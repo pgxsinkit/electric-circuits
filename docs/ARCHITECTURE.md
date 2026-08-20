@@ -418,11 +418,17 @@ floors to 0, and is dropped as already-seen.
 needs the key set *it* holds at that offset (the adapter reconstructs insert-vs-update, and suppresses
 deletes of keys the client never had). Durable-streams carries no per-envelope offset — a read is a
 raw byte range and messages are stored verbatim — so nothing can fold "up to" an offset. What a read
-gives exactly is a **suffix**, so the adapter subtracts two of them: everything after the client's
-offset is, at one tail, exactly the tail of everything in the stream, and the leading remainder is
-precisely the window the client has seen (`electric.rs::keys_at`). An offset that cannot be placed
-that way is answered `409 must-refetch` rather than served from a guessed key set — a key set rebuilt
-from the wrong window fails silently in the retain-data direction (a revoked row is never evicted).
+answers exactly is **how many envelopes lie after a position**, and the stream is append-only, so
+`electric.rs::keys_at` counts the whole stream, counts what the client has not seen, and folds the
+difference as a prefix — and a prefix never changes, however much arrives meanwhile.
+
+The two counts come from separate reads, so an append landing between them would skew the
+subtraction. The surplus is itself a count-after, measurable the same way, so the corrections
+alternate in sign and shrink to the appends that landed during the previous read
+(`SuffixCorrection`); the series settles as soon as one read sees a quiet stream. A stream that never
+goes quiet, or an offset the stream never issued, is answered `409 must-refetch` rather than served
+from a guessed key set — one rebuilt from the wrong window fails silently in the retain-data
+direction (a revoked row is never evicted).
 
 Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes

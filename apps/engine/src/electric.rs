@@ -510,29 +510,20 @@ fn apply_membership(keys: &mut HashSet<String>, env: &Envelope) {
     }
 }
 
-/// Drive catch-up reads over `path` from `from` to the tail, handing every envelope to `each`.
-/// Returns how many there were and the tail offset.
+/// How many envelopes lie after `from`, and the tail that answer is relative to.
 ///
 /// A catch-up read is an exact **suffix** — the server returns the stream from `from` onward — and
 /// that is the ONLY positional primitive durable-streams offers. Individual envelopes carry no
 /// offset of their own: `EnvelopeHeaders::offset` is never populated on read (nothing in the engine
 /// ever sets it, and the server stores each JSON message verbatim, serving a read as a raw byte
 /// range wrapped in `[`…`]`), so no fold can stop "at" an offset. [`keys_at`] builds the missing
-/// positional answer out of two suffixes.
-async fn scan_suffix(
-    engine: &Engine,
-    path: &str,
-    from: &str,
-    mut each: impl FnMut(Envelope),
-) -> anyhow::Result<(usize, String)> {
+/// positional answer out of counts.
+async fn count_after(engine: &Engine, path: &str, from: &str) -> anyhow::Result<(usize, String)> {
     let mut offset = from.to_string();
     let mut seen = 0usize;
     loop {
         let r = engine.read_shape_stream(path, &offset, false).await?;
         seen += r.envelopes.len();
-        for env in r.envelopes {
-            each(env);
-        }
         let advanced = match r.next_offset {
             Some(n) if n != offset => {
                 offset = n;
@@ -546,45 +537,119 @@ async fn scan_suffix(
     }
 }
 
-/// How many times [`keys_at`] re-reads when the tail moved between its two scans. A busy stream can
-/// lose a race; a stream that loses five in a row is answered with `must-refetch` rather than with a
-/// key set rebuilt from the wrong window.
-const KEYS_AT_ATTEMPTS: usize = 5;
+/// Fold the stream's first `window` envelopes into the key set they leave behind, reading only as far
+/// as it takes. A prefix of an append-only stream never changes, so the answer is stable however much
+/// arrives meanwhile. `None` if the stream turned out to be shorter than the window.
+async fn fold_prefix(engine: &Engine, path: &str, window: usize) -> anyhow::Result<Option<HashSet<String>>> {
+    let mut keys: HashSet<String> = HashSet::new();
+    let mut offset = "-1".to_string();
+    let mut folded = 0usize;
+    while folded < window {
+        let r = engine.read_shape_stream(path, &offset, false).await?;
+        let exhausted = r.up_to_date || !matches!(&r.next_offset, Some(n) if *n != offset);
+        for env in r.envelopes {
+            if folded == window {
+                break;
+            }
+            apply_membership(&mut keys, &env);
+            folded += 1;
+        }
+        if let Some(n) = r.next_offset {
+            offset = n;
+        }
+        if folded < window && exhausted {
+            return Ok(None);
+        }
+    }
+    Ok(Some(keys))
+}
+
+/// Ceiling on [`SuffixCorrection`]'s rounds. Each round measures only the appends that landed during
+/// the previous one, so the series settles the moment a single scan sees a quiet stream; the cap is
+/// there for a stream that never goes quiet, which is answered `must-refetch` rather than guessed at.
+const CORRECTION_ROUNDS: usize = 8;
+
+/// Counting `count(offset, anchor]` — the envelopes a client at `offset` has NOT seen, as of the
+/// anchor a previous scan settled on — while the stream keeps growing underneath.
+///
+/// A scan can only ever answer "how many are there after X **right now**", so a scan started after
+/// the anchor was taken over-counts by whatever landed since. That surplus is itself a
+/// `count(a, b]`, measurable the same way, and each measurement covers only the appends during the
+/// previous scan — so the corrections alternate in sign and shrink:
+///
+/// ```text
+/// count(offset, anchor] = count(offset, t₀] − count(anchor, t₁] + count(t₀, t₂] − …
+/// ```
+///
+/// The series terminates as soon as one scan sees no new appends, which on any stream that is not
+/// being written to continuously is the first one. Kept as an explicit state machine so the
+/// arithmetic is unit-testable without a stream (see the tests below) — this is exactly the kind of
+/// subtle bookkeeping that hides a defect when it can only be exercised end-to-end.
+struct SuffixCorrection {
+    count: i64,
+    sign: i64,
+    /// The scan to run next measures `count(from, ?]`; `to` is the tail it must be corrected back to.
+    from: String,
+    to: String,
+}
+
+impl SuffixCorrection {
+    /// `counted` envelopes were found after the client's offset, up to tail `to`; correct that back
+    /// to `anchor`.
+    fn new(counted: usize, to: String, anchor: String) -> Self {
+        SuffixCorrection { count: counted as i64, sign: -1, from: anchor, to }
+    }
+
+    /// The offset the next scan must start from, or `None` when the count is already exact.
+    fn next_scan(&self) -> Option<&str> {
+        (self.from != self.to).then_some(self.from.as_str())
+    }
+
+    /// Fold in that scan's result: `count` envelopes after [`Self::next_scan`], tail `tail`.
+    fn apply(&mut self, count: usize, tail: String) {
+        self.count += self.sign * count as i64;
+        self.sign = -self.sign;
+        // The next term corrects for whatever landed during the scan just applied.
+        self.from = std::mem::replace(&mut self.to, tail);
+    }
+
+    /// The exact count, once [`Self::next_scan`] returns `None`.
+    fn finish(&self) -> Option<usize> {
+        usize::try_from(self.count).ok()
+    }
+}
 
 /// The key set a client holds when positioned at `offset`.
 ///
-/// Scan 1 counts the envelopes PAST the client's offset; scan 2 walks the whole stream. At one tail
-/// the first is exactly the tail of the second, so everything except the final `after_len` envelopes
-/// is precisely the window the client has seen — folding it is exact at ANY offset, with no
-/// per-envelope stamps needed. Scan 2 therefore holds back `after_len` envelopes in a queue and
-/// folds each one only once a later envelope proves it is not in the unseen suffix; the peak cost is
-/// the key set plus that queue (the client's own backlog), never the whole stream.
+/// Envelopes carry no offset of their own, so nothing can fold "up to" one (see [`scan_suffix`]).
+/// What a read does answer exactly is how many envelopes lie after a position, and the stream is
+/// append-only — so: count the whole stream (settling on an anchor), count what the client has not
+/// seen as of that same anchor, and the difference is how many it HAS seen. Its window is that many
+/// envelopes from the start, and a prefix of an append-only stream never changes, so folding it is
+/// exact at ANY offset no matter what arrives meanwhile. Nothing is buffered: the fold streams the
+/// prefix and stops.
 ///
-/// The suffix is counted FIRST so a concurrent append lands only in the second scan; the two tails
-/// then differ and the attempt is retried instead of over-applying a change the client sits before.
-/// `None` = the offset could not be placed (a tail that never settles, or a suffix longer than the
-/// stream) — the caller must `must-refetch` rather than serve a guessed key set.
+/// `None` = the offset could not be placed (a stream that never stops long enough for
+/// [`SuffixCorrection`] to settle, or a suffix longer than the stream itself) — the caller must
+/// `must-refetch` rather than serve a key set rebuilt from the wrong window.
 /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
 async fn keys_at(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<Option<HashSet<String>>> {
-    for _ in 0..KEYS_AT_ATTEMPTS {
-        let (after_len, after_tail) = scan_suffix(engine, path, offset, |_| {}).await?;
+    let (total, anchor) = count_after(engine, path, "-1").await?;
+    let (counted, tail) = count_after(engine, path, offset).await?;
 
-        let mut keys: HashSet<String> = HashSet::new();
-        let mut held: std::collections::VecDeque<Envelope> = std::collections::VecDeque::new();
-        let (total, whole_tail) = scan_suffix(engine, path, "-1", |env| {
-            held.push_back(env);
-            if held.len() > after_len && let Some(seen) = held.pop_front() {
-                apply_membership(&mut keys, &seen);
-            }
-        })
-        .await?;
-
-        if after_tail != whole_tail {
-            continue; // the stream grew between the scans — the subtraction would be off by it
-        }
-        return Ok((total >= after_len).then_some(keys));
+    let mut correction = SuffixCorrection::new(counted, tail, anchor);
+    for _ in 0..CORRECTION_ROUNDS {
+        let Some(from) = correction.next_scan() else { break };
+        let (c, tail) = count_after(engine, path, from).await?;
+        correction.apply(c, tail);
     }
-    Ok(None)
+    if correction.next_scan().is_some() {
+        return Ok(None); // never settled — the stream is being written to without pause
+    }
+
+    let Some(unseen) = correction.finish() else { return Ok(None) };
+    let Some(window) = total.checked_sub(unseen) else { return Ok(None) };
+    fold_prefix(engine, path, window).await
 }
 
 /// Classify the engine's absolute `upsert`/`delete` envelopes into Electric `insert`/`update`/`delete`
@@ -1250,6 +1315,41 @@ mod tests {
         ));
         let keys: Vec<&String> = fold.ordered_rows().map(|(k, _)| k).collect();
         assert_eq!(keys, vec!["k1", "k2"], "the re-entering key must not get a second slot");
+    }
+
+    // ---- the suffix correction ------------------------------------------------------------------
+
+    /// Drive a [`SuffixCorrection`] with scripted scan results, as `keys_at` drives it with real ones.
+    fn correct(counted: usize, to: &str, anchor: &str, scans: &[(usize, &str)]) -> Option<usize> {
+        let mut c = SuffixCorrection::new(counted, to.into(), anchor.into());
+        let mut scans = scans.iter();
+        while c.next_scan().is_some() {
+            let (n, tail) = *scans.next().expect("a scan for every round the correction asks for");
+            c.apply(n, tail.into());
+        }
+        assert!(scans.next().is_none(), "the correction must stop asking once it is exact");
+        c.finish()
+    }
+
+    // The quiet case: the suffix scan saw the same tail the whole-stream scan settled on, so the
+    // count is already `count(offset, anchor]` and no correction is needed.
+    #[test]
+    fn a_settled_stream_needs_no_correction() {
+        assert_eq!(correct(3, "t5", "t5", &[]), Some(3));
+    }
+
+    // One append landed between the two scans: the suffix scan counted 4 up to t6, but the anchor is
+    // t5, so the extra one is subtracted — count(offset, t5] = 3.
+    #[test]
+    fn an_append_between_the_scans_is_subtracted() {
+        assert_eq!(correct(4, "t6", "t5", &[(1, "t6")]), Some(3));
+    }
+
+    // The correcting scan is itself overtaken: measuring count(t5, ?] it sees TWO envelopes because
+    // another landed while it ran (tail t7). The next term adds that one back, and the series settles.
+    #[test]
+    fn a_correction_overtaken_by_another_append_settles_on_the_next_term() {
+        assert_eq!(correct(4, "t6", "t5", &[(2, "t7"), (1, "t7")]), Some(3));
     }
 
     // ---- LSN headers ---------------------------------------------------------------------------

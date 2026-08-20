@@ -15,6 +15,7 @@
 //! neither does the engine).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,16 @@ use tower::ServiceExt;
 /// or a shape stream.
 type Store = Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>;
 
+/// How many more shape-stream reads should have an append land underneath them — the stream growing
+/// while the adapter is mid-reconstruction. Drained by the handler, one per read.
+type Growth = Arc<AtomicUsize>;
+
+#[derive(Clone)]
+struct DsState {
+    store: Store,
+    growth: Growth,
+}
+
 /// Offsets are opaque tokens to the engine; here they are the item index, zero-padded like the real
 /// server's fixed-width tokens. `-1` is the protocol's "from the beginning" sentinel.
 fn tok(n: usize) -> String {
@@ -49,7 +60,8 @@ fn parse_offset(q: &str) -> usize {
     if raw == "-1" { 0 } else { raw.trim_start_matches('0').parse().unwrap_or(0) }
 }
 
-async fn ds_handler(State(store): State<Store>, req: Request) -> Response {
+async fn ds_handler(State(state): State<DsState>, req: Request) -> Response {
+    let store = state.store.clone();
     let path = req.uri().path().trim_start_matches('/').to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let method = req.method().clone();
@@ -72,6 +84,23 @@ async fn ds_handler(State(store): State<Store>, req: Request) -> Response {
             ([("stream-next-offset", next)], StatusCode::OK).into_response()
         }
         Method::GET => {
+            // A concurrent writer: land one append on the shape stream before serving this read, so
+            // the adapter's scans see a moving tail.
+            if path.starts_with("shape")
+                && state
+                    .growth
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                let n = store.lock().unwrap().get(&path).map(Vec::len).unwrap_or(0);
+                let key = format!("grow{n}");
+                store.lock().unwrap().entry(path.clone()).or_default().push(serde_json::json!({
+                    "type": "t",
+                    "key": key,
+                    "value": { "id": key },
+                    "headers": { "operation": "upsert", "lsn": "0/99" },
+                }));
+            }
             let from = parse_offset(&query);
             let live = query.split('&').any(|kv| kv == "live=long-poll");
             let (items, len) = {
@@ -172,11 +201,12 @@ async fn read_until_change(engine: &Engine, query: &str) -> ShapeResponse {
     }
 }
 
-async fn engine_with_table() -> (Engine, Store) {
+async fn engine_with_table() -> (Engine, Store, Growth) {
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let growth: Growth = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ds_url = format!("http://{}", listener.local_addr().unwrap());
-    let served = store.clone();
+    let served = DsState { store: store.clone(), growth: growth.clone() };
     tokio::spawn(async move {
         let _ = axum::serve(listener, Router::new().fallback(ds_handler).with_state(served)).await;
     });
@@ -186,14 +216,14 @@ async fn engine_with_table() -> (Engine, Store) {
     }))
     .unwrap();
     engine.define_schema(&schema).await.unwrap();
-    (engine, store)
+    (engine, store, growth)
 }
 
 // ---- tests ---------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn resume_at_a_persisted_offset_replays_a_delete_the_handle_already_served() {
-    let (engine, store) = engine_with_table().await;
+    let (engine, store, _growth) = engine_with_table().await;
 
     // Snapshot: empty shape, fresh handle.
     let snap = get_shape(&engine, "table=t&offset=-1").await;
@@ -235,9 +265,50 @@ async fn resume_at_a_persisted_offset_replays_a_delete_the_handle_already_served
     assert!(resumed.schema.is_some(), "electric-schema must ride the resume response");
 }
 
+// The reconstruction counts the stream, counts what the client has not seen, and folds the
+// difference. Those counts are taken by separate reads, so an append landing between them would skew
+// the subtraction — the client's window would be measured against a stream that has since grown, and
+// it would be handed a key set for the wrong position. The correction settles that, and this is the
+// test that the settling is real: the same revocation replay as above, with an append landing under
+// every read the adapter issues while it reconstructs.
+#[tokio::test]
+async fn a_resume_stays_correct_while_the_stream_grows_underneath_it() {
+    let (engine, store, growth) = engine_with_table().await;
+
+    let snap = get_shape(&engine, "table=t&offset=-1").await;
+    let handle = snap.handle.clone().unwrap();
+
+    append_change(&store, "upsert", "k1", "0/10");
+    append_change(&store, "upsert", "k2", "0/20");
+    let caught_up = read_until_change(&engine, &format!("table=t&handle={handle}&offset={}", snap.offset)).await;
+    assert_eq!(caught_up.changes().len(), 2);
+    let persisted = caught_up.offset.clone();
+
+    append_change(&store, "delete", "k2", "0/30");
+    let served = read_until_change(&engine, &format!("table=t&handle={handle}&offset={persisted}")).await;
+    assert_eq!(served.changes().len(), 1);
+
+    // Now make the stream move under the reconstruction: three of its reads get an append first.
+    growth.store(3, Ordering::SeqCst);
+    let resumed = get_shape(&engine, &format!("table=t&handle={handle}&offset={persisted}")).await;
+    assert_eq!(resumed.status, StatusCode::OK);
+    assert_eq!(growth.load(Ordering::SeqCst), 0, "the appends must actually have landed");
+
+    // The revocation still replays...
+    let revocation: Vec<_> = resumed.changes().into_iter().filter(|m| m["key"] == "k2").collect();
+    assert_eq!(revocation.len(), 1, "the revocation must survive a moving tail: {:?}", resumed.messages);
+    assert_eq!(revocation[0]["headers"]["operation"], "delete");
+
+    // ...and the rows that arrived DURING the reconstruction are classified against the client's real
+    // position: it has never seen them, so they are inserts, not updates of rows it does not hold.
+    for m in resumed.changes().into_iter().filter(|m| m["key"].as_str().unwrap().starts_with("grow")) {
+        assert_eq!(m["headers"]["operation"], "insert", "concurrent arrival misclassified: {m:?}");
+    }
+}
+
 #[tokio::test]
 async fn up_to_date_advertises_the_fan_out_frontier_not_zero() {
-    let (engine, store) = engine_with_table().await;
+    let (engine, store, _growth) = engine_with_table().await;
     let snap = get_shape(&engine, "table=t&offset=-1").await;
     let handle = snap.handle.clone().unwrap();
     assert_eq!(snap.watermark().as_deref(), Some("0"), "nothing sequenced yet");
