@@ -27,6 +27,9 @@ use super::*;
 struct Batch {
     stream_path: String,
     envs: Vec<Envelope>,
+    /// The barrier hold this batch owns until its append lands. Travels with the batch so a dead
+    /// writer task retires it as lost instead of quietly opening the barrier.
+    permit: Permit,
 }
 
 /// Hash-sharded, per-stream-ordered append lanes. Cheap to clone.
@@ -45,15 +48,14 @@ impl EmissionLanes {
         for _ in 0..n {
             let (tx, mut rx) = mpsc::unbounded_channel::<Batch>();
             let ds = ds.clone();
-            let frontier = frontier.clone();
             tokio::spawn(async move {
                 while let Some(b) = rx.recv().await {
                     // Reliable: a dropped subquery envelope is permanent divergence for the
                     // shape's subscribers. 404 (shape dropped mid-flight) discards, correctly.
                     ds.append_reliable(&b.stream_path, &b.envs).await;
                     // The append landed: this batch's effects are on the stream, so the commit
-                    // waiting on the barrier may now be published (see [`Frontier::release`]).
-                    frontier.release();
+                    // waiting on the barrier may now be published (the permit drops here).
+                    drop(b.permit);
                 }
             });
             lanes.push(tx);
@@ -76,11 +78,15 @@ impl EmissionLanes {
         if envs.is_empty() {
             return;
         }
-        self.frontier.hold();
+        let permit = Permit::take(&self.frontier);
         let lane = self.lane_for(stream_path);
-        if self.lanes[lane].send(Batch { stream_path: stream_path.to_string(), envs }).is_err() {
-            // Writer gone (engine teardown): don't leave the barrier stuck.
-            self.frontier.release();
+        if let Err(e) =
+            self.lanes[lane].send(Batch { stream_path: stream_path.to_string(), envs, permit })
+        {
+            // The writer task is gone while the engine is still running: these envelopes will never
+            // be appended, and a live shape append must not silently drop.
+            tracing::error!("emission lane for {stream_path} closed; {} envelopes dropped", e.0.envs.len());
+            e.0.permit.lost();
         }
     }
 }

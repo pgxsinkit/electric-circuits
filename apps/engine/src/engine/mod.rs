@@ -38,7 +38,7 @@ mod tests;
 use catalog::*;
 use circuit_serving::*;
 use executors::*;
-use frontier::Frontier;
+use frontier::{Frontier, Permit};
 use introspection::*;
 use planning::*;
 use sequencer::*;
@@ -118,6 +118,10 @@ pub struct Engine {
 /// One tailer envelope's worth of deferred subquery flips (see [`Engine::flip_tx`]).
 pub(crate) struct FlipWork {
     work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+    /// The barrier hold covering this batch until its effects are on the streams. Travels WITH the
+    /// work, so a propagator that is gone (a closed channel) retires it as lost rather than letting
+    /// the barrier drain on flips nobody will run.
+    permit: Permit,
     txid: Option<String>,
     /// The originating write's commit lsn, threaded through to the deferred flip's trace event so
     /// it carries the same lsn/txid as the direct-change event that triggered the propagation —
@@ -162,11 +166,12 @@ fn spawn_flip_propagator(
             let frontier = frontier.clone();
             let trace_tx = trace_tx.clone();
             tokio::spawn(async move {
-                propagate_with_retry(&registry, &fw.work, fw.txid, fw.lsn, &trace_tx, &frontier).await;
-                // Released only after propagation finished enqueueing every resulting
-                // batch — each batch carries its own hold until it lands, so
-                // the barrier never reads zero with effects in flight.
-                frontier.release();
+                let FlipWork { mut work, txid, lsn, permit: barrier } = fw;
+                propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx, &frontier).await;
+                // Dropped only after propagation finished enqueueing every resulting batch — each
+                // batch carries its own permit until it lands, so the barrier never reads zero with
+                // effects in flight.
+                drop(barrier);
                 drop(permit);
             });
         }
@@ -179,9 +184,11 @@ const FLIP_ATTEMPTS: u32 = 5;
 /// Run one batch's propagation, retrying a failed query-back before giving up.
 ///
 /// A failure here is a Postgres round-trip that did not answer — a pool timeout, a dropped
-/// connection, a restart. Re-running the batch is safe: membership is re-derived from the current
-/// inner-set state and emitted **absolutely** per pk (see [`crate::subquery::emit_for_shapes`]), so
-/// a partially-applied batch converges to the same result on a second pass.
+/// connection, a restart. The retry resumes from the queue the failed attempt left behind rather
+/// than from the roots, which is what makes it safe: each individual step is convergent (membership
+/// is re-derived from current state and emitted **absolutely** per pk — see
+/// [`crate::subquery::emit_for_shapes`]), but the DAG walk is not restartable, because reconciling a
+/// parent node consumes the transition that produced its flips. See [`crate::subquery::propagate_flips`].
 ///
 /// If every attempt fails the effects are LOST — the rows a subquery moved in or out never reach
 /// their shape streams, and nothing will retry them. That is not a lag the frontier can wait out,
@@ -191,7 +198,7 @@ const FLIP_ATTEMPTS: u32 = 5;
 /// consumers with permanently wrong membership and no signal — see `docs/ARCHITECTURE.md`.
 pub(crate) async fn propagate_with_retry(
     registry: &Mutex<SubqueryRegistry>,
-    work: &std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+    work: &mut std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
     txid: Option<String>,
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
@@ -199,9 +206,7 @@ pub(crate) async fn propagate_with_retry(
 ) {
     let mut backoff = std::time::Duration::from_millis(50);
     for attempt in 1..=FLIP_ATTEMPTS {
-        let r =
-            crate::subquery::propagate_flips(registry, work.clone(), txid.clone(), lsn.clone(), trace_tx)
-                .await;
+        let r = crate::subquery::propagate_flips(registry, work, txid.clone(), lsn.clone(), trace_tx).await;
         match r {
             Ok(()) => return,
             Err(e) if attempt < FLIP_ATTEMPTS => {

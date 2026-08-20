@@ -1112,16 +1112,19 @@ async fn a_terminal_flip_publishes_the_commit_that_was_waiting_on_it() {
     // A commit that produced deferred flip work: the hold is taken where the sequencer takes it,
     // synchronously, before the transaction's own boundary. The signature has no dependents, so
     // propagation is a no-op that still has to release the barrier.
-    subq.frontier.hold();
-    subq.flip_tx
-        .send(FlipWork {
-            work: [("no-dependents".to_string(), Flip { value: Value::Int(1), dir: FlipDir::Enter })]
-                .into_iter()
-                .collect(),
-            txid: None,
-            lsn: Some("0/10".into()),
-        })
-        .unwrap();
+    let permit = super::frontier::Permit::take(&subq.frontier);
+    assert!(
+        subq.flip_tx
+            .send(FlipWork {
+                work: [("no-dependents".to_string(), Flip { value: Value::Int(1), dir: FlipDir::Enter })]
+                    .into_iter()
+                    .collect(),
+                txid: None,
+                lsn: Some("0/10".into()),
+                permit,
+            })
+            .is_ok()
+    );
     subq.frontier.commit_flushed("0/10");
     assert_eq!(subq.frontier.published(), "0/0", "not while its flips are in flight");
 

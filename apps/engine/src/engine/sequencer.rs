@@ -954,10 +954,14 @@ pub(crate) async fn process_envelope(
             }
         }
         if !work.is_empty() {
-            subq.frontier.hold();
-            if subq.flip_tx.send(FlipWork { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
-                // Propagator gone (shutdown) — don't leave the barrier stuck.
-                subq.frontier.release();
+            let permit = crate::engine::frontier::Permit::take(&subq.frontier);
+            if let Err(e) =
+                subq.flip_tx.send(FlipWork { work, txid: txid.clone(), lsn: lsn.clone(), permit })
+            {
+                // The propagator is gone while the engine is still running: these flips will never
+                // be walked, so their effects are LOST, not merely late.
+                tracing::error!("flip propagator channel closed; subquery effects dropped");
+                e.0.permit.lost();
             }
         }
     }

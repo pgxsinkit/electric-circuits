@@ -907,9 +907,18 @@ impl Engine {
         // the first delta can be buffered: without it the sequencer, seeing no flip work for those
         // commits, would publish a frontier past changes whose membership consequences are still
         // sitting in a buffer. The cost is conservative lag — a create's Postgres seeding stalls
-        // the watermark (not delivery) for its duration — and every exit path below must give the
-        // hold back, or the stall is permanent.
-        self.frontier.hold();
+        // the watermark (not delivery) for its duration.
+        //
+        // A guard, not manual pairing: this future is awaited straight from the HTTP handler, so a
+        // client that disconnects mid-create DROPS it, and cleanup that only ran on the enumerated
+        // returns would freeze the watermark for every consumer, permanently — and leave a pending
+        // shape buffering deltas for a create nobody is finishing.
+        let mut creating = CreateGuard {
+            engine: self.clone(),
+            shape_id: id.to_string(),
+            permit: crate::engine::frontier::Permit::take(&self.frontier),
+            armed: true,
+        };
         // Phase A (brief lock), with conflict retry.
         let begin = {
             let mut attempt = 0u32;
@@ -924,7 +933,8 @@ impl Engine {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     Err(e) => {
-                        self.frontier.release();
+                        // Nothing was registered, so there is nothing to roll back.
+                        creating.disarm();
                         return Err(e);
                     }
                 }
@@ -995,35 +1005,65 @@ impl Engine {
                     .await
                     .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
                     .await;
-                let replay = match replay {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.frontier.release();
-                        return Err(e);
-                    }
-                };
+                let replay = replay?;
                 if !replay.work.is_empty() {
                     // Replay flips propagate exactly like live ones (barrier-covered), stamped with
-                    // the newest commit they reflect so a consumer does not discard them.
-                    self.frontier.hold();
-                    if self
-                        .flip_tx
-                        .send(FlipWork { work: replay.work, txid: None, lsn: replay.lsn })
-                        .is_err()
+                    // the newest commit they reflect so a consumer does not discard them. The
+                    // replay's own permit is taken while the create still holds its own, so the
+                    // barrier never dips to zero between the two.
+                    let permit = crate::engine::frontier::Permit::take(&self.frontier);
+                    if let Err(e) =
+                        self.flip_tx.send(FlipWork { work: replay.work, txid: None, lsn: replay.lsn, permit })
                     {
-                        self.frontier.release();
+                        tracing::error!("flip propagator channel closed; creation replay dropped");
+                        e.0.permit.lost();
                     }
                 }
-                // The create's own hold, released only once its replay is enqueued behind one of
-                // its own — so the barrier never dips to zero between the two.
-                self.frontier.release();
+                creating.disarm();
                 Ok(())
             }
             Err(e) => {
                 self.subqueries.lock().await.abort_create(id);
-                self.frontier.release();
+                creating.disarm();
                 Err(e)
             }
         }
+    }
+}
+
+/// Everything a subquery create must give back if it does not reach its own end.
+///
+/// The create's future is awaited straight from the HTTP handler, so a client that disconnects
+/// takes it away mid-flight — during the conflict sleep, a Postgres round-trip, a stream append, or
+/// phase C. Two things outlive that drop unless something reclaims them: the fan-out barrier permit
+/// (the watermark stops for every consumer of the engine, forever) and the registry's pending shape,
+/// whose fresh nodes go on buffering every inner-table delta for a create that will never install.
+/// `Drop` reclaims both; the create disarms it once it has settled its own outcome.
+struct CreateGuard {
+    engine: Engine,
+    shape_id: String,
+    /// Dropped with the guard — see [`crate::engine::frontier::Permit`].
+    #[allow(dead_code)]
+    permit: crate::engine::frontier::Permit,
+    armed: bool,
+}
+
+impl CreateGuard {
+    /// The create settled its own outcome (installed, or rolled back).
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancelled. The rollback needs the registry lock, which `drop` cannot await, so it runs as
+        // a detached task — the same shape as the reactivation path, and for the same reason.
+        tracing::warn!("subquery create for '{}' was cancelled; rolling back", self.shape_id);
+        let (engine, shape_id) = (self.engine.clone(), self.shape_id.clone());
+        tokio::spawn(async move { engine.subqueries.lock().await.abort_create(&shape_id) });
     }
 }

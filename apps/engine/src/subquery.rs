@@ -1450,77 +1450,109 @@ impl SubqueryRegistry {
 //    single-task bottleneck. Postgres round-trips run outside the lock, concurrently.
 
 /// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
+///
+/// `work` is drained in place and is the **retry state**, not just an input. A failed attempt leaves
+/// every item it has not finished — including the one that failed — in the queue, because the
+/// registry it half-walked cannot be re-derived from the roots: reconciling a parent node mutates
+/// that node, and the flips that reconcile produced exist only here. Re-running the roots would find
+/// the parent already at its new value, produce no transition, and report success while the
+/// dependents those flips would have moved never move. Absolute per-pk emission makes each
+/// individual step convergent; it does not make the walk restartable.
 pub async fn propagate_flips(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
-    mut work: VecDeque<(SubquerySig, Flip)>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
     txid: Option<String>,
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     while let Some((sig, flip)) = work.pop_front() {
-        // The flipped inner-set node's dependents, plus the table its change entered through: the
-        // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
-        // dependent). Fetched under one lock so a concurrent drop can't split them.
-        let (edges, source_table) = {
-            let reg = registry.lock().await;
-            (reg.edges_of(&sig), reg.nodes.get(&sig).map(|n| n.inner_table.clone()))
-        };
-        for edge in edges {
-            // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
-            // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
-            // negation turns into a membership change). It can shift *every* dependent row, so
-            // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
-            // monotone over FALSE < UNKNOWN < TRUE), so skip.
-            if matches!(flip.value, Value::Null) {
-                if edge.null_sensitive {
-                    rederive_dependent(registry, &edge, txid.clone(), lsn.clone(), &mut work).await?;
-                }
-                continue;
+        if let Err(e) =
+            propagate_one(registry, &sig, &flip, txid.clone(), lsn.clone(), trace_tx, work).await
+        {
+            // Back on the queue for the retry. Its already-walked edges are re-walked there: a shape
+            // move re-emits absolutely (converges), and a parent already reconciled yields no second
+            // transition — which is exactly why its first one had to stay in `work`.
+            work.push_front((sig, flip));
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One flip: walk its node's edges, moving dependent shapes and re-deriving dependent parent nodes,
+/// pushing whatever the parents flip in turn onto `work`.
+#[allow(clippy::too_many_arguments)]
+async fn propagate_one(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    sig: &SubquerySig,
+    flip: &Flip,
+    txid: Option<String>,
+    lsn: Option<String>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
+) -> Result<()> {
+    // The flipped inner-set node's dependents, plus the table its change entered through: the
+    // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
+    // dependent). Fetched under one lock so a concurrent drop can't split them.
+    let (edges, source_table) = {
+        let reg = registry.lock().await;
+        (reg.edges_of(sig), reg.nodes.get(sig).map(|n| n.inner_table.clone()))
+    };
+    for edge in edges {
+        // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
+        // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
+        // negation turns into a membership change). It can shift *every* dependent row, so
+        // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
+        // monotone over FALSE < UNKNOWN < TRUE), so skip.
+        if matches!(flip.value, Value::Null) {
+            if edge.null_sensitive {
+                rederive_dependent(registry, &edge, txid.clone(), lsn.clone(), work).await?;
             }
-            match &edge.dependent {
-                Dependent::Shape(id) => {
-                    let moved =
-                        move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone(), lsn.clone())
-                            .await?;
-                    // Light the whole path only when the shape actually moved rows: source
-                    // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
-                    if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
+            continue;
+        }
+        match &edge.dependent {
+            Dependent::Shape(id) => {
+                let moved =
+                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone(), lsn.clone())
+                        .await?;
+                // Light the whole path only when the shape actually moved rows: source
+                // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
+                if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
+                    emit_flip_trace(
+                        trace_tx,
+                        &outer,
+                        src,
+                        &sig,
+                        format!("shape:{id}"),
+                        vec![id.clone()],
+                        net,
+                        lsn.clone(),
+                        txid.clone(),
+                    );
+                }
+            }
+            Dependent::Node(parent_sig) => {
+                let new_flips =
+                    requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
+                if let Some((_inner, flips)) = new_flips {
+                    // A nested `IN`: connect the flipped child `node:<sig>` to the parent
+                    // `node:<parent_sig>` it re-derived, so the propagation reads through. The
+                    // parent's own downstream shape lights when its flips reach a shape edge.
+                    if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
                         emit_flip_trace(
                             trace_tx,
-                            &outer,
+                            src,
                             src,
                             &sig,
-                            format!("shape:{id}"),
-                            vec![id.clone()],
-                            net,
+                            format!("node:{parent_sig}"),
+                            Vec::new(),
+                            flip_net(&flips),
                             lsn.clone(),
                             txid.clone(),
                         );
                     }
-                }
-                Dependent::Node(parent_sig) => {
-                    let new_flips =
-                        requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
-                    if let Some((_inner, flips)) = new_flips {
-                        // A nested `IN`: connect the flipped child `node:<sig>` to the parent
-                        // `node:<parent_sig>` it re-derived, so the propagation reads through. The
-                        // parent's own downstream shape lights when its flips reach a shape edge.
-                        if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
-                            emit_flip_trace(
-                                trace_tx,
-                                src,
-                                src,
-                                &sig,
-                                format!("node:{parent_sig}"),
-                                Vec::new(),
-                                flip_net(&flips),
-                                lsn.clone(),
-                                txid.clone(),
-                            );
-                        }
-                        for f in flips {
-                            work.push_back((parent_sig.clone(), f));
-                        }
+                    for f in flips {
+                        work.push_back((parent_sig.clone(), f));
                     }
                 }
             }
@@ -1995,7 +2027,7 @@ mod tests {
 
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         work.push_back(("sig1".into(), Flip { value: Value::Null, dir: FlipDir::Enter }));
-        propagate_flips(&reg, work, None, None, &trace_tx).await.unwrap();
+        propagate_flips(&reg, &mut work, None, None, &trace_tx).await.unwrap();
         assert!(trace_rx.try_recv().is_err(), "a NULL flip on a non-null-sensitive dependent emits nothing");
     }
 
@@ -2598,22 +2630,22 @@ mod tests {
         let registry = tokio::sync::Mutex::new(reg);
         let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
 
-        let frontier = crate::engine::frontier::Frontier::new();
+        let frontier = Arc::new(crate::engine::frontier::Frontier::new());
         // A commit that produced flip work, flushed while the work is still outstanding.
-        frontier.hold();
+        let permit = crate::engine::frontier::Permit::take(&frontier);
         frontier.commit_flushed("0/10");
-        let work: VecDeque<(SubquerySig, Flip)> =
+        let mut work: VecDeque<(SubquerySig, Flip)> =
             [(sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
         crate::engine::propagate_with_retry(
             &registry,
-            &work,
+            &mut work,
             None,
             Some("0/10".into()),
             &trace_tx,
             &frontier,
         )
         .await;
-        frontier.release();
+        drop(permit);
 
         assert!(frontier.poisoned(), "abandoned membership effects must poison the frontier");
         assert_eq!(frontier.failures(), 1);
@@ -2715,5 +2747,47 @@ mod tests {
             stamp_bytes,
             "SubqueryNode::seed_buffer_lsn must be accounted for"
         );
+    }
+
+    /// **A failed walk keeps its own remains.** The DAG walk is not restartable from its roots:
+    /// reconciling a parent node consumes the transition that produced its flips, so a retry from
+    /// the roots finds the parent already moved, derives nothing, and reports success while the
+    /// dependents those flips would have moved never move — lost effects that also bypass the
+    /// poison path, because nothing errored the second time.
+    ///
+    /// What makes the retry sound is that the queue survives the failure: whatever the attempt did
+    /// not finish, including the item that failed, is still there for the next attempt. Asserted
+    /// here directly, since a partial walk through a nested DAG needs a live Postgres to reach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_propagation_leaves_its_work_for_the_retry() {
+        let ts = issues_ts();
+        // No `pg_url`: the first query-back fails, as an outage makes it fail.
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+        reg.add_edge(Edge {
+            node_sig: sig.clone(),
+            dependent: Dependent::Shape("s1".into()),
+            connecting_col: 1,
+            negated: false,
+            null_sensitive: false,
+        });
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> = [
+            (sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter }),
+            (sig.clone(), Flip { value: Value::Int(200), dir: FlipDir::Enter }),
+        ]
+        .into_iter()
+        .collect();
+        let err = propagate_flips(&registry, &mut work, None, None, &trace_tx).await;
+
+        assert!(err.is_err(), "the query-back cannot succeed without Postgres");
+        assert_eq!(work.len(), 2, "a failed attempt must not consume the work it did not finish");
+        assert_eq!(work[0].1.value, Value::Int(100), "the failed item goes back at the front");
+        assert_eq!(work[1].1.value, Value::Int(200), "and the untouched item keeps its place");
     }
 }

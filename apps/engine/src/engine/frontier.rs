@@ -13,6 +13,7 @@
 //! last outstanding batch. That second path is what stops a final deferred flip from freezing the
 //! frontier forever on a stream that then goes quiet: nothing else would ever look again.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -48,15 +49,18 @@ impl Frontier {
         }
     }
 
-    /// Take a count for work that must land before the frontier may advance. Every `hold` is paired
-    /// with exactly one [`Self::release`].
-    pub(crate) fn hold(&self) {
+    /// Take a count for work that must land before the frontier may advance.
+    ///
+    /// Private on purpose: pairing a `hold` with a `release` by hand is how a hold gets leaked — an
+    /// early return, a `?`, or a dropped future, and the barrier never drains again. Callers take a
+    /// [`Permit`] instead, which releases when it goes out of scope however it goes out of scope.
+    fn hold(&self) {
         self.pending.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Give back a count. The worker that takes the barrier to zero publishes whatever commit was
     /// waiting on it — the only chance a candidate gets if no further transaction arrives.
-    pub(crate) fn release(&self) {
+    fn release(&self) {
         if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.try_publish();
         }
@@ -96,10 +100,17 @@ impl Frontier {
         self.state.lock().unwrap().poisoned
     }
 
-    /// Promote the candidate if nothing is in flight. The barrier is re-read **under the state
-    /// lock**, so a `hold` racing a `release` cannot leave a candidate published past work that has
-    /// since been enqueued: increments for a commit's own flips happen synchronously before that
-    /// commit's boundary, so a zero reading proves every earlier commit's work has landed.
+    /// Promote the candidate if nothing is in flight.
+    ///
+    /// A [`Permit::take`] racing this read is not excluded by the state lock — it does not take that
+    /// lock — and does not need to be. What makes a zero reading sound is an ordering precondition
+    /// on the callers: **a permit is always taken before the commits it covers are processed**. A
+    /// commit's own flip permits are taken synchronously during `process_envelope`, before that
+    /// commit's boundary; a create's permit is taken before `begin_create`, before any delta can be
+    /// buffered against it. So a permit appearing after the read covers only commits *later* than
+    /// the candidate, and publishing the candidate stays true. A permit taken lazily — after the
+    /// work it covers was already processed — would break that and is the one thing this type
+    /// cannot check for you.
     fn try_publish(&self) {
         let mut st = self.state.lock().unwrap();
         if st.poisoned || self.pending.load(Ordering::SeqCst) != 0 {
@@ -111,6 +122,39 @@ impl Frontier {
         if crate::pg::lsn_to_u64(&candidate) >= crate::pg::lsn_to_u64(&st.published) {
             st.published = candidate;
         }
+    }
+}
+
+/// A hold on the barrier that releases itself.
+///
+/// Every piece of work the frontier waits on holds one for as long as its effects are not yet on
+/// the streams: an enqueued emission batch, a flip batch in flight, a shape create's buffering
+/// window. `Drop` releases, so a `?`, a panic, or a **cancelled future** (an HTTP client that
+/// disconnects mid-create) cannot strand the barrier — which manual pairing could not promise.
+///
+/// A permit whose work was lost rather than completed is retired with [`Permit::lost`] instead.
+pub(crate) struct Permit {
+    frontier: Arc<Frontier>,
+}
+
+impl Permit {
+    /// Take a hold on `frontier`.
+    pub(crate) fn take(frontier: &Arc<Frontier>) -> Permit {
+        frontier.hold();
+        Permit { frontier: frontier.clone() }
+    }
+
+    /// This permit's work will never land — the worker it was handed to is gone, or its retries are
+    /// spent. Poison the frontier before releasing: a barrier that drains on lost work is a
+    /// watermark that advances past effects no client will ever see.
+    pub(crate) fn lost(self) {
+        self.frontier.poison();
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.frontier.release();
     }
 }
 
@@ -127,34 +171,58 @@ mod tests {
 
     #[test]
     fn a_commit_with_outstanding_flips_waits_for_the_last_one() {
-        let f = Frontier::new();
-        f.hold();
-        f.hold();
+        let f = Arc::new(Frontier::new());
+        let one = Permit::take(&f);
+        let two = Permit::take(&f);
         f.commit_flushed("0/10");
         assert_eq!(f.published(), "0/0", "flips still in flight");
-        f.release();
+        drop(one);
         assert_eq!(f.published(), "0/0", "one still in flight");
         // The terminal flip publishes it — no later transaction is needed, which is the whole point.
-        f.release();
+        drop(two);
         assert_eq!(f.published(), "0/10");
+    }
+
+    /// The leak this type exists to prevent: work that returns early, panics, or is cancelled.
+    #[test]
+    fn a_permit_releases_however_its_scope_ends() {
+        let f = Arc::new(Frontier::new());
+        {
+            let _permit = Permit::take(&f);
+            f.commit_flushed("0/10");
+            assert_eq!(f.published(), "0/0");
+        }
+        assert_eq!(f.published(), "0/10", "the permit released on the way out of scope");
+        assert_eq!(f.pending(), 0);
+    }
+
+    /// A permit whose work is gone is not a permit whose work is done.
+    #[test]
+    fn a_lost_permit_poisons_before_it_releases() {
+        let f = Arc::new(Frontier::new());
+        let permit = Permit::take(&f);
+        f.commit_flushed("0/10");
+        permit.lost();
+        assert!(f.poisoned());
+        assert_eq!(f.pending(), 0, "the barrier is still given back — pendingFlips means in flight");
+        assert_eq!(f.published(), "0/0", "but the commit whose effects were lost is never published");
     }
 
     #[test]
     fn a_drained_barrier_with_nothing_waiting_publishes_nothing() {
-        let f = Frontier::new();
+        let f = Arc::new(Frontier::new());
         f.commit_flushed("0/10");
-        f.hold();
-        f.release();
+        drop(Permit::take(&f));
         assert_eq!(f.published(), "0/10", "no candidate to promote; stays put");
     }
 
     #[test]
     fn the_newest_flushed_commit_wins() {
-        let f = Frontier::new();
-        f.hold();
+        let f = Arc::new(Frontier::new());
+        let permit = Permit::take(&f);
         f.commit_flushed("0/10");
         f.commit_flushed("0/20");
-        f.release();
+        drop(permit);
         assert_eq!(f.published(), "0/20");
     }
 
