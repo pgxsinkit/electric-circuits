@@ -97,16 +97,6 @@ struct HandleEntry {
     /// When this handle was last touched by a request — drives idle-TTL eviction.
     last_access: std::sync::Mutex<Instant>,
     state: tokio::sync::Mutex<HandleState>,
-    /// The key set and offset this handle's SNAPSHOT was minted with. `keys_as_of` reconstructs a key
-    /// set by folding the shape STREAM, but a snapshot's rows come from `materialize()` and are not in
-    /// the stream at/below that offset — so folding to the snapshot offset yields a set MISSING them,
-    /// and `apply_changes` then silently drops their deletes (its delete arm is gated on
-    /// `keys.remove(..)`). A client resuming from its persisted offset therefore never evicted rows
-    /// whose access had been revoked. Keeping the snapshot's own answer lets the rebuild start from
-    /// truth instead of from an incomplete fold.
-    /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
-    snapshot_offset: String,
-    snapshot_keys: HashSet<String>,
     /// In-flight **live** long-polls keyed by request offset. Concurrent live requests at the same
     /// (handle, offset) are identical, so the first arrival (the leader) does the read+apply while
     /// every other one awaits the published [`ReadOutcome`] on the watch channel instead of queueing
@@ -258,6 +248,12 @@ fn pg_type(ty: ColumnType) -> &'static str {
     }
 }
 
+/// The `electric-schema` header value: [`schema_json`] serialized. One constructor, because the
+/// header rides on the snapshot AND on every other non-live response (see [`positioned_headers`]).
+fn schema_header(ts: &TableSchema, columns: &Option<Vec<String>>) -> String {
+    serde_json::to_string(&schema_json(ts, columns)).unwrap_or_default()
+}
+
 /// Build the `electric-schema` JSON: `{col: {type, pk_index?}}`.
 fn schema_json(ts: &TableSchema, columns: &Option<Vec<String>>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
@@ -298,14 +294,11 @@ fn pg_text(v: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Postgres LSNs travel through the engine in their native `hi/lo` hex form (`0/1AEB9F8`), but
-/// Electric puts a **decimal** 64-bit LSN on the wire (`"27042192"`) and clients parse it as an
+/// Electric puts a **decimal** 64-bit LSN on the wire (`"28228088"`) and clients parse it as an
 /// integer — `BigInt(headers.lsn)` throws on the slash form. Convert, or emit nothing at all.
 /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
 fn lsn_to_decimal(lsn: &str) -> Option<String> {
-    let (hi, lo) = lsn.split_once('/')?;
-    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
-    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
-    Some((((hi << 32) | lo) as u64).to_string())
+    lsn.contains('/').then(|| crate::pg::lsn_to_u64(lsn).to_string())
 }
 
 fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, lsn: Option<&str>) -> serde_json::Value {
@@ -314,8 +307,8 @@ fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, lsn: Option
     headers.insert("operation".into(), serde_json::Value::String(op.into()));
     // Consumers position their catch-up/dedup frontier on this (pgxsinkit ADR-0031); without it a
     // resume over persisted metadata can never advance its watermark.
-    if let Some(d) = lsn.and_then(lsn_to_decimal) {
-        headers.insert("lsn".into(), serde_json::Value::String(d));
+    if let Some(decimal_lsn) = lsn.and_then(lsn_to_decimal) {
+        headers.insert("lsn".into(), serde_json::Value::String(decimal_lsn));
     }
     m.insert("headers".into(), serde_json::Value::Object(headers));
     m.insert("key".into(), serde_json::Value::String(key.into()));
@@ -325,21 +318,31 @@ fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, lsn: Option
     serde_json::Value::Object(m)
 }
 
+/// A control message that carries no watermark (`must-refetch`); `up-to-date` has its own
+/// constructor because its watermark is load-bearing — see [`up_to_date_msg`].
 fn control_msg(control: &str) -> serde_json::Value {
-    control_msg_at(control, None)
-}
-
-/// `up-to-date` carries the engine's replication head as `global_last_seen_lsn`. Was hardcoded to
-/// `"0"`, which pins every consumer watermark at zero.
-/// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
-fn control_msg_at(control: &str, global_lsn: Option<&str>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     let mut headers = serde_json::Map::new();
     headers.insert("control".into(), serde_json::Value::String(control.into()));
-    if control == "up-to-date" {
-        let d = global_lsn.and_then(lsn_to_decimal).unwrap_or_else(|| "0".into());
-        headers.insert("global_last_seen_lsn".into(), serde_json::Value::String(d));
-    }
+    m.insert("headers".into(), serde_json::Value::Object(headers));
+    serde_json::Value::Object(m)
+}
+
+/// `up-to-date`, carrying `global_last_seen_lsn` — was hardcoded to `"0"`, which pins every consumer
+/// watermark at zero.
+///
+/// Consumers position their catch-up/dedup frontier on this and DROP anything at or below it
+/// (pgxsinkit ADR-0031), so it must never name an LSN whose changes are not already on this shape's
+/// stream: `global_lsn` is the sequencer's fan-out frontier ([`Engine::sequenced_lsn`]), captured
+/// BEFORE the read that produced these messages — never the ingestor head, which runs ahead of the
+/// fan-out. `"0"` while nothing has been sequenced yet.
+/// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+fn up_to_date_msg(global_lsn: &str) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    let mut headers = serde_json::Map::new();
+    headers.insert("control".into(), serde_json::Value::String("up-to-date".into()));
+    let decimal_lsn = lsn_to_decimal(global_lsn).unwrap_or_else(|| "0".into());
+    headers.insert("global_last_seen_lsn".into(), serde_json::Value::String(decimal_lsn));
     m.insert("headers".into(), serde_json::Value::Object(headers));
     serde_json::Value::Object(m)
 }
@@ -378,6 +381,12 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         ApiError { status: StatusCode::BAD_REQUEST, message: message.into() }
     }
+
+    /// The client's `(handle, offset)` can no longer be placed in the stream: answer with the same
+    /// `409 must-refetch` an evicted handle gets, so it re-snapshots onto the retained shape.
+    fn must_refetch() -> Self {
+        ApiError { status: StatusCode::CONFLICT, message: "must-refetch".into() }
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -388,6 +397,11 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // 409 is only ever [`ApiError::must_refetch`], whose body is the control message the Electric
+        // client acts on — not the `{"message": …}` error shape.
+        if self.status == StatusCode::CONFLICT {
+            return must_refetch();
+        }
         let body = serde_json::json!({ "message": self.message }).to_string();
         let len = body.len() as u64;
         let mut headers = HeaderMap::new();
@@ -398,26 +412,13 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// `true` iff stream offset `a` sorts after `b`. `"-1"` is the beginning; every other offset is the
-/// durable-streams server's fixed-width zero-padded token, whose lexicographic order equals stream
-/// order (`{seq:016}_{byte:016}`).
-fn offset_after(a: &str, b: &str) -> bool {
-    if a == "-1" {
-        false
-    } else if b == "-1" {
-        true
-    } else {
-        a > b
-    }
-}
-
 /// Page-driven fold of a shape stream into its current key→row map (pure, so unit-testable).
 ///
-/// `until = Some(off)` rebuilds the state **as of** that offset: envelopes stamped after it are
-/// ignored (used when a client retries an older offset — folding to the tail instead would drop
-/// deletes / mis-classify inserts in the replayed window). `done` is set on `up-to-date`, when the
-/// target offset is passed, or when the next offset stops advancing; an empty page mid-stream does
-/// **not** end the fold (that truncated snapshots).
+/// Folds to the stream's TAIL — there is deliberately no "fold up to offset X" mode, because the
+/// substrate cannot support one: durable-streams carries no per-envelope offset (see [`keys_at`]),
+/// so an envelope cannot be tested against a target. `done` is set on `up-to-date` or when the next
+/// offset stops advancing; an empty page mid-stream does **not** end the fold (that truncated
+/// snapshots).
 struct StreamFold {
     rows: HashMap<String, serde_json::Value>,
     /// Keys in first-appearance (stream) order. `rows` alone would randomize the snapshot's
@@ -432,24 +433,12 @@ struct StreamFold {
     /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
     seen: HashSet<String>,
     offset: String,
-    until: Option<String>,
     done: bool,
 }
 
 impl StreamFold {
     fn to_tail() -> Self {
-        StreamFold { rows: HashMap::new(), order: Vec::new(), seen: HashSet::new(), offset: "-1".into(), until: None, done: false }
-    }
-
-    fn up_to(offset: &str) -> Self {
-        StreamFold {
-            rows: HashMap::new(),
-            order: Vec::new(),
-            seen: HashSet::new(),
-            offset: "-1".into(),
-            until: Some(offset.to_string()),
-            done: false,
-        }
+        StreamFold { rows: HashMap::new(), order: Vec::new(), seen: HashSet::new(), offset: "-1".into(), done: false }
     }
 
     /// The folded rows in stream (first-appearance) order.
@@ -459,12 +448,6 @@ impl StreamFold {
 
     fn apply_page(&mut self, r: ReadResult) {
         for env in r.envelopes {
-            if let (Some(target), Some(stamp)) = (self.until.as_deref(), env.headers.offset.as_deref()) {
-                if offset_after(stamp, target) {
-                    self.done = true;
-                    return;
-                }
-            }
             match env.headers.operation.as_str() {
                 "delete" => {
                     self.rows.remove(&env.key);
@@ -512,10 +495,96 @@ async fn materialize(engine: &Engine, path: &str) -> anyhow::Result<(Vec<(String
     Ok((rows, fold.offset))
 }
 
-/// The key set a client holds when positioned at `offset` (fold `-1..=offset`).
-async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<HashSet<String>> {
-    let fold = drive_fold(engine, path, StreamFold::up_to(offset)).await?;
-    Ok(fold.rows.into_keys().collect())
+/// One envelope's effect on a client's key set — the membership rule the whole resume path is built
+/// on, and the mirror image of [`apply_changes`]'s classification.
+fn apply_membership(keys: &mut HashSet<String>, env: &Envelope) {
+    match env.headers.operation.as_str() {
+        "delete" => {
+            keys.remove(&env.key);
+        }
+        // Like [`StreamFold`]: only a value-bearing upsert puts a key in the set.
+        _ if env.value.is_some() => {
+            keys.insert(env.key.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Drive catch-up reads over `path` from `from` to the tail, handing every envelope to `each`.
+/// Returns how many there were and the tail offset.
+///
+/// A catch-up read is an exact **suffix** — the server returns the stream from `from` onward — and
+/// that is the ONLY positional primitive durable-streams offers. Individual envelopes carry no
+/// offset of their own: `EnvelopeHeaders::offset` is never populated on read (nothing in the engine
+/// ever sets it, and the server stores each JSON message verbatim, serving a read as a raw byte
+/// range wrapped in `[`…`]`), so no fold can stop "at" an offset. [`keys_at`] builds the missing
+/// positional answer out of two suffixes.
+async fn scan_suffix(
+    engine: &Engine,
+    path: &str,
+    from: &str,
+    mut each: impl FnMut(Envelope),
+) -> anyhow::Result<(usize, String)> {
+    let mut offset = from.to_string();
+    let mut seen = 0usize;
+    loop {
+        let r = engine.read_shape_stream(path, &offset, false).await?;
+        seen += r.envelopes.len();
+        for env in r.envelopes {
+            each(env);
+        }
+        let advanced = match r.next_offset {
+            Some(n) if n != offset => {
+                offset = n;
+                true
+            }
+            _ => false,
+        };
+        if r.up_to_date || !advanced {
+            return Ok((seen, offset));
+        }
+    }
+}
+
+/// How many times [`keys_at`] re-reads when the tail moved between its two scans. A busy stream can
+/// lose a race; a stream that loses five in a row is answered with `must-refetch` rather than with a
+/// key set rebuilt from the wrong window.
+const KEYS_AT_ATTEMPTS: usize = 5;
+
+/// The key set a client holds when positioned at `offset`.
+///
+/// Scan 1 counts the envelopes PAST the client's offset; scan 2 walks the whole stream. At one tail
+/// the first is exactly the tail of the second, so everything except the final `after_len` envelopes
+/// is precisely the window the client has seen — folding it is exact at ANY offset, with no
+/// per-envelope stamps needed. Scan 2 therefore holds back `after_len` envelopes in a queue and
+/// folds each one only once a later envelope proves it is not in the unseen suffix; the peak cost is
+/// the key set plus that queue (the client's own backlog), never the whole stream.
+///
+/// The suffix is counted FIRST so a concurrent append lands only in the second scan; the two tails
+/// then differ and the attempt is retried instead of over-applying a change the client sits before.
+/// `None` = the offset could not be placed (a tail that never settles, or a suffix longer than the
+/// stream) — the caller must `must-refetch` rather than serve a guessed key set.
+/// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+async fn keys_at(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<Option<HashSet<String>>> {
+    for _ in 0..KEYS_AT_ATTEMPTS {
+        let (after_len, after_tail) = scan_suffix(engine, path, offset, |_| {}).await?;
+
+        let mut keys: HashSet<String> = HashSet::new();
+        let mut held: std::collections::VecDeque<Envelope> = std::collections::VecDeque::new();
+        let (total, whole_tail) = scan_suffix(engine, path, "-1", |env| {
+            held.push_back(env);
+            if held.len() > after_len && let Some(seen) = held.pop_front() {
+                apply_membership(&mut keys, &seen);
+            }
+        })
+        .await?;
+
+        if after_tail != whole_tail {
+            continue; // the stream grew between the scans — the subtraction would be off by it
+        }
+        return Ok((total >= after_len).then_some(keys));
+    }
+    Ok(None)
 }
 
 /// Classify the engine's absolute `upsert`/`delete` envelopes into Electric `insert`/`update`/`delete`
@@ -680,21 +749,25 @@ async fn positioned_read(
     offset: &str,
     live: bool,
 ) -> Result<ReadOutcome, ApiError> {
+    // Captured BEFORE the read: every change at or below this LSN is already on the shape stream, so
+    // a read that reaches up-to-date has delivered it. Reading it afterwards would let a commit
+    // sequenced *during* the read be advertised as delivered. See [`up_to_date_msg`].
+    let frontier = engine.sequenced_lsn();
+
     let mut st = entry.state.lock().await;
     if st.offset != offset {
         // The client resumed at a different (older) offset than we last served: rebuild the key set
-        // **as of that offset** (fold -1..=offset), then replay from there. Folding to the tail instead
-        // would silently drop a delete of a key absent at tail and emit updates for reinserted keys.
-        //
-        // At the SNAPSHOT offset the fold is not the truth: those rows came from `materialize()` and
-        // were never appended to the stream, so the fold returns a set missing every one of them and
-        // `apply_changes` drops their deletes. Use the snapshot's own key set there.
-        // Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
-        st.keys = if offset == entry.snapshot_offset {
-            entry.snapshot_keys.clone()
-        } else {
-            keys_as_of(engine, &entry.stream_path, offset).await?
+        // **as of that offset**, then replay from there. Rebuilding at the tail instead would
+        // silently drop a delete of a key absent at tail (the delete arm of `apply_changes` is gated
+        // on `keys.remove(..)`, so a revoked row is never evicted) and emit updates for reinserted
+        // keys.
+        let Some(keys) = keys_at(engine, &entry.stream_path, offset).await? else {
+            // The offset cannot be placed in the stream. Refuse loudly: a key set rebuilt from the
+            // wrong window fails silently in the retain-data direction, which is exactly how the
+            // revocation-loss bug hid.
+            return Err(ApiError::must_refetch());
         };
+        st.keys = keys;
         st.offset = offset.to_string();
     }
     let from = offset.to_string();
@@ -727,7 +800,7 @@ async fn positioned_read(
 
     let mut messages = apply_changes(&mut st.keys, &entry.pk_name, r.envelopes);
     if r.up_to_date {
-        messages.push(control_msg_at("up-to-date", Some(&engine.replication_lsn())));
+        messages.push(up_to_date_msg(&frontier));
     }
     let served_offset = st.offset.clone();
     drop(st);
@@ -738,6 +811,36 @@ async fn positioned_read(
         cursor: next_cursor(),
         body: Some(serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into())),
     })
+}
+
+/// The response headers for a POSITIONED (non-snapshot) `/v1/shape` response.
+///
+/// `electric-schema` rides on every NON-LIVE response, not only the `offset=-1` snapshot: a client
+/// resuming from a PERSISTED (handle, offset) — a warm-store restart — has never seen a snapshot, so
+/// this is the first response it ever parses, and without the header `@electric-sql/client`
+/// hard-errors ("didn't include the following required headers: electric-schema"), delivers ZERO
+/// messages, and the stream never reaches up-to-date. Electric sends it on every non-live response
+/// and omits it on live polls; match that exactly.
+/// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+fn positioned_headers(
+    handle: &str,
+    outcome: &ReadOutcome,
+    live: bool,
+    ts: &TableSchema,
+    columns: &Option<Vec<String>>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(HeaderName::from_static("electric-handle"), hv(handle));
+    headers.insert(HeaderName::from_static("electric-offset"), hv(&outcome.offset));
+    headers.insert(HeaderName::from_static("electric-cursor"), hv(&outcome.cursor.to_string()));
+    if !live {
+        headers.insert(HeaderName::from_static("electric-schema"), hv(&schema_header(ts, columns)));
+    }
+    if outcome.up_to_date {
+        headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
+    }
+    headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
+    headers
 }
 
 /// Response body size in bytes, stamped on every `/v1/shape` response so [`shape`] can emit the byte
@@ -843,6 +946,8 @@ async fn shape_inner(
         // `create_shape` if it went dormant — instead of re-backfilling from Postgres. The handle
         // minted below stays per-client (see the module docs).
         let rec = engine.create_shape(&p.table, pred, columns.clone(), false, true).await?;
+        // Captured before the materialize, for the same reason as in `positioned_read`.
+        let frontier = engine.sequenced_lsn();
         let (rows, tail) = match materialize(&engine, &rec.stream_path).await {
             Ok(v) => v,
             Err(e) => {
@@ -859,9 +964,9 @@ async fn shape_inner(
             messages.push(change_msg("insert", key, Some(encode_value(value)), None));
             keys.insert(key.clone());
         }
-        messages.push(control_msg_at("up-to-date", Some(&engine.replication_lsn())));
+        messages.push(up_to_date_msg(&frontier));
 
-        let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
+        let schema_str = schema_header(&ts, &columns);
         // Handles are per-client even though the shape is shared: a unique handle id per snapshot
         // keeps each client's cursor state (key set / offset) private, so one client's live
         // long-poll never head-of-line blocks another's positioned read and offsets never thrash.
@@ -876,8 +981,6 @@ async fn shape_inner(
                 table: p.table.clone(),
                 pk_name: ts.pk_name.clone(),
                 last_access: std::sync::Mutex::new(Instant::now()),
-                snapshot_offset: tail.clone(),
-                snapshot_keys: keys.clone(),
                 state: tokio::sync::Mutex::new(HandleState { keys, offset: tail.clone() }),
                 live_inflight: std::sync::Mutex::new(HashMap::new()),
             }),
@@ -927,25 +1030,7 @@ async fn shape_inner(
         positioned_read(&engine, &entry, &offset, false).await?
     };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(HeaderName::from_static("electric-handle"), hv(&handle));
-    headers.insert(HeaderName::from_static("electric-offset"), hv(&outcome.offset));
-    headers.insert(HeaderName::from_static("electric-cursor"), hv(&outcome.cursor.to_string()));
-    // `electric-schema` must ride on every NON-LIVE response, not only the `offset=-1` snapshot. A
-    // client resuming from a PERSISTED (handle, offset) — a warm-store restart — has never seen a
-    // snapshot, so this is the first response it ever parses; without the header
-    // `@electric-sql/client` hard-errors ("didn't include the following required headers:
-    // electric-schema"), delivers ZERO messages, and the stream never reaches up-to-date.
-    // Electric sends it on every non-live response and omits it on live polls; match that exactly.
-    // Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
-    if !live {
-        let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
-        headers.insert(HeaderName::from_static("electric-schema"), hv(&schema_str));
-    }
-    if outcome.up_to_date {
-        headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
-    }
-    headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
+    let headers = positioned_headers(&handle, &outcome, live, &ts, &columns);
     match outcome.body {
         None => {
             let mut resp = (StatusCode::NO_CONTENT, headers).into_response();
@@ -953,6 +1038,7 @@ async fn shape_inner(
             Ok(resp)
         }
         Some(body) => {
+            let mut headers = headers;
             headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
             let len = body.len() as u64;
             let mut resp = (StatusCode::OK, headers, body).into_response();
@@ -967,7 +1053,14 @@ mod tests {
     use super::*;
     use crate::ds::EnvelopeHeaders;
 
-    fn env(op: &str, key: &str, offset: &str) -> Envelope {
+    /// NOTE the `offset: None`: durable-streams never stamps a per-envelope offset, and nothing in
+    /// the engine sets one either. A fixture that invents one tests a stream that cannot exist —
+    /// which is how the fold-to-offset bug stayed green (see [`keys_at`]).
+    fn env(op: &str, key: &str) -> Envelope {
+        env_lsn(op, key, None)
+    }
+
+    fn env_lsn(op: &str, key: &str, lsn: Option<&str>) -> Envelope {
         Envelope {
             type_: "change".into(),
             key: key.into(),
@@ -976,8 +1069,8 @@ mod tests {
             headers: EnvelopeHeaders {
                 operation: op.into(),
                 txid: None,
-                offset: Some(offset.into()),
-                lsn: None,
+                offset: None,
+                lsn: lsn.map(str::to_string),
                 seq: None,
             },
         }
@@ -999,11 +1092,11 @@ mod tests {
     #[test]
     fn fold_survives_empty_mid_stream_page() {
         let mut fold = StreamFold::to_tail();
-        fold.apply_page(page(vec![env("upsert", "k1", "01")], "01", false));
+        fold.apply_page(page(vec![env("upsert", "k1")], "01", false));
         assert!(!fold.done, "non-empty non-up-to-date page must not end the fold");
         fold.apply_page(page(vec![], "02", false)); // empty page, but offset advanced
         assert!(!fold.done, "empty page with an advancing offset must not end the fold");
-        fold.apply_page(page(vec![env("upsert", "k2", "03")], "03", true));
+        fold.apply_page(page(vec![env("upsert", "k2")], "03", true));
         assert!(fold.done);
         assert_eq!(fold.offset, "03");
         let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
@@ -1014,7 +1107,7 @@ mod tests {
     #[test]
     fn fold_stops_when_offset_stalls() {
         let mut fold = StreamFold::to_tail();
-        fold.apply_page(page(vec![env("upsert", "k1", "01")], "01", false));
+        fold.apply_page(page(vec![env("upsert", "k1")], "01", false));
         // Same next offset, no up-to-date: the stream is not advancing — stop (no infinite loop).
         fold.apply_page(page(vec![], "01", false));
         assert!(fold.done);
@@ -1043,7 +1136,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         let r = poll_live_until("00".into(), deadline, |_from| async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok::<ReadResult, ()>(page(vec![env("upsert", "k1", "01")], "01", false))
+            Ok::<ReadResult, ()>(page(vec![env("upsert", "k1")], "01", false))
         })
         .await
         .unwrap();
@@ -1080,56 +1173,110 @@ mod tests {
         );
     }
 
-    // C2: rebuilding the key set as of the client's *requested* offset (not the tail).
-    #[test]
-    fn fold_up_to_stops_at_the_requested_offset() {
-        // Stream: insert k1 @01, insert k2 @02, delete k2 @03. A client at offset 02 holds {k1, k2}.
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(
-            vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")],
-            "03",
-            true,
-        ));
-        assert!(fold.done);
-        let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
-        keys.sort();
-        assert_eq!(keys, vec!["k1", "k2"], "the delete past the requested offset must not be folded in");
+    // ---- key-set reconstruction at a client's offset -------------------------------------------
+
+    /// What a client holds at an offset: the stream's envelopes MINUS the suffix it has not seen.
+    /// The window arithmetic itself lives in `keys_at` (it needs a stream to scan) and is covered
+    /// end-to-end by `tests/shape_resume.rs`.
+    fn keys_after(window: &[Envelope]) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        for env in window {
+            apply_membership(&mut keys, env);
+        }
+        keys
     }
 
-    // C2: a delete in the replayed window must reach the client. Folding to the TAIL loses k2 (absent
-    // at tail), so the replayed delete was silently dropped and the client kept a deleted row forever.
+    // Stream: insert k1, insert k2, delete k2. A client that has seen the first two holds {k1, k2}
+    // — the delete it has not seen must not be in its set.
+    #[test]
+    fn a_clients_key_set_excludes_what_it_has_not_seen() {
+        let whole = vec![env("upsert", "k1"), env("upsert", "k2"), env("delete", "k2")];
+        let mut keys: Vec<_> = keys_after(&whole[..2]).into_iter().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["k1", "k2"], "an unseen delete must not be folded into the client's set");
+    }
+
+    // A delete in the replayed window must reach the client. Rebuilding at the TAIL loses k2 (absent
+    // at tail), so the replayed delete is silently dropped and the client keeps a revoked row forever
+    // — the revocation-loss bug. The window rebuild keeps k2, so the delete is emitted.
     #[test]
     fn replay_emits_delete_for_row_deleted_in_the_replayed_window() {
-        let all = vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")];
+        let whole = vec![env("upsert", "k1"), env("upsert", "k2"), env("delete", "k2")];
+        let replay = whole[2..].to_vec(); // the client has seen the first two
 
-        // Rebuild as of the client's offset (02)...
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(all.clone(), "03", true));
-        let mut keys: HashSet<String> = fold.rows.into_keys().collect();
-
-        // ...then replay everything after it.
-        let replay: Vec<Envelope> = all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
+        let mut keys = keys_after(&whole[..2]);
         let msgs = apply_changes(&mut keys, "id", replay);
         assert_eq!(msgs.len(), 1);
         assert_eq!(op_and_key(&msgs[0]), ("delete".into(), "k2".into()));
         assert!(!keys.contains("k2"));
     }
 
-    // C2: an insert in the replayed window whose key exists at TAIL must be emitted as an insert (the
-    // tail-state rebuild classified it as `update`, which Electric's client rejects as update-of-missing).
+    // An insert in the replayed window whose key exists at TAIL must be emitted as an insert (a
+    // tail-state rebuild classifies it as `update`, which Electric's client rejects as
+    // update-of-missing).
     #[test]
     fn replay_emits_insert_for_row_reinserted_after_the_replayed_offset() {
-        let all = vec![env("upsert", "k1", "01"), env("delete", "k1", "02"), env("upsert", "k1", "03")];
+        let whole = vec![env("upsert", "k1"), env("delete", "k1"), env("upsert", "k1")];
+        let replay = whole[2..].to_vec();
 
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(all.clone(), "03", true));
-        let mut keys: HashSet<String> = fold.rows.into_keys().collect();
-        assert!(keys.is_empty(), "as of offset 02 the client holds no rows");
+        let mut keys = keys_after(&whole[..2]);
+        assert!(keys.is_empty(), "at that offset the client holds no rows");
 
-        let replay: Vec<Envelope> = all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
         let msgs = apply_changes(&mut keys, "id", replay);
         assert_eq!(msgs.len(), 1);
         assert_eq!(op_and_key(&msgs[0]), ("insert".into(), "k1".into()));
+    }
+
+    // Membership churn: a key that LEAVES the shape and RE-ENTERS it must occupy ONE slot in the
+    // snapshot's row order. Guarding on `rows.insert(..).is_none()` gave it a second slot (the delete
+    // removed it from `rows`), and both resolved — emitting the key twice as `insert` in one snapshot,
+    // which is a duplicate-key collision for the client's bulk-apply tier.
+    #[test]
+    fn fold_does_not_duplicate_a_key_that_re_enters_the_shape() {
+        let mut fold = StreamFold::to_tail();
+        fold.apply_page(page(
+            vec![env("upsert", "k1"), env("upsert", "k2"), env("delete", "k1"), env("upsert", "k1")],
+            "04",
+            true,
+        ));
+        let keys: Vec<&String> = fold.ordered_rows().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec!["k1", "k2"], "the re-entering key must not get a second slot");
+    }
+
+    // ---- LSN headers ---------------------------------------------------------------------------
+
+    // Electric puts a DECIMAL 64-bit LSN on the wire; clients parse it with `BigInt(...)`, which
+    // throws on Postgres's native `hi/lo` hex form. Anything unparseable is omitted, never faked.
+    #[test]
+    fn lsn_is_converted_to_electrics_decimal_form() {
+        assert_eq!(lsn_to_decimal("0/1AEB9F8").as_deref(), Some("28228088"));
+        assert_eq!(lsn_to_decimal("1/0").as_deref(), Some("4294967296"));
+        assert_eq!(lsn_to_decimal("not-an-lsn"), None);
+    }
+
+    // A change message carries the LSN its consumer positions its catch-up/dedup frontier on; an
+    // envelope without one carries no header at all (never a fabricated "0", which would be read as
+    // a snapshot row).
+    #[test]
+    fn change_messages_carry_the_envelopes_lsn() {
+        let mut keys: HashSet<String> = HashSet::new();
+        let msgs = apply_changes(&mut keys, "id", vec![env_lsn("upsert", "k1", Some("0/2A")), env("upsert", "k2")]);
+        assert_eq!(msgs[0]["headers"]["lsn"].as_str(), Some("42"));
+        assert!(msgs[1]["headers"].get("lsn").is_none(), "no LSN on the envelope, no lsn header");
+    }
+
+    // `up-to-date` advertises the FAN-OUT frontier as `global_last_seen_lsn`. It was hardcoded "0",
+    // which pins every consumer watermark at zero; it must never be a fabricated or unparseable value.
+    #[test]
+    fn up_to_date_advertises_the_frontier() {
+        let msg = up_to_date_msg("0/2A");
+        assert_eq!(msg["headers"]["control"].as_str(), Some("up-to-date"));
+        assert_eq!(msg["headers"]["global_last_seen_lsn"].as_str(), Some("42"));
+        assert_eq!(
+            up_to_date_msg("")["headers"]["global_last_seen_lsn"].as_str(),
+            Some("0"),
+            "nothing sequenced yet reads as 0, the frontier every consumer starts at"
+        );
     }
 
     #[test]
@@ -1138,7 +1285,7 @@ mod tests {
         let msgs = apply_changes(
             &mut keys,
             "id",
-            vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k9", "03")],
+            vec![env("upsert", "k1"), env("upsert", "k2"), env("delete", "k9")],
         );
         assert_eq!(op_and_key(&msgs[0]), ("update".into(), "k1".into()));
         assert_eq!(op_and_key(&msgs[1]), ("insert".into(), "k2".into()));
@@ -1146,13 +1293,39 @@ mod tests {
         assert_eq!(msgs.len(), 2);
     }
 
+    // ---- response headers -----------------------------------------------------------------------
+
+    fn test_schema() -> crate::schema::TableSchema {
+        let def: crate::schema::TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "name": {"type":"text"} },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        crate::schema::TableSchema::from_def("t", &def).unwrap()
+    }
+
+    fn outcome(up_to_date: bool) -> ReadOutcome {
+        ReadOutcome { offset: "07".into(), up_to_date, cursor: 3, body: Some("[]".into()) }
+    }
+
+    // A warm-store resume (non-live, offset != -1) is the FIRST response such a client parses, and
+    // `@electric-sql/client` hard-errors without `electric-schema` — delivering zero messages and
+    // never reaching up-to-date. Electric sends it on every non-live response; live polls omit it.
     #[test]
-    fn offset_ordering() {
-        assert!(offset_after("02", "01"));
-        assert!(!offset_after("01", "02"));
-        assert!(!offset_after("-1", "01"));
-        assert!(offset_after("01", "-1"));
-        assert!(!offset_after("01", "01"));
+    fn schema_header_rides_every_non_live_response() {
+        let ts = test_schema();
+        let headers = positioned_headers("h1", &outcome(true), false, &ts, &None);
+        assert_eq!(
+            headers.get("electric-schema").unwrap(),
+            r#"{"id":{"pk_index":0,"type":"int8"},"name":{"type":"text"}}"#
+        );
+        assert_eq!(headers.get("electric-handle").unwrap(), "h1");
+        assert_eq!(headers.get("electric-offset").unwrap(), "07");
+        assert!(headers.get("electric-up-to-date").is_some());
+
+        let live = positioned_headers("h1", &outcome(false), true, &ts, &None);
+        assert!(live.get("electric-schema").is_none(), "live polls must not carry the schema header");
+        assert!(live.get("electric-up-to-date").is_none());
     }
 
     // ---- live-request coalescing --------------------------------------------------------------
@@ -1166,8 +1339,6 @@ mod tests {
             table: "t".into(),
             pk_name: "id".into(),
             last_access: std::sync::Mutex::new(Instant::now()),
-            snapshot_offset: "-1".into(),
-            snapshot_keys: HashSet::new(),
             state: tokio::sync::Mutex::new(HandleState { keys: HashSet::new(), offset: "-1".into() }),
             live_inflight: std::sync::Mutex::new(HashMap::new()),
         })
