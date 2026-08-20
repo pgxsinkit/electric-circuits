@@ -931,6 +931,17 @@ async fn shape_inner(
     headers.insert(HeaderName::from_static("electric-handle"), hv(&handle));
     headers.insert(HeaderName::from_static("electric-offset"), hv(&outcome.offset));
     headers.insert(HeaderName::from_static("electric-cursor"), hv(&outcome.cursor.to_string()));
+    // `electric-schema` must ride on every NON-LIVE response, not only the `offset=-1` snapshot. A
+    // client resuming from a PERSISTED (handle, offset) — a warm-store restart — has never seen a
+    // snapshot, so this is the first response it ever parses; without the header
+    // `@electric-sql/client` hard-errors ("didn't include the following required headers:
+    // electric-schema"), delivers ZERO messages, and the stream never reaches up-to-date.
+    // Electric sends it on every non-live response and omits it on live polls; match that exactly.
+    // Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+    if !live {
+        let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
+        headers.insert(HeaderName::from_static("electric-schema"), hv(&schema_str));
+    }
     if outcome.up_to_date {
         headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
     }
