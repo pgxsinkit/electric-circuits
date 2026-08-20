@@ -296,9 +296,17 @@ fn pg_text(v: &serde_json::Value) -> serde_json::Value {
 /// Postgres LSNs travel through the engine in their native `hi/lo` hex form (`0/1AEB9F8`), but
 /// Electric puts a **decimal** 64-bit LSN on the wire (`"28228088"`) and clients parse it as an
 /// integer — `BigInt(headers.lsn)` throws on the slash form. Convert, or emit nothing at all.
+///
+/// Parsed here rather than deferred to [`crate::pg::lsn_to_u64`], which is lenient by design (an
+/// unreadable component reads as 0). On the wire that leniency is a lie a client cannot see
+/// through: `"0"` is a real position — a snapshot row's — so a garbled LSN would be published as
+/// "the beginning of time" rather than as the absence of an answer.
 /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
 fn lsn_to_decimal(lsn: &str) -> Option<String> {
-    lsn.contains('/').then(|| crate::pg::lsn_to_u64(lsn).to_string())
+    let (hi, lo) = lsn.split_once('/')?;
+    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
+    Some((((hi << 32) | lo) as u64).to_string())
 }
 
 fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, lsn: Option<&str>) -> serde_json::Value {
@@ -391,6 +399,14 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // A read the stream refused because of the POSITION is the client's problem to fix, not a
+        // server fault: answer it the way Electric answers any offset that can no longer be placed.
+        // Every read on this path is at an offset the client supplied, directly (the positioned
+        // read) or derived from it (the [`keys_at`] reconstruction), so there is no internal read
+        // this could mislabel.
+        if crate::ds::is_unplaceable_offset(&e) {
+            return ApiError::must_refetch();
+        }
         ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:#}") }
     }
 }
@@ -1361,6 +1377,13 @@ mod tests {
         assert_eq!(lsn_to_decimal("0/1AEB9F8").as_deref(), Some("28228088"));
         assert_eq!(lsn_to_decimal("1/0").as_deref(), Some("4294967296"));
         assert_eq!(lsn_to_decimal("not-an-lsn"), None);
+        // A slash is not enough: an unreadable component is no LSN at all. Emitting "0" here would
+        // put a real position on the wire — the one every snapshot row carries.
+        assert_eq!(lsn_to_decimal("bad/lsn"), None);
+        assert_eq!(lsn_to_decimal("0/xyz"), None);
+        assert_eq!(lsn_to_decimal("/10"), None);
+        assert_eq!(lsn_to_decimal("0/"), None);
+        assert_eq!(lsn_to_decimal("-1/10"), None);
     }
 
     // A change message carries the LSN its consumer positions its catch-up/dedup frontier on; an

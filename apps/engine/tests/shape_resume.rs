@@ -52,12 +52,19 @@ fn tok(n: usize) -> String {
     format!("{n:016}")
 }
 
-fn parse_offset(q: &str) -> usize {
-    let raw = q
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("offset="))
-        .unwrap_or("-1");
-    if raw == "-1" { 0 } else { raw.trim_start_matches('0').parse().unwrap_or(0) }
+/// `Ok(index)`, or `Err(status)` for an offset the server would refuse: `400` for a token it cannot
+/// parse, `410` for one below the earliest retained position. Modelling those is the point — coercing
+/// a bad token to zero (as this fake used to) answers a client's garbage offset with a full replay
+/// from the start of the stream, and hides that the adapter turned the refusal into a 500.
+fn parse_offset(q: &str) -> Result<usize, u16> {
+    let raw = q.split('&').find_map(|kv| kv.strip_prefix("offset=")).unwrap_or("-1");
+    if raw == "-1" {
+        return Ok(0);
+    }
+    if raw.len() != 16 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(400);
+    }
+    raw.parse().map_err(|_| 400)
 }
 
 async fn ds_handler(State(state): State<DsState>, req: Request) -> Response {
@@ -101,7 +108,12 @@ async fn ds_handler(State(state): State<DsState>, req: Request) -> Response {
                     "headers": { "operation": "upsert", "lsn": "0/99" },
                 }));
             }
-            let from = parse_offset(&query);
+            let from = match parse_offset(&query) {
+                Ok(n) => n,
+                Err(status) => {
+                    return StatusCode::from_u16(status).unwrap().into_response();
+                }
+            };
             let live = query.split('&').any(|kv| kv == "live=long-poll");
             let (items, len) = {
                 let s = store.lock().unwrap();
@@ -168,8 +180,10 @@ async fn get_shape(engine: &Engine, query: &str) -> ShapeResponse {
     let (handle, offset, schema) =
         (head("electric-handle"), head("electric-offset").unwrap_or_default(), head("electric-schema"));
     let body = to_bytes(res.into_body(), 8 * 1024 * 1024).await.unwrap();
+    // An error response's body is plain text, not a message array — keep it out of `messages`
+    // rather than panicking, so a test that expected a protocol answer fails on its own assertion.
     let messages: Vec<serde_json::Value> =
-        if body.is_empty() { Vec::new() } else { serde_json::from_slice(&body).unwrap() };
+        if body.is_empty() { Vec::new() } else { serde_json::from_slice(&body).unwrap_or_default() };
     ShapeResponse { status, handle, offset, schema, messages }
 }
 
@@ -330,4 +344,32 @@ async fn up_to_date_advertises_the_fan_out_frontier_not_zero() {
         assert!(Instant::now() < deadline, "frontier never reached the sequenced commit");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// **An offset the stream cannot place is a `must-refetch`, not a 500.** durable-streams answers a
+/// malformed offset with 400 and one that has aged out of retention with 410 — the position, not
+/// the read, is what failed. Electric's own answer to that is `409` carrying the `must-refetch`
+/// control message, which tells the client to re-snapshot onto the same shape; a 500 tells it
+/// nothing it can act on, and a client whose persisted offset outlived the stream's retention would
+/// see nothing else for as long as it kept retrying.
+#[tokio::test]
+async fn an_offset_the_stream_cannot_place_is_answered_must_refetch() {
+    let (engine, store, _growth) = engine_with_table().await;
+    let snap = get_shape(&engine, "table=t&offset=-1").await;
+    let handle = snap.handle.clone().expect("snapshot mints a handle");
+    append_change(&store, "upsert", "k1", "0/10");
+    let caught_up = read_until_change(&engine, &format!("table=t&handle={handle}&offset={}", snap.offset)).await;
+    assert_eq!(caught_up.changes().len(), 1);
+
+    // A persisted offset that is not a token this stream ever issued: truncated storage, a client
+    // that constructed one, a downgraded token format.
+    let res = get_shape(&engine, &format!("table=t&handle={handle}&offset=not-a-real-offset")).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "expected must-refetch, got {:?}", res.messages);
+    assert_eq!(res.messages.len(), 1);
+    assert_eq!(res.messages[0]["headers"]["control"], "must-refetch");
+
+    // And the shape is still serving: the refusal is about that offset, not the shape.
+    let fresh = get_shape(&engine, "table=t&offset=-1").await;
+    assert_eq!(fresh.status, StatusCode::OK);
+    assert_eq!(fresh.changes().len(), 1, "re-snapshot returns the live row: {:?}", fresh.messages);
 }

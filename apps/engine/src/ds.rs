@@ -265,6 +265,15 @@ impl DsClient {
             return Ok(ReadResult { envelopes: Vec::new(), next_offset, up_to_date });
         }
         if !status.is_success() {
+            // 400 (malformed offset) and 410 (before the earliest retained position) are the server
+            // saying this POSITION cannot be served — not that the read failed. Typed, so the
+            // Electric adapter can answer its client `409 must-refetch` instead of a 500:
+            // re-snapshotting is the protocol's own answer to an offset that no longer places.
+            // (durable-streams PROTOCOL.md §GET response codes.)
+            if matches!(status.as_u16(), 400 | 410) {
+                return Err(anyhow::Error::new(UnplaceableOffset { status: status.as_u16() })
+                    .context(format!("GET {path} at offset {offset}")));
+            }
             bail!("GET {path} -> {status}");
         }
         let body = res.text().await?;
@@ -275,6 +284,25 @@ impl DsClient {
         };
         Ok(ReadResult { envelopes, next_offset, up_to_date })
     }
+}
+
+/// The stream could not place the offset it was asked for: malformed, or aged out of retention.
+#[derive(Debug)]
+pub struct UnplaceableOffset {
+    pub status: u16,
+}
+
+impl std::fmt::Display for UnplaceableOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the stream cannot place this offset (durable-streams answered {})", self.status)
+    }
+}
+
+impl std::error::Error for UnplaceableOffset {}
+
+/// Whether this error, or anything it wraps, is an [`UnplaceableOffset`].
+pub fn is_unplaceable_offset(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<UnplaceableOffset>())
 }
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
