@@ -101,7 +101,6 @@ pub(crate) fn spawn_sequencer(
     ds: DsClient,
     tables: SharedTables,
     start_offset: String,
-    seq_lsn: Arc<std::sync::Mutex<String>>,
     catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
@@ -116,7 +115,6 @@ pub(crate) fn spawn_sequencer(
         ds,
         tables,
         start_offset,
-        seq_lsn,
         catalog_tx,
         cmd_rx,
         processed.clone(),
@@ -243,7 +241,6 @@ pub(crate) async fn sequencer_loop(
     ds: DsClient,
     tables: SharedTables,
     start_offset: String,
-    seq_lsn: Arc<std::sync::Mutex<String>>,
     catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
@@ -471,18 +468,16 @@ pub(crate) async fn sequencer_loop(
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
-                        // Publish the fan-out frontier (`Engine::sequenced_lsn`) — what the Electric
-                        // adapter advertises as `global_last_seen_lsn`, and what consumers discard
-                        // changes at or below. This commit's own appends have landed, but deferred
-                        // subquery flips carry their SOURCE commit's LSN and land later, so the
-                        // frontier may only move while none is outstanding: publishing past an
-                        // unlanded flip would have the consumer drop its move-in/move-out rows.
-                        // `pending_flips` is incremented synchronously during `process_envelope`
-                        // above, so a flip from THIS transaction is already counted here.
-                        if let Some(l) = &lsn
-                            && subq.pending_flips.load(Ordering::SeqCst) == 0
-                        {
-                            *seq_lsn.lock().unwrap() = l.clone();
+                        // Hand this commit to the fan-out frontier (`Engine::sequenced_lsn`) — what
+                        // the Electric adapter advertises as `global_last_seen_lsn`, and what
+                        // consumers discard changes at or below. Its own appends have now landed;
+                        // the deferred subquery flips it triggered carry this same LSN and land
+                        // later, so [`Frontier`] publishes it only once the barrier is drained —
+                        // here if it already is, otherwise from the worker that drains it. The
+                        // holds for THIS transaction's flips were taken synchronously during
+                        // `process_envelope` above, so they are already counted.
+                        if let Some(l) = &lsn {
+                            subq.frontier.commit_flushed(l);
                         }
                         i = j;
                     }
@@ -935,7 +930,7 @@ pub(crate) async fn process_envelope(
     // updates the shared inner-set nodes (in-memory) and emits outer-shape deltas; the flip-driven
     // Postgres query-backs are handed to the engine's flip-propagator task so they never block
     // this tailer. The convergence barrier is processed offsets + a drained flip queue
-    // (`pending_flips == 0`).
+    // (a drained [`Frontier`] barrier).
     {
         let mut work = std::collections::VecDeque::new();
         {
@@ -959,10 +954,10 @@ pub(crate) async fn process_envelope(
             }
         }
         if !work.is_empty() {
-            subq.pending_flips.fetch_add(1, Ordering::SeqCst);
+            subq.frontier.hold();
             if subq.flip_tx.send(FlipWork { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
-                subq.pending_flips.fetch_sub(1, Ordering::SeqCst);
+                subq.frontier.release();
             }
         }
     }

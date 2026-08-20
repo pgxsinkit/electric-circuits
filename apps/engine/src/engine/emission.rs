@@ -14,16 +14,15 @@
 //!   * appends use `append_reliable` (retry-until-landed; the only non-retried case is 404 —
 //!     the shape was dropped, discard is correct).
 //!
-//! The convergence barrier: every enqueued batch increments the shared `pending` counter
-//! (the engine's `pendingFlips` term) and decrements it only after the append **landed**, so
+//! The convergence barrier: every enqueued batch takes a hold on the engine's [`Frontier`]
+//! (the `pendingFlips` term) and releases it only after the append **landed**, so
 //! "`pendingFlips == 0`" still means every subquery effect is on its stream — queued batches
-//! included. Increment-before/at-enqueue happens while the emitter still holds its own
-//! accounting (a `FlipWork` token stays >0 until its batches are enqueued), so the counter
-//! never dips to zero with effects in flight.
+//! included. The hold is taken at enqueue while the emitter still holds its own
+//! (a `FlipWork` hold stays outstanding until its batches are enqueued), so the counter
+//! never dips to zero with effects in flight — which is also what makes it safe for the
+//! frontier to publish a commit the moment it does.
 
 use super::*;
-
-use std::sync::atomic::AtomicI64;
 
 struct Batch {
     stream_path: String,
@@ -34,30 +33,32 @@ struct Batch {
 #[derive(Clone)]
 pub(crate) struct EmissionLanes {
     lanes: Arc<Vec<mpsc::UnboundedSender<Batch>>>,
-    pending: Arc<AtomicI64>,
+    frontier: Arc<Frontier>,
 }
 
 impl EmissionLanes {
-    /// Spawn `n` writer tasks. `pending` is the engine's convergence-barrier counter
-    /// (`pendingFlips`): incremented per enqueued batch, decremented after its append lands.
-    pub(crate) fn spawn(ds: DsClient, n: usize, pending: Arc<AtomicI64>) -> EmissionLanes {
+    /// Spawn `n` writer tasks. Each enqueued batch takes a hold on the engine's convergence
+    /// barrier ([`Frontier`], the `pendingFlips` term) and releases it once its append lands.
+    pub(crate) fn spawn(ds: DsClient, n: usize, frontier: Arc<Frontier>) -> EmissionLanes {
         let n = n.max(1);
         let mut lanes = Vec::with_capacity(n);
         for _ in 0..n {
             let (tx, mut rx) = mpsc::unbounded_channel::<Batch>();
             let ds = ds.clone();
-            let pending = pending.clone();
+            let frontier = frontier.clone();
             tokio::spawn(async move {
                 while let Some(b) = rx.recv().await {
                     // Reliable: a dropped subquery envelope is permanent divergence for the
                     // shape's subscribers. 404 (shape dropped mid-flight) discards, correctly.
                     ds.append_reliable(&b.stream_path, &b.envs).await;
-                    pending.fetch_sub(1, Ordering::SeqCst);
+                    // The append landed: this batch's effects are on the stream, so the commit
+                    // waiting on the barrier may now be published (see [`Frontier::release`]).
+                    frontier.release();
                 }
             });
             lanes.push(tx);
         }
-        EmissionLanes { lanes: Arc::new(lanes), pending }
+        EmissionLanes { lanes: Arc::new(lanes), frontier }
     }
 
     /// Which lane serves `path` (stable: one stream always drains through one FIFO).
@@ -75,11 +76,11 @@ impl EmissionLanes {
         if envs.is_empty() {
             return;
         }
-        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.frontier.hold();
         let lane = self.lane_for(stream_path);
         if self.lanes[lane].send(Batch { stream_path: stream_path.to_string(), envs }).is_err() {
             // Writer gone (engine teardown): don't leave the barrier stuck.
-            self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.frontier.release();
         }
     }
 }

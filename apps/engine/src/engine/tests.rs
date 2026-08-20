@@ -66,10 +66,10 @@ fn test_subq() -> SubqueryHandle {
     let registry =
         Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
-    let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let frontier = Arc::new(super::frontier::Frontier::new());
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
-    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), trace_tx);
-    SubqueryHandle { registry, flip_tx, pending_flips }
+    spawn_flip_propagator(registry.clone(), flip_rx, frontier.clone(), trace_tx);
+    SubqueryHandle { registry, flip_tx, frontier }
 }
 
 fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {
@@ -999,8 +999,8 @@ async fn emission_lanes_order_and_barrier() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let ds = crate::ds::DsClient::new(&format!("http://{addr}"));
-    let pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone());
+    let barrier = Arc::new(super::frontier::Frontier::new());
+    let lanes = emission::EmissionLanes::spawn(ds, 4, barrier.clone());
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
     assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));
@@ -1017,11 +1017,11 @@ async fn emission_lanes_order_and_barrier() {
         lanes.enqueue("shape/a", vec![env(i)]);
         lanes.enqueue("shape/b", vec![env(i)]);
     }
-    assert!(pending.load(Ordering::SeqCst) > 0, "barrier must cover queued batches");
+    assert!(barrier.pending() > 0, "barrier must cover queued batches");
 
     // Drain: the barrier is the only signal a caller has — poll it like the harness does.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while pending.load(Ordering::SeqCst) != 0 {
+    while barrier.pending() != 0 {
         assert!(std::time::Instant::now() < deadline, "lanes did not drain");
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -1097,4 +1097,39 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
     let merged = card.with_bytes(bytes);
     assert_eq!(merged.bytes_shape_records, merged.bytes_shape_records); // shape carried through
     assert!(merged.bytes_shape_records > 0);
+}
+
+/// **The terminal-flip stall.** A commit whose deferred flips are still in flight is not
+/// publishable at its own transaction boundary — and if the source then goes quiet, no later
+/// boundary ever comes back to it. The frontier must therefore be published by whichever worker
+/// drains the last outstanding flip. Before that, `sequencedLsn` froze at the previous commit
+/// forever, and a consumer holding the delivered changes above its watermark never applied them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_flip_publishes_the_commit_that_was_waiting_on_it() {
+    use crate::subquery::{Flip, FlipDir};
+
+    let subq = test_subq();
+    // A commit that produced deferred flip work: the hold is taken where the sequencer takes it,
+    // synchronously, before the transaction's own boundary. The signature has no dependents, so
+    // propagation is a no-op that still has to release the barrier.
+    subq.frontier.hold();
+    subq.flip_tx
+        .send(FlipWork {
+            work: [("no-dependents".to_string(), Flip { value: Value::Int(1), dir: FlipDir::Enter })]
+                .into_iter()
+                .collect(),
+            txid: None,
+            lsn: Some("0/10".into()),
+        })
+        .unwrap();
+    subq.frontier.commit_flushed("0/10");
+    assert_eq!(subq.frontier.published(), "0/0", "not while its flips are in flight");
+
+    // No further transaction ever arrives. The drain is the only thing that can publish it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while subq.frontier.published() != "0/10" {
+        assert!(std::time::Instant::now() < deadline, "the terminal flip stranded the frontier");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(subq.frontier.pending(), 0);
 }

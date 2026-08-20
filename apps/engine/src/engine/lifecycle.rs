@@ -985,9 +985,9 @@ impl Engine {
                     .await?;
                 if !work.is_empty() {
                     // Replay flips propagate exactly like live ones (barrier-covered).
-                    self.pending_flips.fetch_add(1, Ordering::SeqCst);
+                    self.frontier.hold();
                     if self.flip_tx.send(FlipWork { work, txid: None, lsn: None }).is_err() {
-                        self.pending_flips.fetch_sub(1, Ordering::SeqCst);
+                        self.frontier.release();
                     }
                 }
                 Ok(())

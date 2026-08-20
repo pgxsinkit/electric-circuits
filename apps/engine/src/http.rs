@@ -86,11 +86,17 @@ fn health_json(status: &str) -> String {
     format!("{{\"status\":\"{status}\"}}")
 }
 
-/// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200. Caches are disabled so the fleet's
-/// 500ms poll always sees the live phase.
+/// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200, `degraded` → 503. Caches are
+/// disabled so the fleet's 500ms poll always sees the live phase.
 async fn health_v1(State(engine): State<Engine>) -> Response {
     let status = engine.health_status();
-    let code = if status == "active" { StatusCode::OK } else { StatusCode::ACCEPTED };
+    let code = match status {
+        "active" => StatusCode::OK,
+        // Lost subquery effects: serving, but no longer able to tell a client what it has seen, so
+        // fail readiness and let the fleet restart us — a restart re-seeds membership from Postgres.
+        "degraded" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::ACCEPTED,
+    };
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -558,6 +564,9 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // Deferred subquery flip batches not yet propagated. Convergence barrier = sync caught up
         // + per-table offsets at tail + pendingFlips == 0.
         "pendingFlips": engine.pending_flips(),
+        // Flip batches abandoned after exhausting their retries. Non-zero means membership effects
+        // were LOST: `sequencedLsn` is frozen and `/v1/health` reports `degraded`.
+        "flipFailures": engine.flip_failures(),
     }))
 }
 
@@ -627,5 +636,6 @@ mod tests {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
+        assert_eq!(health_json("degraded"), r#"{"status":"degraded"}"#);
     }
 }

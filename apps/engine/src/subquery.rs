@@ -2514,4 +2514,58 @@ mod tests {
         // unknown sig -> empty
         assert!(!reg.contains(&"other".to_string(), &Value::Int(1)));
     }
+
+    /// **A failed query-back is not a drained one.** Propagation runs off the tailer path, so its
+    /// only report is the barrier it releases. When the query-backs cannot be made — Postgres away,
+    /// pool exhausted — the membership rows this flip would have moved never reach any shape
+    /// stream, and nothing retries them: the effects are LOST, not late.
+    ///
+    /// So the retries must be real, and running out of them must stop the engine claiming anything
+    /// is fully fanned out. Before this, the batch was logged and the barrier released as if it had
+    /// landed, and the very next commit advertised a watermark past the missing rows — consumers
+    /// discarded them permanently, with a divergence no client could detect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abandoned_flip_work_poisons_the_frontier() {
+        let ts = issues_ts();
+        // No `pg_url`: every membership query-back fails, exactly as an outage makes it fail.
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+        // The edge a real `begin_create` compile would stage: the flip has a dependent to move.
+        reg.add_edge(Edge {
+            node_sig: sig.clone(),
+            dependent: Dependent::Shape("s1".into()),
+            connecting_col: 1,
+            negated: false,
+            null_sensitive: false,
+        });
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let frontier = crate::engine::frontier::Frontier::new();
+        // A commit that produced flip work, flushed while the work is still outstanding.
+        frontier.hold();
+        frontier.commit_flushed("0/10");
+        let work: VecDeque<(SubquerySig, Flip)> =
+            [(sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
+        crate::engine::propagate_with_retry(
+            &registry,
+            &work,
+            None,
+            Some("0/10".into()),
+            &trace_tx,
+            &frontier,
+        )
+        .await;
+        frontier.release();
+
+        assert!(frontier.poisoned(), "abandoned membership effects must poison the frontier");
+        assert_eq!(frontier.failures(), 1);
+        assert_eq!(frontier.published(), "0/0", "the commit whose effects were lost is never published");
+        // And it stays stopped: a later, perfectly healthy commit cannot un-poison it.
+        frontier.commit_flushed("0/20");
+        assert_eq!(frontier.published(), "0/0");
+    }
 }

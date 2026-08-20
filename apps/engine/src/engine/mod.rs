@@ -25,6 +25,7 @@ mod catalog;
 mod circuit_serving;
 pub(crate) mod emission;
 mod executors;
+pub(crate) mod frontier;
 mod introspection;
 mod lifecycle;
 pub(crate) mod membership;
@@ -37,6 +38,7 @@ mod tests;
 use catalog::*;
 use circuit_serving::*;
 use executors::*;
+use frontier::Frontier;
 use introspection::*;
 use planning::*;
 use sequencer::*;
@@ -64,10 +66,11 @@ pub struct Engine {
     pg_url: Option<String>,
     /// Last commit LSN the replication ingestor has appended (observability).
     repl_lsn: Arc<std::sync::Mutex<String>>,
-    /// The sequencer's FAN-OUT frontier: the last commit LSN whose changes are on every shape stream
-    /// they belong to. Trails [`Self::repl_lsn`] (which is only the ingest head). Published by the
-    /// sequencer; read by the Electric adapter for `global_last_seen_lsn`. See [`Self::sequenced_lsn`].
-    seq_lsn: Arc<std::sync::Mutex<String>>,
+    /// The FAN-OUT frontier: the last commit LSN whose changes are on every shape stream they
+    /// belong to, together with the convergence barrier gating it. Trails [`Self::repl_lsn`] (which
+    /// is only the ingest head). Read by the Electric adapter for `global_last_seen_lsn`. See
+    /// [`Self::sequenced_lsn`] and [`frontier::Frontier`].
+    frontier: Arc<Frontier>,
     /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended. The drain barrier
     /// bumps the sentinel and waits for this to catch up — robust under a shared multi-database
     /// Postgres (per-database, no dependence on server-global WAL LSNs).
@@ -89,9 +92,6 @@ pub struct Engine {
     /// off here so their Postgres query-backs run off the tailer hot path (see
     /// [`crate::subquery::propagate_flips`]).
     flip_tx: mpsc::UnboundedSender<FlipWork>,
-    /// Flip batches enqueued but not yet fully propagated. Part of the convergence barrier:
-    /// drained change log + `pending_flips == 0` ⇒ all subquery effects have landed.
-    pending_flips: Arc<std::sync::atomic::AtomicI64>,
     /// Table schemas shared with the sequencer task (updated on `setup_postgres`/`define_schema`).
     tables_shared: SharedTables,
     /// Ordered writer for the durable shape catalog (see [`CATALOG_STREAM`]).
@@ -132,7 +132,7 @@ pub(crate) struct FlipWork {
 struct SubqueryHandle {
     registry: Arc<Mutex<SubqueryRegistry>>,
     flip_tx: mpsc::UnboundedSender<FlipWork>,
-    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    frontier: Arc<Frontier>,
 }
 
 /// Spawn the flip-propagation dispatcher: FlipWork batches run **concurrently**, bounded by a
@@ -146,7 +146,7 @@ struct SubqueryHandle {
 fn spawn_flip_propagator(
     registry: Arc<Mutex<SubqueryRegistry>>,
     mut rx: mpsc::UnboundedReceiver<FlipWork>,
-    pending: Arc<std::sync::atomic::AtomicI64>,
+    frontier: Arc<Frontier>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
     let workers: usize = std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS")
@@ -159,22 +159,64 @@ fn spawn_flip_propagator(
         while let Some(fw) = rx.recv().await {
             let permit = sem.clone().acquire_owned().await.expect("flip semaphore");
             let registry = registry.clone();
-            let pending = pending.clone();
+            let frontier = frontier.clone();
             let trace_tx = trace_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::subquery::propagate_flips(&registry, fw.work, fw.txid, fw.lsn, &trace_tx).await
-                {
-                    tracing::error!("subquery flip propagation failed: {e:#}");
-                }
-                // Decremented only after propagation finished enqueueing every resulting
-                // batch — each batch carries its own pending increment until it lands, so
+                propagate_with_retry(&registry, &fw.work, fw.txid, fw.lsn, &trace_tx, &frontier).await;
+                // Released only after propagation finished enqueueing every resulting
+                // batch — each batch carries its own hold until it lands, so
                 // the barrier never reads zero with effects in flight.
-                pending.fetch_sub(1, Ordering::SeqCst);
+                frontier.release();
                 drop(permit);
             });
         }
     });
+}
+
+/// How many times a flip batch's query-backs are attempted before the work is abandoned.
+const FLIP_ATTEMPTS: u32 = 5;
+
+/// Run one batch's propagation, retrying a failed query-back before giving up.
+///
+/// A failure here is a Postgres round-trip that did not answer — a pool timeout, a dropped
+/// connection, a restart. Re-running the batch is safe: membership is re-derived from the current
+/// inner-set state and emitted **absolutely** per pk (see [`crate::subquery::emit_for_shapes`]), so
+/// a partially-applied batch converges to the same result on a second pass.
+///
+/// If every attempt fails the effects are LOST — the rows a subquery moved in or out never reach
+/// their shape streams, and nothing will retry them. That is not a lag the frontier can wait out,
+/// so the frontier is poisoned: the engine stops claiming any commit is fully fanned out, and
+/// `/v1/health` reports `degraded` so the fleet restarts it (a restart re-seeds every node from
+/// Postgres, which is what actually repairs the divergence). Silently continuing would leave
+/// consumers with permanently wrong membership and no signal — see `docs/ARCHITECTURE.md`.
+pub(crate) async fn propagate_with_retry(
+    registry: &Mutex<SubqueryRegistry>,
+    work: &std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    frontier: &Frontier,
+) {
+    let mut backoff = std::time::Duration::from_millis(50);
+    for attempt in 1..=FLIP_ATTEMPTS {
+        let r =
+            crate::subquery::propagate_flips(registry, work.clone(), txid.clone(), lsn.clone(), trace_tx)
+                .await;
+        match r {
+            Ok(()) => return,
+            Err(e) if attempt < FLIP_ATTEMPTS => {
+                tracing::warn!("subquery flip propagation failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(e) => {
+                tracing::error!(
+                    "subquery flip propagation failed after {FLIP_ATTEMPTS} attempts, ABANDONED                      (membership effects lost; fan-out frontier poisoned): {e:#}"
+                );
+                frontier.poison();
+            }
+        }
+    }
 }
 
 struct EngineState {
@@ -316,17 +358,17 @@ impl Engine {
         let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
-        let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let frontier = Arc::new(Frontier::new());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
         let lanes = emission::EmissionLanes::spawn(
             ds.clone(),
             std::env::var("ELECTRIC_CIRCUITS_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
-            pending_flips.clone(),
+            frontier.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
-        spawn_flip_propagator(subqueries.clone(), flip_rx, pending_flips.clone(), trace_tx.clone());
+        spawn_flip_propagator(subqueries.clone(), flip_rx, frontier.clone(), trace_tx.clone());
         let (catalog_tx, catalog_rx) = mpsc::unbounded_channel();
         spawn_catalog_writer(ds.clone(), catalog_rx);
         Engine {
@@ -342,7 +384,7 @@ impl Engine {
             })),
             pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
-            seq_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
+            frontier,
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Library mode: no Postgres to wait on, so report `active` immediately.
@@ -350,7 +392,6 @@ impl Engine {
             subqueries,
             trace_tx,
             flip_tx,
-            pending_flips,
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
             seq_start: Arc::new(std::sync::Mutex::new("-1".to_string())),
@@ -440,14 +481,20 @@ impl Engine {
 
     /// Flip batches enqueued but not yet propagated (convergence-barrier term; see `flip_tx`).
     pub fn pending_flips(&self) -> i64 {
-        self.pending_flips.load(std::sync::atomic::Ordering::SeqCst)
+        self.frontier.pending()
+    }
+
+    /// Flip batches abandoned after exhausting their retries. Non-zero means the fan-out frontier
+    /// is poisoned and the engine is `degraded` (see [`Frontier::poison`]).
+    pub fn flip_failures(&self) -> u64 {
+        self.frontier.failures()
     }
 
     fn subquery_handle(&self) -> SubqueryHandle {
         SubqueryHandle {
             registry: self.subqueries.clone(),
             flip_tx: self.flip_tx.clone(),
-            pending_flips: self.pending_flips.clone(),
+            frontier: self.frontier.clone(),
         }
     }
 
@@ -459,7 +506,6 @@ impl Engine {
                 self.ds.clone(),
                 self.tables_shared.clone(),
                 start,
-                self.seq_lsn.clone(),
                 self.catalog_tx.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
@@ -475,11 +521,14 @@ impl Engine {
         self.state.lock().await.tables.len()
     }
 
-    /// The `/v1/health` status string: `waiting` | `starting` | `active` (exact, no whitespace).
+    /// The `/v1/health` status string: `waiting` | `starting` | `active` | `degraded` (exact, no
+    /// whitespace). `degraded` outranks `active`: the engine is serving, but it has lost subquery
+    /// effects and can no longer tell a client what it has seen (see [`Frontier::poison`]).
     pub fn health_status(&self) -> &'static str {
         match self.health.load(std::sync::atomic::Ordering::Relaxed) {
             HEALTH_WAITING => "waiting",
             HEALTH_STARTING => "starting",
+            _ if self.frontier.poisoned() => "degraded",
             _ => "active",
         }
     }
@@ -570,9 +619,11 @@ impl Engine {
     ///
     /// Trails the ingest head, and stalls (rather than over-advancing) while flip work is
     /// outstanding — the conservative direction: a stale watermark holds a consumer's changes
-    /// buffered, an over-advanced one makes it discard them.
+    /// buffered, an over-advanced one makes it discard them. A commit that flushes while flips are
+    /// still in flight is published by whichever worker drains the last of them, so a terminal flip
+    /// on a stream that then goes quiet does not strand the watermark.
     pub fn sequenced_lsn(&self) -> String {
-        self.seq_lsn.lock().unwrap().clone()
+        self.frontier.published()
     }
 
     /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended.
