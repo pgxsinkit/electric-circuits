@@ -121,10 +121,15 @@ The engine also speaks Electric's wire protocol (`apps/engine/src/electric.rs`),
 Electric clients/tools work:
 
 - **Snapshot:** `GET /v1/shape?table=todos&where=<SQL WHERE>` (or `offset=-1`) → the current rows
-  as `insert` messages + an `up-to-date` control message. Response carries `electric-handle` and
-  `electric-offset` headers. (Schema-qualified names like `public.todos` are accepted.)
-- **Live:** `GET /v1/shape?...&handle=<h>&offset=<o>&live=true` long-polls for `insert`/`update`/
-  `delete` from that offset. An unknown handle returns `must-refetch`.
+  as `insert` messages + an `up-to-date` control message. Response carries `electric-handle`,
+  `electric-offset` and `electric-schema` headers. (`public.todos` is accepted and means `todos`;
+  the engine serves the `public` schema only, so any other qualifier is a `400`, not a silent
+  answer from `public`.)
+- **Catch-up / live:** `GET /v1/shape?...&handle=<h>&offset=<o>[&live=true]` replays
+  `insert`/`update`/`delete` from that offset, long-polling when `live=true`. Every **non-live**
+  response repeats `electric-schema` (a client resuming from a persisted offset has never seen a
+  snapshot); live polls omit it, as Electric does. An unknown handle — or an offset that can no
+  longer be placed in the shape's stream — returns `must-refetch`.
 
 Here the `where` is a **SQL string** (`status = 'active' AND priority > 2`, `BETWEEN`, `IN (…)`,
 `IN (SELECT …)`, `NOT IN`), parsed by the engine's WHERE parser.

@@ -206,7 +206,8 @@ Any two **equal** shapes share one maintained stream, ref-counted:
   are torn down when the last subscriber leaves (a dropped shape must not leave an orphaned stream
   on the storage server). N joiners hold the same id and must each delete exactly once; the client
   enforces one-shot `close()`.
-- The Electric `/v1/shape` adapter opts out (`share=false`) — its protocol needs per-request handles.
+- The Electric `/v1/shape` adapter shares too (`share=true`); its per-request **handles** are minted
+  per snapshot *on top of* the shared shape, so they cost cursor state, not a second stream (§8).
 
 ### 5.4 Creation is atomic; failures never leave zombies
 
@@ -392,10 +393,38 @@ carry their commit LSN for exactly this. Key invariants (all regression-tested):
 
 `GET /v1/shape` (`electric.rs`) serves the ElectricSQL client protocol directly from the engine:
 `table` + SQL `where` (+ `columns`) are parsed (`where_sql.rs`) into the same predicate AST used
-everywhere else, identical `/v1/shape` definitions share ONE engine shape (`share=true`, so the
-handle is the shared shape id), the shape stream is folded into the Electric message shape
-(insert/update/delete + `up-to-date` control messages), and live requests long-poll. Handle state
-is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
+everywhere else, identical `/v1/shape` definitions share ONE engine shape (`share=true`, with a
+per-client handle minted per snapshot on top of it), the shape stream is folded into the Electric
+message shape (insert/update/delete + `up-to-date` control messages), and live requests long-poll.
+Table names may be `public`-qualified (`public.users` → `users`); the engine introspects the `public`
+schema only, so any other qualifier is a `400` rather than an answer from the wrong table.
+
+**`electric-schema` rides every non-live response**, not just the `offset=-1` snapshot — a client
+resuming from a persisted `(handle, offset)` has never seen a snapshot, and `@electric-sql/client`
+hard-errors without it. Live polls omit it, as Electric does.
+
+**Watermarks.** Change messages carry the source commit's `lsn` and `up-to-date` carries
+`global_last_seen_lsn`, both as Electric's decimal 64-bit form. Consumers position a dedup frontier
+on the watermark and *discard* anything at or below it, so it is the engine's **fan-out frontier**
+(`Engine::sequenced_lsn`, also on `GET /replication/lsn` as `sequencedLsn`) — the last commit whose
+changes have reached the shape streams, deferred subquery flips included — captured *before* the read
+it accompanies. Never the ingest head (`replication_lsn`), which runs ahead of the fan-out. The
+frontier stalls rather than over-advancing while flip work is outstanding: a stale watermark holds a
+consumer's changes buffered, an over-advanced one makes it throw them away. For the same reason every
+emitted envelope carries its source LSN — an unstamped change reaches the client with no `lsn` header,
+floors to 0, and is dropped as already-seen.
+
+**Resuming at an offset.** A client that reconnects at an older offset than the handle last served
+needs the key set *it* holds at that offset (the adapter reconstructs insert-vs-update, and suppresses
+deletes of keys the client never had). Durable-streams carries no per-envelope offset — a read is a
+raw byte range and messages are stored verbatim — so nothing can fold "up to" an offset. What a read
+gives exactly is a **suffix**, so the adapter subtracts two of them: everything after the client's
+offset is, at one tail, exactly the tail of everything in the stream, and the leading remainder is
+precisely the window the client has seen (`electric.rs::keys_at`). An offset that cannot be placed
+that way is answered `409 must-refetch` rather than served from a guessed key set — a key set rebuilt
+from the wrong window fails silently in the retain-data direction (a revoked row is never evicted).
+
+Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay
 from the captured resume offset (through the sequencer's two-phase pending-buffer handshake);

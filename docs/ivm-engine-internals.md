@@ -289,8 +289,9 @@ key on `(table, predicate, fn, column)` in their own namespace. Consequences:
 - Creation is **atomic**: on any failure the record, share entries, and (for subqueries) every
   node refcount/edge/pending-seed added by the attempt are rolled back
   (`subquery.rs::rollback_create`).
-- The Electric `/v1/shape` adapter passes `share=false` (its protocol needs per-request
-  handles); everything else shares by default.
+- The Electric `/v1/shape` adapter passes `share=true` like everything else: identical shape
+  definitions collapse onto ONE engine shape/stream, and the per-request **handle** (with its own
+  cursor state) is minted per snapshot on top of it.
 
 ### 3.6 Aggregations (extended API)
 
