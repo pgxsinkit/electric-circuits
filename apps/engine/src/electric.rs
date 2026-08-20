@@ -897,9 +897,18 @@ async fn shape_inner(
     mut p: ShapeParams,
     raw_pairs: &[(String, String)],
 ) -> Result<Response, ApiError> {
-    // Electric clients send schema-qualified table names (`public.users`); our engine keys by the bare
-    // table name. Strip any schema prefix.
-    if let Some((_schema, bare)) = p.table.rsplit_once('.') {
+    // Electric clients send schema-qualified table names (`public.users`); our engine keys by the
+    // bare table name and introspects the `public` schema ONLY (see `pg::introspect`). So `public.`
+    // is stripped and any OTHER qualifier is an unknown table — stripping it too would answer
+    // `private.users` with `public.users`: different rows, silently, which is an authorization
+    // answer given from the wrong table.
+    if let Some((schema, bare)) = p.table.rsplit_once('.') {
+        if schema != "public" {
+            return Err(ApiError::bad_request(format!(
+                "unknown table '{}' (only the 'public' schema is served)",
+                p.table
+            )));
+        }
         p.table = bare.to_string();
     }
     let offset = p.offset.clone().unwrap_or_else(|| "-1".into());

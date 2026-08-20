@@ -79,6 +79,37 @@ async fn legacy_health_still_ok() {
 
 /// `DELETE /table/{table}/rows` is registered and validates its input: an unknown table is a 400
 /// with an `error` body (not a 404/405, which would mean the route or method is missing).
+// Electric clients qualify table names (`public.users`). The engine introspects the `public` schema
+// ONLY, so `public.` is stripped and any other qualifier is an unknown table: stripping that one too
+// would answer `private.users` from `public.users` — different rows, silently, which is an
+// authorization answer given from the wrong table.
+#[tokio::test]
+async fn shape_rejects_a_non_public_schema_qualifier() {
+    let res = router(library_engine())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/shape?table=private.users&offset=-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(res).await;
+    assert!(body.contains("private.users"), "the rejection must name the table asked for: {body}");
+    assert!(body.contains("public"), "and say why: {body}");
+
+    // `public.` is still stripped — this one fails later, as an unknown *bare* table.
+    let res = router(library_engine())
+        .oneshot(
+            Request::builder().uri("/v1/shape?table=public.users&offset=-1").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_string(res).await, r#"{"message":"unknown table 'users'"}"#);
+}
+
 #[tokio::test]
 async fn delete_table_rows_rejects_unknown_table() {
     let res = router(library_engine())
