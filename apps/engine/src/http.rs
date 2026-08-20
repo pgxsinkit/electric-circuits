@@ -551,6 +551,9 @@ async fn subquery_stats(State(engine): State<Engine>) -> Json<serde_json::Value>
 async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "lsn": engine.replication_lsn(),
+        // The fan-out frontier: `lsn` is only the ingest head, this is what has actually reached the
+        // shape streams (deferred subquery flips included). See `Engine::sequenced_lsn`.
+        "sequencedLsn": engine.sequenced_lsn(),
         "sync": engine.replication_sync(),
         // Deferred subquery flip batches not yet propagated. Convergence barrier = sync caught up
         // + per-table offsets at tail + pendingFlips == 0.

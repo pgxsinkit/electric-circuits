@@ -272,6 +272,10 @@ pub struct PendingSubqueryShape {
     collect_log: Vec<SubquerySig>,
     /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install.
     buffer: Vec<Tup2<Row, ZWeight>>,
+    /// Commit LSN of the newest delta in `buffer` — the high-water mark of what the replay emission
+    /// reflects, stamped onto its envelopes so they clear a consumer's dedup frontier (see
+    /// [`SubqueryRegistry::emit_for_shapes`]).
+    buffer_lsn: Option<String>,
 }
 
 impl HeapSize for PendingSubqueryShape {
@@ -782,6 +786,7 @@ impl SubqueryRegistry {
             changes_only,
             collect_log: log,
             buffer: Vec::new(),
+            buffer_lsn: None,
         });
         Ok(BeginCreate { seeds, schemas: self.schemas.clone() })
     }
@@ -874,8 +879,12 @@ impl SubqueryRegistry {
             self.feed_sets.insert(feed_id, pk_id);
         }
         if !pending.buffer.is_empty() {
+            // Stamp the replay with the newest commit it reflects, so these rows clear a consumer's
+            // dedup frontier (see `emit_for_shapes`); an unstamped replay floors to LSN 0 and is
+            // discarded by any consumer whose frontier has moved.
+            let replay_lsn = pending.buffer_lsn.clone();
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
-            self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None).await?;
+            self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None, replay_lsn).await?;
         }
         Ok(work)
     }
@@ -1040,12 +1049,14 @@ impl SubqueryRegistry {
     /// flip-driven Postgres query-backs is safe because outer membership is emitted absolutely
     /// (upsert-if-matches-now / idempotent delete), so cross-table convergence is order-independent;
     /// the convergence barrier is the processed offset **plus** a drained flip queue. `lsn` is the
-    /// change's commit LSN (0 = unknown/never skip).
+    /// change's commit LSN as a comparable u64 (0 = unknown/never skip); `commit_lsn` is the same
+    /// LSN in text form, stamped onto the emitted envelopes (see [`Self::emit_for_shapes`]).
     pub async fn on_table_delta(
         &mut self,
         ts: &TableSchema,
         delta: &[Tup2<Row, ZWeight>],
         lsn: u64,
+        commit_lsn: Option<String>,
         xid: Option<u64>,
         txid: Option<String>,
         mut trace: Option<&mut Vec<crate::trace::TraceHop>>,
@@ -1131,13 +1142,16 @@ impl SubqueryRegistry {
             }
             groups.push((id, crate::engine::membership::latest_rows_by_pk(ts, delta)));
         }
-        for (id, emitted, _net) in self.emit_for_shapes(ts, groups, txid.clone()).await? {
+        for (id, emitted, _net) in self.emit_for_shapes(ts, groups, txid.clone(), commit_lsn.clone()).await? {
             hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
         }
 
         // 2b. Pending shapes (mid-create) on this table: buffer for gated replay at install.
         for p in self.pending_shapes.iter_mut().filter(|p| p.outer_table == table) {
             p.buffer.extend(delta.iter().cloned());
+            if commit_lsn.is_some() {
+                p.buffer_lsn = commit_lsn.clone();
+            }
         }
 
         // 3. Flip propagation (the Postgres query-backs) is deferred: the caller enqueues `work`
@@ -1283,11 +1297,19 @@ impl SubqueryRegistry {
     /// decision atomic with its bitmap transition (borrow-checker-enforced — no `.await` between).
     /// `candidates` are each shape's touched rows: `(latest row, still-exists)`.
     /// Returns per shape whether anything was delivered (trace hops).
+    ///
+    /// `lsn` is the commit LSN these emissions are a consequence of, stamped onto every envelope.
+    /// It is load-bearing, not decoration: an Electric consumer positions its dedup frontier on the
+    /// `up-to-date` watermark and DISCARDS any change at or below it, and a change delivered with no
+    /// `lsn` header floors to 0 — so an unstamped move-in/move-out row is silently dropped the
+    /// moment that consumer's frontier has moved off zero. `None` only where no commit is the cause
+    /// (a shape's own creation replay).
     async fn emit_for_shapes(
         &mut self,
         ts: &TableSchema,
         groups: Vec<(String, Vec<(Row, bool)>)>,
         txid: Option<String>,
+        lsn: Option<String>,
     ) -> Result<Vec<(String, bool, i64)>> {
         // Phase 1: evaluate each candidate against the current membership snapshot and, in the
         // SAME synchronous step (no `.await`), transition the host-side FeedSet — building the
@@ -1335,10 +1357,10 @@ impl SubqueryRegistry {
                 ts,
                 members.into_iter().map(|r| (r, 1)).collect(),
                 txid.clone(),
-                None,
+                lsn.clone(),
                 shape.out_cols.as_deref().map(Vec::as_slice),
             );
-            envs.extend(crate::engine::delete_envelopes(ts, dels, txid.clone()));
+            envs.extend(crate::engine::delete_envelopes(ts, dels, txid.clone(), lsn.clone()));
             if envs.is_empty() {
                 results.push((shape_id, false, 0));
                 continue;
@@ -1397,14 +1419,15 @@ pub async fn propagate_flips(
             // monotone over FALSE < UNKNOWN < TRUE), so skip.
             if matches!(flip.value, Value::Null) {
                 if edge.null_sensitive {
-                    rederive_dependent(registry, &edge, txid.clone(), &mut work).await?;
+                    rederive_dependent(registry, &edge, txid.clone(), lsn.clone(), &mut work).await?;
                 }
                 continue;
             }
             match &edge.dependent {
                 Dependent::Shape(id) => {
                     let moved =
-                        move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                        move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone(), lsn.clone())
+                            .await?;
                     // Light the whole path only when the shape actually moved rows: source
                     // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
                     if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
@@ -1463,6 +1486,7 @@ async fn move_shape_for_value(
     connecting_col: usize,
     value: &Value,
     txid: Option<String>,
+    lsn: Option<String>,
 ) -> Result<Option<(String, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url) = {
@@ -1479,7 +1503,7 @@ async fn move_shape_for_value(
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
     let results =
-        reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid).await?;
+        reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, lsn).await?;
     Ok(match results.first() {
         Some((_, true, net)) => Some((ts.name.clone(), *net)),
         _ => None,
@@ -1531,6 +1555,7 @@ async fn rederive_dependent(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     edge: &Edge,
     txid: Option<String>,
+    lsn: Option<String>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
 ) -> Result<()> {
     match &edge.dependent {
@@ -1544,7 +1569,7 @@ async fn rederive_dependent(
             // Full re-derive: every row is a candidate; the ONE emission tail decides.
             let mut reg = registry.lock().await;
             let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-            reg.emit_for_shapes(&ts, vec![(id.clone(), candidates)], txid).await?;
+            reg.emit_for_shapes(&ts, vec![(id.clone(), candidates)], txid, lsn).await?;
         }
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
@@ -1845,7 +1870,7 @@ mod tests {
         // A new row projects value 1 into the inner set -> Enter flip -> passed.
         let delta = vec![Tup2(Row(vec![Value::Int(1)]), 1)];
         let mut hops = Vec::new();
-        reg.on_table_delta(&ts, &delta, 0, None, None, Some(&mut hops)).await.unwrap();
+        reg.on_table_delta(&ts, &delta, 0, None, None, None, Some(&mut hops)).await.unwrap();
         assert!(
             hops.iter().any(|h| h.node == "node:sig1" && h.outcome == "passed"),
             "expected passed node hop, got {hops:?}"
@@ -1853,7 +1878,7 @@ mod tests {
 
         // The same row again: the value is already present -> no flip -> dropped.
         let mut hops = Vec::new();
-        reg.on_table_delta(&ts, &delta, 0, None, None, Some(&mut hops)).await.unwrap();
+        reg.on_table_delta(&ts, &delta, 0, None, None, None, Some(&mut hops)).await.unwrap();
         assert!(
             hops.iter().any(|h| h.node == "node:sig1" && h.outcome == "dropped"),
             "expected dropped node hop, got {hops:?}"
@@ -2103,7 +2128,7 @@ mod tests {
         // configured, so an emission would attempt a real append and fail loudly; emitted
         // stays 0 and the result reports nothing delivered).
         let results = reg
-            .emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(1), true)])], None)
+            .emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(1), true)])], None, None)
             .await
             .unwrap();
         assert_eq!(results, vec![("s1".to_string(), false, 0)], "never-member delete must be dropped");
@@ -2150,7 +2175,7 @@ mod tests {
 
         // A delete for a brand-new pk (42), never interned before: `exists = false` forces
         // `member = false` regardless of the (always-true) predicate. The fix must skip minting.
-        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(42), false)])], None)
+        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(42), false)])], None, None)
             .await
             .unwrap();
         assert_eq!(reg.pk_dict.len(), 0, "a never-member delete candidate must not mint a pk_dict id");
@@ -2162,14 +2187,14 @@ mod tests {
         // through `install_shape`.)
         reg.shapes.get_mut("s1").unwrap().pred =
             Arc::new(CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
-        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(43), true)])], None)
+        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(43), true)])], None, None)
             .await
             .unwrap();
         assert_eq!(reg.pk_dict.len(), 0, "a non-matching candidate must not mint a pk_dict id");
 
         // A genuinely matching insert (pk 44) DOES mint exactly one id.
         reg.shapes.get_mut("s1").unwrap().pred = Arc::new(CompiledPredicate::MatchAll);
-        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(44), true)])], None)
+        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(44), true)])], None, None)
             .await
             .unwrap();
         assert_eq!(reg.pk_dict.len(), 1, "a matching candidate must mint exactly one pk_dict id");
@@ -2317,7 +2342,7 @@ mod tests {
         insert_outer_shape(&mut reg, "s200", "issues", keyed_membership_pred(200, &sig));
 
         // Enter s100: issue 1 lands in project 100.
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, None, None, None, None).await.unwrap();
         assert_eq!(ops_for(&store, "shape/s100"), vec!["upsert"]);
 
         // The move: UPDATE project_id 100 -> 200, as `apply_envelope` builds it (old `-1`, new
@@ -2328,7 +2353,7 @@ mod tests {
             reg.outer_candidates("issues", &delta).contains(&"s100".to_string()),
             "the shape the row LEFT must be a candidate — via the delta's old image"
         );
-        reg.on_table_delta(&ts, &delta, 2, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &delta, 2, None, None, None, None).await.unwrap();
         assert_eq!(
             ops_for(&store, "shape/s100"),
             vec!["upsert", "delete"],
@@ -2406,12 +2431,12 @@ mod tests {
         insert_membership_shape(&mut reg, "s1", &sig, 1);
 
         // Write an issue in a NON-matching project (999): never a member, so nothing is emitted.
-        let work = reg.on_table_delta(&ts, &[Tup2(issue(1, 999), 1)], 1, None, None, None).await.unwrap();
+        let work = reg.on_table_delta(&ts, &[Tup2(issue(1, 999), 1)], 1, None, None, None, None).await.unwrap();
         assert!(work.is_empty(), "an outer-table delta never queues node-flip propagation");
         assert_eq!(reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         // Delete it: still never a member -> the delete-gate must drop it (no spurious wake).
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 999), -1)], 2, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 999), -1)], 2, None, None, None, None).await.unwrap();
         assert_eq!(
             reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed),
             0,
@@ -2442,18 +2467,18 @@ mod tests {
         }
 
         // Enter: an issue in the matching project.
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, None, None, None, None).await.unwrap();
         assert_eq!(emitted(&reg), 1);
         assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert"]);
 
         // Exit (a): the row itself is deleted -> exactly one delete emission.
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 2, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 2, None, None, None, None).await.unwrap();
         assert_eq!(emitted(&reg), 2, "exactly one more envelope: the row-delete emission");
         assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert", "delete"]);
 
         // A pk that re-enters after leaving must re-emit — the feed relation gates on current
         // membership, it is not a one-shot "already told you" latch.
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 3, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 3, None, None, None, None).await.unwrap();
         assert_eq!(emitted(&reg), 3, "a re-entering pk must re-emit");
         assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert", "delete", "upsert"]);
 
@@ -2467,7 +2492,7 @@ mod tests {
         let flips = reg.apply_node_evals(&sig, vec![("pm-1".into(), None)]).await;
         assert_eq!(flips, vec![Flip { value: Value::Int(100), dir: FlipDir::Leave }]);
         let results =
-            reg.emit_for_shapes(&ts, vec![("s2".to_string(), vec![(issue(1, 100), true)])], None).await.unwrap();
+            reg.emit_for_shapes(&ts, vec![("s2".to_string(), vec![(issue(1, 100), true)])], None, None).await.unwrap();
         assert_eq!(
             results,
             vec![("s2".to_string(), true, -1)],

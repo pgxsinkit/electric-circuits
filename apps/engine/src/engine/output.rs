@@ -110,7 +110,17 @@ pub(crate) fn translate_output(
 /// retraction IS the delete decision (structural spurious-delete gating), so this needs no
 /// row body — only the pk. Honors the TEST-ONLY `drop_deletes` fault exactly like
 /// [`translate_output`].
-pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<String>) -> Vec<Envelope> {
+///
+/// `lsn` is the commit these retractions are a consequence of. It must be carried: a change with no
+/// LSN reaches an Electric consumer with no `lsn` header, which floors to 0 and is discarded as
+/// already-seen once that consumer's frontier has moved (pgxsinkit ADR-0031) — silently losing every
+/// membership move-out.
+pub(crate) fn delete_envelopes(
+    ts: &TableSchema,
+    pks: Vec<String>,
+    txid: Option<String>,
+    lsn: Option<String>,
+) -> Vec<Envelope> {
     if matches!(crate::fault::active(), crate::fault::Fault::DropDeletes) {
         return Vec::new();
     }
@@ -120,7 +130,7 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
             key: pk,
             value: None,
             old: None,
-            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: None, seq: None },
+            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: lsn.clone(), seq: None },
         })
         .collect()
 }

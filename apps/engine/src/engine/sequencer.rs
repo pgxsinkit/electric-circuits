@@ -101,6 +101,7 @@ pub(crate) fn spawn_sequencer(
     ds: DsClient,
     tables: SharedTables,
     start_offset: String,
+    seq_lsn: Arc<std::sync::Mutex<String>>,
     catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
@@ -115,6 +116,7 @@ pub(crate) fn spawn_sequencer(
         ds,
         tables,
         start_offset,
+        seq_lsn,
         catalog_tx,
         cmd_rx,
         processed.clone(),
@@ -241,6 +243,7 @@ pub(crate) async fn sequencer_loop(
     ds: DsClient,
     tables: SharedTables,
     start_offset: String,
+    seq_lsn: Arc<std::sync::Mutex<String>>,
     catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
@@ -468,6 +471,19 @@ pub(crate) async fn sequencer_loop(
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
+                        // Publish the fan-out frontier (`Engine::sequenced_lsn`) — what the Electric
+                        // adapter advertises as `global_last_seen_lsn`, and what consumers discard
+                        // changes at or below. This commit's own appends have landed, but deferred
+                        // subquery flips carry their SOURCE commit's LSN and land later, so the
+                        // frontier may only move while none is outstanding: publishing past an
+                        // unlanded flip would have the consumer drop its move-in/move-out rows.
+                        // `pending_flips` is incremented synchronously during `process_envelope`
+                        // above, so a flip from THIS transaction is already counted here.
+                        if let Some(l) = &lsn
+                            && subq.pending_flips.load(Ordering::SeqCst) == 0
+                        {
+                            *seq_lsn.lock().unwrap() = l.clone();
+                        }
                         i = j;
                     }
                     // Publish the processed offset only after the whole batch is fanned out + flushed.
@@ -926,7 +942,9 @@ pub(crate) async fn process_envelope(
             let mut reg = subq.registry.lock().await;
             if reg.touches(&ts.name) {
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
-                work = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
+                work = reg
+                    .on_table_delta(ts, &delta, lsn_u64, lsn.clone(), xid, txid.clone(), sq_hops.as_mut())
+                    .await?;
                 if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
                     for h in &sq {
                         if h.outcome == "passed"

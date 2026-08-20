@@ -64,6 +64,10 @@ pub struct Engine {
     pg_url: Option<String>,
     /// Last commit LSN the replication ingestor has appended (observability).
     repl_lsn: Arc<std::sync::Mutex<String>>,
+    /// The sequencer's FAN-OUT frontier: the last commit LSN whose changes are on every shape stream
+    /// they belong to. Trails [`Self::repl_lsn`] (which is only the ingest head). Published by the
+    /// sequencer; read by the Electric adapter for `global_last_seen_lsn`. See [`Self::sequenced_lsn`].
+    seq_lsn: Arc<std::sync::Mutex<String>>,
     /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended. The drain barrier
     /// bumps the sentinel and waits for this to catch up — robust under a shared multi-database
     /// Postgres (per-database, no dependence on server-global WAL LSNs).
@@ -338,6 +342,7 @@ impl Engine {
             })),
             pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
+            seq_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Library mode: no Postgres to wait on, so report `active` immediately.
@@ -454,6 +459,7 @@ impl Engine {
                 self.ds.clone(),
                 self.tables_shared.clone(),
                 start,
+                self.seq_lsn.clone(),
                 self.catalog_tx.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
@@ -548,8 +554,25 @@ impl Engine {
     }
 
     /// Last commit LSN appended by the replication ingestor (text form, e.g. "0/1A2B3C").
+    ///
+    /// This is the INGEST head — the sequencer has not necessarily fanned it out to the shape
+    /// streams yet, so it is an observability figure, never a delivery guarantee. Anything a client
+    /// is told it has seen must come from [`Self::sequenced_lsn`].
     pub fn replication_lsn(&self) -> String {
         self.repl_lsn.lock().unwrap().clone()
+    }
+
+    /// The engine's **fan-out frontier**: the highest commit LSN such that every change at or below
+    /// it has been appended to the shape streams it belongs to — including the deferred subquery
+    /// flips, whose query-back rows land after their transaction's own flush (the frontier only
+    /// advances while `pending_flips` is drained). Safe to advertise to a client as "you have seen
+    /// everything up to here"; the ingest head is not.
+    ///
+    /// Trails the ingest head, and stalls (rather than over-advancing) while flip work is
+    /// outstanding — the conservative direction: a stale watermark holds a consumer's changes
+    /// buffered, an over-advanced one makes it discard them.
+    pub fn sequenced_lsn(&self) -> String {
+        self.seq_lsn.lock().unwrap().clone()
     }
 
     /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended.
