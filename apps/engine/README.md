@@ -70,6 +70,11 @@ unknown `ELECTRIC_*` var is accepted and logged once as "accepted (no-op)" — i
 **`GET /v1/health`** reports the boot state machine as an exact, whitespace-free JSON body:
 `{"status":"waiting"}` (202) until Postgres connects, `{"status":"starting"}` (202) through
 introspection/slot/ingest spawn, then `{"status":"active"}` (200). Library mode is `active` at once.
+A fourth state sits outside that machine: `{"status":"degraded"}` (503), reported once subquery
+membership work has been **lost** (`/replication/lsn` → `flipFailures` > 0). The engine keeps
+serving, but its fan-out frontier is frozen, so it can no longer tell a client what it has seen.
+Failing readiness is the point — a restart re-seeds every node from Postgres, which is what repairs
+the divergence.
 `GET /` → 200 empty; `OPTIONS /v1/shape` → 204 with `access-control-allow-methods`.
 
 **StatsD telemetry** (`statsd.rs`) is the fleet's only metrics channel — the datadog wire format
@@ -95,7 +100,7 @@ unchanged.
 | `GET /trace` | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers |
 | `GET /tables/{name}/offset` · `GET /tables/{name}/families` | tailer position / routing-family stats |
 | `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
-| `GET /replication/lsn` | ingestor LSN + sync status |
+| `GET /replication/lsn` | ingest head, fan-out frontier (`sequencedLsn`), sync status, `pendingFlips`, `flipFailures` |
 | `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition |
 | `GET /v1/shape` | Electric protocol: snapshot (`offset=-1`), live long-poll, handles/offsets/`must-refetch` |
 

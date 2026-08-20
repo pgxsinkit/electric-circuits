@@ -258,7 +258,9 @@ sequencer feeds every table's deltas into:
   so per-shape append order equals evaluation order — a stale move can never land after a fresher
   emission — without network under the lock. The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
-  undrained flips and enqueued-but-unlanded lane batches.
+  undrained flips and enqueued-but-unlanded lane batches. A batch whose query-backs fail is
+  **retried** (re-derivation is absolute per pk, so a second pass converges); work that outlives its
+  retries is abandoned, which is lost membership — see the frontier's poisoning in §8.
 - **Absolute emission via the per-feed key set** — the correctness rule that keeps deferred
   flips convergent: for each touched pk the registry asserts the row's *current* membership into
   the shape's **feed set** (`subq_feed::FeedSet`, one host-side Roaring bitmap per feed), never a
@@ -412,7 +414,19 @@ it accompanies. Never the ingest head (`replication_lsn`), which runs ahead of t
 frontier stalls rather than over-advancing while flip work is outstanding: a stale watermark holds a
 consumer's changes buffered, an over-advanced one makes it throw them away. For the same reason every
 emitted envelope carries its source LSN — an unstamped change reaches the client with no `lsn` header,
-floors to 0, and is dropped as already-seen.
+floors to 0, and is dropped as already-seen. That covers the replays too: deltas buffered while a
+subquery shape is being created carry the high-water commit they reflect, and the create holds the
+barrier across its whole window, so the frontier cannot pass changes whose membership consequences
+are still sitting in a buffer.
+
+A commit that flushes while flips are in flight is published by whichever worker drains the **last**
+of them (`engine::frontier::Frontier`), not by the next transaction — otherwise a terminal flip on a
+source that then goes quiet strands the watermark, with the changes delivered and nothing to release
+them. And when flip work is abandoned, the frontier is **poisoned**: those effects are lost rather
+than late, so the engine stops claiming any commit is fully fanned out, counts it on
+`/replication/lsn` as `flipFailures`, and reports `{"status":"degraded"}` (503) on `/v1/health`. The
+recovery is a restart, which re-seeds every node from Postgres; continuing to serve a moving
+watermark would leave consumers with permanently wrong membership and no way to detect it.
 
 **Resuming at an offset.** A client that reconnects at an older offset than the handle last served
 needs the key set *it* holds at that offset (the adapter reconstructs insert-vs-update, and suppresses
@@ -421,6 +435,11 @@ raw byte range and messages are stored verbatim — so nothing can fold "up to" 
 answers exactly is **how many envelopes lie after a position**, and the stream is append-only, so
 `electric.rs::keys_at` counts the whole stream, counts what the client has not seen, and folds the
 difference as a prefix — and a prefix never changes, however much arrives meanwhile.
+
+That costs about two passes over the stream's history and retains nothing. It is bounded by the same
+thing a snapshot is bounded by, and the alternative to reconstruction *is* that snapshot:
+`must-refetch` re-folds the stream from `-1` **and** re-delivers the whole key set to the client, so
+refusing an old position to save the work would raise the total, not lower it.
 
 The two counts come from separate reads, so an append landing between them would skew the
 subtraction. The surplus is itself a count-after, measurable the same way, so the corrections
