@@ -89,14 +89,21 @@ async fn batching_stays_under_1432_and_loses_nothing() {
     let id = "batch-instance-02";
     let client = Statsd::connect(&addr.to_string(), id).unwrap();
 
-    // Enough lines to force many datagrams (each line ~80 bytes; 2000 lines ≈ 160 KB).
+    // Enough lines to force many datagrams (each line ~108 bytes; 2000 lines ≈ 210 KB).
     const N: usize = 2000;
+
+    // Drain CONCURRENTLY with the send. Collecting afterwards is what a receive buffer is for, and
+    // this payload is larger than one: ~150 datagrams at ~2.3 KB of skb truesize each overruns the
+    // default `net.core.rmem_default` (212992 on Linux) long before the collector wakes, and the
+    // kernel drops the rest — losing ~40% of the lines deterministically, with nothing wrong on the
+    // sending side. The assertion below is about the CLIENT never dropping a line, so don't let the
+    // harness manufacture kernel loss.
+    let collector = tokio::task::spawn_blocking(move || collect(sock, Duration::from_secs(2)));
     for i in 0..N {
         client.count("electric.postgres.replication.transaction_received.bytes", i as u64, &[("k", "vvvvvvvv")]);
     }
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let datagrams = tokio::task::spawn_blocking(move || collect(sock, Duration::from_secs(2))).await.unwrap();
+    let datagrams = collector.await.unwrap();
 
     assert!(datagrams.len() > 1, "expected multiple datagrams, got {}", datagrams.len());
     let names = assert_fleet_parseable(&datagrams, id); // also asserts every datagram <= 1432 bytes
