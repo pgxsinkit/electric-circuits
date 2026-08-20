@@ -259,8 +259,10 @@ sequencer feeds every table's deltas into:
   emission — without network under the lock. The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
   undrained flips and enqueued-but-unlanded lane batches. A batch whose query-backs fail is
-  **retried** (re-derivation is absolute per pk, so a second pass converges); work that outlives its
-  retries is abandoned, which is lost membership — see the frontier's poisoning in §8.
+  **retried from the queue the failed attempt left behind**, never from its roots: each step is
+  convergent (absolute per pk), but the walk is not restartable, because reconciling a parent node
+  consumes the transition that produced its flips. Work that outlives its retries is abandoned,
+  which is lost membership — see the frontier's poisoning in §8.
 - **Absolute emission via the per-feed key set** — the correctness rule that keeps deferred
   flips convergent: for each touched pk the registry asserts the row's *current* membership into
   the shape's **feed set** (`subq_feed::FeedSet`, one host-side Roaring bitmap per feed), never a
@@ -424,9 +426,22 @@ of them (`engine::frontier::Frontier`), not by the next transaction — otherwis
 source that then goes quiet strands the watermark, with the changes delivered and nothing to release
 them. And when flip work is abandoned, the frontier is **poisoned**: those effects are lost rather
 than late, so the engine stops claiming any commit is fully fanned out, counts it on
-`/replication/lsn` as `flipFailures`, and reports `{"status":"degraded"}` (503) on `/v1/health`. The
-recovery is a restart, which re-seeds every node from Postgres; continuing to serve a moving
-watermark would leave consumers with permanently wrong membership and no way to detect it.
+`/replication/lsn` as `flipFailures`, reports `{"status":"degraded"}` (503) on `/v1/health`, and
+**stops serving shape data** — `/v1/shape`, `/shapes/{id}/rows`, `/shapes/{id}/log` and `/query` all
+answer 503. Membership is known to be wrong and nothing in the engine repairs it, so answering at
+all is the worse outcome: the client cannot tell, and neither can its user. 503 is retryable, so
+clients resume by themselves once an operator restarts the engine, which re-seeds every node from
+Postgres. Observability stays up — that is how the operator finds out. Note the gate covers what the
+*engine* serves: an extended client long-polling a shape stream from durable-streams directly is
+past it.
+
+**Creation is atomic on the stream, not just in the registry.** A subquery shape's creation replay
+comes from Postgres query-backs, which cannot run under the registry lock, so `finish_create`
+registers the shape without making it a **candidate** for live evaluation: outer deltas keep
+buffering on its pending entry while the replay propagates. `install_visible` then replays that
+buffer and files the index entry under one lock, in that order. Otherwise a change committed in the
+gap would be emitted first, with a higher LSN, and the replay behind it would fall below the
+consumer's per-shape dedup frontier — which only moves forward — and be discarded for good.
 
 **Resuming at an offset.** A client that reconnects at an older offset than the handle last served
 needs the key set *it* holds at that offset (the adapter reconstructs insert-vs-update, and suppresses

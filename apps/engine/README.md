@@ -71,10 +71,10 @@ unknown `ELECTRIC_*` var is accepted and logged once as "accepted (no-op)" — i
 `{"status":"waiting"}` (202) until Postgres connects, `{"status":"starting"}` (202) through
 introspection/slot/ingest spawn, then `{"status":"active"}` (200). Library mode is `active` at once.
 A fourth state sits outside that machine: `{"status":"degraded"}` (503), reported once subquery
-membership work has been **lost** (`/replication/lsn` → `flipFailures` > 0). The engine keeps
-serving, but its fan-out frontier is frozen, so it can no longer tell a client what it has seen.
-Failing readiness is the point — a restart re-seeds every node from Postgres, which is what repairs
-the divergence.
+membership work has been **lost** (`/replication/lsn` → `flipFailures` > 0). The fan-out frontier is
+frozen and the data endpoints (`/v1/shape`, `/shapes/{id}/rows`, `/shapes/{id}/log`, `/query`) answer
+503 as well: membership is known to be wrong, and nothing in the engine repairs it. Observability
+keeps serving. Recovery is a restart, which re-seeds every node from Postgres.
 `GET /` → 200 empty; `OPTIONS /v1/shape` → 204 with `access-control-allow-methods`.
 
 **StatsD telemetry** (`statsd.rs`) is the fleet's only metrics channel — the datadog wire format

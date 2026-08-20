@@ -247,8 +247,9 @@ subqueries).
    happen atomically under the lock, and per-stream FIFO emission lanes make append order equal
    eval order per shape. The in-flight count (flips + enqueued-but-unlanded batches) is the
    extra convergence-barrier term (`GET /replication/lsn` → `pendingFlips`). A batch whose
-   query-backs fail is retried; work that outlives its retries is abandoned, and the fan-out
-   frontier is poisoned rather than advanced past effects that will never land.
+   query-backs fail is retried from where the failed attempt stopped (the walk consumes parent
+   transitions, so it cannot restart from its roots); work that outlives its retries is abandoned,
+   and the fan-out frontier is poisoned rather than advanced past effects that will never land.
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 
