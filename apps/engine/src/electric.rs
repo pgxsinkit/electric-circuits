@@ -287,10 +287,26 @@ fn pg_text(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>) -> serde_json::Value {
+/// Postgres LSNs travel through the engine in their native `hi/lo` hex form (`0/1AEB9F8`), but
+/// Electric puts a **decimal** 64-bit LSN on the wire (`"27042192"`) and clients parse it as an
+/// integer — `BigInt(headers.lsn)` throws on the slash form. Convert, or emit nothing at all.
+/// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+fn lsn_to_decimal(lsn: &str) -> Option<String> {
+    let (hi, lo) = lsn.split_once('/')?;
+    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
+    Some((((hi << 32) | lo) as u64).to_string())
+}
+
+fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, lsn: Option<&str>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     let mut headers = serde_json::Map::new();
     headers.insert("operation".into(), serde_json::Value::String(op.into()));
+    // Consumers position their catch-up/dedup frontier on this (pgxsinkit ADR-0031); without it a
+    // resume over persisted metadata can never advance its watermark.
+    if let Some(d) = lsn.and_then(lsn_to_decimal) {
+        headers.insert("lsn".into(), serde_json::Value::String(d));
+    }
     m.insert("headers".into(), serde_json::Value::Object(headers));
     m.insert("key".into(), serde_json::Value::String(key.into()));
     if let Some(v) = value {
@@ -300,11 +316,19 @@ fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>) -> serde_js
 }
 
 fn control_msg(control: &str) -> serde_json::Value {
+    control_msg_at(control, None)
+}
+
+/// `up-to-date` carries the engine's replication head as `global_last_seen_lsn`. Was hardcoded to
+/// `"0"`, which pins every consumer watermark at zero.
+/// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+fn control_msg_at(control: &str, global_lsn: Option<&str>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     let mut headers = serde_json::Map::new();
     headers.insert("control".into(), serde_json::Value::String(control.into()));
     if control == "up-to-date" {
-        headers.insert("global_last_seen_lsn".into(), serde_json::Value::String("0".into()));
+        let d = global_lsn.and_then(lsn_to_decimal).unwrap_or_else(|| "0".into());
+        headers.insert("global_last_seen_lsn".into(), serde_json::Value::String(d));
     }
     m.insert("headers".into(), serde_json::Value::Object(headers));
     serde_json::Value::Object(m)
@@ -499,16 +523,16 @@ fn apply_changes(keys: &mut HashSet<String>, pk_name: &str, envelopes: Vec<Envel
                         .as_ref()
                         .map(encode_value)
                         .unwrap_or_else(|| serde_json::json!({ pk_name: env.key }));
-                    messages.push(change_msg("delete", &env.key, Some(value)));
+                    messages.push(change_msg("delete", &env.key, Some(value), env.headers.lsn.as_deref()));
                 }
             }
             _ => {
                 let value = env.value.as_ref().map(encode_value);
                 if keys.contains(&env.key) {
-                    messages.push(change_msg("update", &env.key, value));
+                    messages.push(change_msg("update", &env.key, value, env.headers.lsn.as_deref()));
                 } else {
                     keys.insert(env.key.clone());
-                    messages.push(change_msg("insert", &env.key, value));
+                    messages.push(change_msg("insert", &env.key, value, env.headers.lsn.as_deref()));
                 }
             }
         }
@@ -684,7 +708,7 @@ async fn positioned_read(
 
     let mut messages = apply_changes(&mut st.keys, &entry.pk_name, r.envelopes);
     if r.up_to_date {
-        messages.push(control_msg("up-to-date"));
+        messages.push(control_msg_at("up-to-date", Some(&engine.replication_lsn())));
     }
     let served_offset = st.offset.clone();
     drop(st);
@@ -813,10 +837,10 @@ async fn shape_inner(
         let mut messages = Vec::with_capacity(rows.len() + 1);
         let mut keys = HashSet::with_capacity(rows.len());
         for (key, value) in &rows {
-            messages.push(change_msg("insert", key, Some(encode_value(value))));
+            messages.push(change_msg("insert", key, Some(encode_value(value)), None));
             keys.insert(key.clone());
         }
-        messages.push(control_msg("up-to-date"));
+        messages.push(control_msg_at("up-to-date", Some(&engine.replication_lsn())));
 
         let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
         // Handles are per-client even though the shape is shared: a unique handle id per snapshot
