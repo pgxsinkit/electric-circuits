@@ -495,6 +495,13 @@ impl Engine {
         self.frontier.failures()
     }
 
+    /// Whether subquery membership effects have been lost, so nothing the engine could say about
+    /// shape membership is known to be true. Gates the data endpoints (`crate::http`) and the
+    /// Electric adapter.
+    pub fn frontier_poisoned(&self) -> bool {
+        self.frontier.poisoned()
+    }
+
     fn subquery_handle(&self) -> SubqueryHandle {
         SubqueryHandle {
             registry: self.subqueries.clone(),

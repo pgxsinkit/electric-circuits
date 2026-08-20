@@ -304,9 +304,11 @@ fn pg_text(v: &serde_json::Value) -> serde_json::Value {
 /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
 fn lsn_to_decimal(lsn: &str) -> Option<String> {
     let (hi, lo) = lsn.split_once('/')?;
-    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
-    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
-    Some((((hi << 32) | lo) as u64).to_string())
+    // Both halves are 32-bit. Parsed as `u32` so an oversized one is REJECTED rather than shifted
+    // out of the top of a `u64` — `100000000/0` is not the beginning of time, it is not an LSN.
+    let hi = u32::from_str_radix(hi.trim(), 16).ok()? as u64;
+    let lo = u32::from_str_radix(lo.trim(), 16).ok()? as u64;
+    Some(((hi << 32) | lo).to_string())
 }
 
 fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, lsn: Option<&str>) -> serde_json::Value {
@@ -394,6 +396,17 @@ impl ApiError {
     /// `409 must-refetch` an evicted handle gets, so it re-snapshots onto the retained shape.
     fn must_refetch() -> Self {
         ApiError { status: StatusCode::CONFLICT, message: "must-refetch".into() }
+    }
+
+    /// Subquery membership effects were lost, so no answer about shape membership is known to be
+    /// true (see [`crate::engine::frontier::Frontier::poison`]). NOT `must-refetch`: re-snapshotting
+    /// would hand the client the same wrong membership with a clean conscience. `503` is retryable,
+    /// so the client resumes when an operator restarts the engine.
+    fn degraded() -> Self {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "degraded: subquery membership effects were lost; restart required".into(),
+        }
     }
 }
 
@@ -957,6 +970,8 @@ pub async fn shape(
         p.api_secret.as_deref(),
     ) {
         unauthorized()
+    } else if engine.frontier_poisoned() {
+        ApiError::degraded().into_response()
     } else {
         match shape_inner(engine, p, &raw_pairs).await {
             Ok(resp) => resp,
@@ -1384,6 +1399,10 @@ mod tests {
         assert_eq!(lsn_to_decimal("/10"), None);
         assert_eq!(lsn_to_decimal("0/"), None);
         assert_eq!(lsn_to_decimal("-1/10"), None);
+        // Both halves are 32-bit; an oversized one is not an LSN with its top bits trimmed off.
+        assert_eq!(lsn_to_decimal("100000000/0"), None);
+        assert_eq!(lsn_to_decimal("0/100000000"), None);
+        assert_eq!(lsn_to_decimal("FFFFFFFF/FFFFFFFF").as_deref(), Some("18446744073709551615"));
     }
 
     // A change message carries the LSN its consumer positions its catch-up/dedup frontier on; an

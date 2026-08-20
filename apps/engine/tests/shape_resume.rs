@@ -40,10 +40,15 @@ type Store = Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>;
 /// while the adapter is mid-reconstruction. Drained by the handler, one per read.
 type Growth = Arc<AtomicUsize>;
 
+/// Earliest position still retained on the shape stream: a read below it is `410 Gone`, as
+/// retention/compaction makes it on the real server. 0 = everything retained.
+type Floor = Arc<AtomicUsize>;
+
 #[derive(Clone)]
 struct DsState {
     store: Store,
     growth: Growth,
+    floor: Floor,
 }
 
 /// Offsets are opaque tokens to the engine; here they are the item index, zero-padded like the real
@@ -56,15 +61,19 @@ fn tok(n: usize) -> String {
 /// parse, `410` for one below the earliest retained position. Modelling those is the point — coercing
 /// a bad token to zero (as this fake used to) answers a client's garbage offset with a full replay
 /// from the start of the stream, and hides that the adapter turned the refusal into a 500.
-fn parse_offset(q: &str) -> Result<usize, u16> {
+fn parse_offset(q: &str, floor: usize) -> Result<usize, u16> {
     let raw = q.split('&').find_map(|kv| kv.strip_prefix("offset=")).unwrap_or("-1");
     if raw == "-1" {
-        return Ok(0);
+        return if floor == 0 { Ok(0) } else { Err(410) };
     }
     if raw.len() != 16 || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(400);
     }
-    raw.parse().map_err(|_| 400)
+    match raw.parse::<usize>() {
+        Ok(n) if n < floor => Err(410),
+        Ok(n) => Ok(n),
+        Err(_) => Err(400),
+    }
 }
 
 async fn ds_handler(State(state): State<DsState>, req: Request) -> Response {
@@ -108,7 +117,7 @@ async fn ds_handler(State(state): State<DsState>, req: Request) -> Response {
                     "headers": { "operation": "upsert", "lsn": "0/99" },
                 }));
             }
-            let from = match parse_offset(&query) {
+            let from = match parse_offset(&query, state.floor.load(Ordering::SeqCst)) {
                 Ok(n) => n,
                 Err(status) => {
                     return StatusCode::from_u16(status).unwrap().into_response();
@@ -215,12 +224,13 @@ async fn read_until_change(engine: &Engine, query: &str) -> ShapeResponse {
     }
 }
 
-async fn engine_with_table() -> (Engine, Store, Growth) {
+async fn engine_with_table() -> (Engine, Store, Growth, Floor) {
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
     let growth: Growth = Arc::new(AtomicUsize::new(0));
+    let floor: Floor = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ds_url = format!("http://{}", listener.local_addr().unwrap());
-    let served = DsState { store: store.clone(), growth: growth.clone() };
+    let served = DsState { store: store.clone(), growth: growth.clone(), floor: floor.clone() };
     tokio::spawn(async move {
         let _ = axum::serve(listener, Router::new().fallback(ds_handler).with_state(served)).await;
     });
@@ -230,14 +240,14 @@ async fn engine_with_table() -> (Engine, Store, Growth) {
     }))
     .unwrap();
     engine.define_schema(&schema).await.unwrap();
-    (engine, store, growth)
+    (engine, store, growth, floor)
 }
 
 // ---- tests ---------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn resume_at_a_persisted_offset_replays_a_delete_the_handle_already_served() {
-    let (engine, store, _growth) = engine_with_table().await;
+    let (engine, store, _growth, _floor) = engine_with_table().await;
 
     // Snapshot: empty shape, fresh handle.
     let snap = get_shape(&engine, "table=t&offset=-1").await;
@@ -287,7 +297,7 @@ async fn resume_at_a_persisted_offset_replays_a_delete_the_handle_already_served
 // every read the adapter issues while it reconstructs.
 #[tokio::test]
 async fn a_resume_stays_correct_while_the_stream_grows_underneath_it() {
-    let (engine, store, growth) = engine_with_table().await;
+    let (engine, store, growth, _floor) = engine_with_table().await;
 
     let snap = get_shape(&engine, "table=t&offset=-1").await;
     let handle = snap.handle.clone().unwrap();
@@ -322,7 +332,7 @@ async fn a_resume_stays_correct_while_the_stream_grows_underneath_it() {
 
 #[tokio::test]
 async fn up_to_date_advertises_the_fan_out_frontier_not_zero() {
-    let (engine, store, _growth) = engine_with_table().await;
+    let (engine, store, _growth, _floor) = engine_with_table().await;
     let snap = get_shape(&engine, "table=t&offset=-1").await;
     let handle = snap.handle.clone().unwrap();
     assert_eq!(snap.watermark().as_deref(), Some("0"), "nothing sequenced yet");
@@ -354,7 +364,7 @@ async fn up_to_date_advertises_the_fan_out_frontier_not_zero() {
 /// see nothing else for as long as it kept retrying.
 #[tokio::test]
 async fn an_offset_the_stream_cannot_place_is_answered_must_refetch() {
-    let (engine, store, _growth) = engine_with_table().await;
+    let (engine, store, _growth, _floor) = engine_with_table().await;
     let snap = get_shape(&engine, "table=t&offset=-1").await;
     let handle = snap.handle.clone().expect("snapshot mints a handle");
     append_change(&store, "upsert", "k1", "0/10");
@@ -372,4 +382,26 @@ async fn an_offset_the_stream_cannot_place_is_answered_must_refetch() {
     let fresh = get_shape(&engine, "table=t&offset=-1").await;
     assert_eq!(fresh.status, StatusCode::OK);
     assert_eq!(fresh.changes().len(), 1, "re-snapshot returns the live row: {:?}", fresh.messages);
+}
+
+/// The other half of "cannot place this offset": a position that has aged out. durable-streams
+/// answers `410 Gone` below the earliest retained position (retention/compaction), which is the
+/// case a long-offline client hits — and the one where a `500` would strand it forever, since
+/// retrying the same persisted offset can never start working again. Same `must-refetch` answer.
+#[tokio::test]
+async fn an_offset_below_the_retained_window_is_answered_must_refetch() {
+    let (engine, store, _growth, floor) = engine_with_table().await;
+    let snap = get_shape(&engine, "table=t&offset=-1").await;
+    let handle = snap.handle.clone().expect("snapshot mints a handle");
+    append_change(&store, "upsert", "k1", "0/10");
+    let caught_up = read_until_change(&engine, &format!("table=t&handle={handle}&offset={}", snap.offset)).await;
+    assert_eq!(caught_up.changes().len(), 1);
+    let persisted = caught_up.offset.clone();
+
+    // The client goes away long enough for its position to fall off the back of the stream.
+    floor.store(9_000, Ordering::SeqCst);
+
+    let res = get_shape(&engine, &format!("table=t&handle={handle}&offset={persisted}")).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "expected must-refetch, got {:?}", res.messages);
+    assert_eq!(res.messages[0]["headers"]["control"], "must-refetch");
 }

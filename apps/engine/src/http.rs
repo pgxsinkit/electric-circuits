@@ -29,9 +29,6 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/shapes", post(create_shape))
         .route("/aggregate", post(create_aggregate))
         .route("/shapes/{id}", get(get_shape).delete(release_shape))
-        .route("/shapes/{id}/rows", get(get_shape_rows))
-        .route("/shapes/{id}/log", get(get_shape_log))
-        .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
         // Table schema (columns + pk), a parameterized single-row INSERT (the visualizer's add-row
@@ -48,7 +45,15 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/metrics/prometheus", get(get_prometheus))
         // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
         // OPTIONS is the CORS preflight the fleet's browser-style clients send.
-        .route("/v1/shape", get(crate::electric::shape).options(shape_options));
+        .route("/v1/shape", get(crate::electric::shape).options(shape_options))
+        // Everything whose answer IS shape membership, behind the degraded gate.
+        .merge(
+            Router::new()
+                .route("/shapes/{id}/rows", get(get_shape_rows))
+                .route("/shapes/{id}/log", get(get_shape_log))
+                .route("/query", post(query_subset))
+                .layer(axum::middleware::from_fn_with_state(engine.clone(), refuse_when_degraded)),
+        );
     if introspection {
         r = r
             .route("/graph", get(get_graph))
@@ -62,6 +67,33 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
             .route("/debug/dbsp-profile", get(get_dbsp_profile));
     }
     r.with_state(engine)
+}
+
+/// Refuse to answer with data that may no longer be true.
+///
+/// Once the fan-out frontier is poisoned, subquery membership effects have been LOST — some rows
+/// are in a shape that should not be, or missing from one that should have them, and nothing in the
+/// engine will repair it. Serving those reads anyway is the one outcome worse than not answering:
+/// the client cannot tell, and neither can its user. `503` is retryable, so a client keeps asking
+/// and starts working again the moment an operator restarts the engine (which re-seeds every node
+/// from Postgres).
+///
+/// Applies to what the ENGINE serves. Extended clients long-polling a shape stream from
+/// durable-streams directly are past this gate — see `docs/ARCHITECTURE.md` §8.
+async fn refuse_when_degraded(
+    State(engine): State<Engine>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if engine.frontier_poisoned() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"degraded: subquery membership effects were lost; restart required"}"#,
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).

@@ -1136,3 +1136,46 @@ async fn a_terminal_flip_publishes_the_commit_that_was_waiting_on_it() {
     }
     assert_eq!(subq.frontier.pending(), 0);
 }
+
+/// **A poisoned engine stops answering questions about membership.** Losing subquery effects means
+/// some rows are in a shape that should not be, or missing from one that should have them, and
+/// nothing in the engine repairs that. Serving those reads anyway is worse than not answering: the
+/// client cannot tell, and neither can its user. `503` is retryable, so clients resume by
+/// themselves once an operator restarts the engine — the restart re-seeds every node from Postgres.
+///
+/// Observability stays up, deliberately: `/replication/lsn` is how an operator sees what happened.
+#[tokio::test]
+async fn a_poisoned_frontier_refuses_to_serve_shape_data() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    let app = crate::http::router(engine.clone());
+    let get = |uri: &str| {
+        let app = app.clone();
+        let uri = uri.to_string();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap()
+        }
+    };
+
+    assert_eq!(get("/v1/health").await.status(), StatusCode::OK, "healthy to begin with");
+
+    engine.frontier.poison();
+
+    assert_eq!(get("/v1/shape?table=t&offset=-1").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(get("/shapes/s1/rows").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(get("/shapes/s1/log").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let health = get("/v1/health").await;
+    assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(health.into_body(), 4096).await.unwrap();
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap(), r#"{"status":"degraded"}"#);
+
+    // The operator's view of what happened is still served.
+    let lsn = get("/replication/lsn").await;
+    assert_eq!(lsn.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(lsn.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["flipFailures"], 1);
+}
