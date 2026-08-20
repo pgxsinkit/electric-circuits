@@ -97,6 +97,16 @@ struct HandleEntry {
     /// When this handle was last touched by a request — drives idle-TTL eviction.
     last_access: std::sync::Mutex<Instant>,
     state: tokio::sync::Mutex<HandleState>,
+    /// The key set and offset this handle's SNAPSHOT was minted with. `keys_as_of` reconstructs a key
+    /// set by folding the shape STREAM, but a snapshot's rows come from `materialize()` and are not in
+    /// the stream at/below that offset — so folding to the snapshot offset yields a set MISSING them,
+    /// and `apply_changes` then silently drops their deletes (its delete arm is gated on
+    /// `keys.remove(..)`). A client resuming from its persisted offset therefore never evicted rows
+    /// whose access had been revoked. Keeping the snapshot's own answer lets the rebuild start from
+    /// truth instead of from an incomplete fold.
+    /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+    snapshot_offset: String,
+    snapshot_keys: HashSet<String>,
     /// In-flight **live** long-polls keyed by request offset. Concurrent live requests at the same
     /// (handle, offset) are identical, so the first arrival (the leader) does the read+apply while
     /// every other one awaits the published [`ReadOutcome`] on the watch channel instead of queueing
@@ -675,7 +685,16 @@ async fn positioned_read(
         // The client resumed at a different (older) offset than we last served: rebuild the key set
         // **as of that offset** (fold -1..=offset), then replay from there. Folding to the tail instead
         // would silently drop a delete of a key absent at tail and emit updates for reinserted keys.
-        st.keys = keys_as_of(engine, &entry.stream_path, offset).await?;
+        //
+        // At the SNAPSHOT offset the fold is not the truth: those rows came from `materialize()` and
+        // were never appended to the stream, so the fold returns a set missing every one of them and
+        // `apply_changes` drops their deletes. Use the snapshot's own key set there.
+        // Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+        st.keys = if offset == entry.snapshot_offset {
+            entry.snapshot_keys.clone()
+        } else {
+            keys_as_of(engine, &entry.stream_path, offset).await?
+        };
         st.offset = offset.to_string();
     }
     let from = offset.to_string();
@@ -857,6 +876,8 @@ async fn shape_inner(
                 table: p.table.clone(),
                 pk_name: ts.pk_name.clone(),
                 last_access: std::sync::Mutex::new(Instant::now()),
+                snapshot_offset: tail.clone(),
+                snapshot_keys: keys.clone(),
                 state: tokio::sync::Mutex::new(HandleState { keys, offset: tail.clone() }),
                 live_inflight: std::sync::Mutex::new(HashMap::new()),
             }),
@@ -1134,6 +1155,8 @@ mod tests {
             table: "t".into(),
             pk_name: "id".into(),
             last_access: std::sync::Mutex::new(Instant::now()),
+            snapshot_offset: "-1".into(),
+            snapshot_keys: HashSet::new(),
             state: tokio::sync::Mutex::new(HandleState { keys: HashSet::new(), offset: "-1".into() }),
             live_inflight: std::sync::Mutex::new(HashMap::new()),
         })
