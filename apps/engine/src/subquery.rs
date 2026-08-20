@@ -74,6 +74,12 @@ pub struct SubqueryNode {
     /// applied to a half-seeded set (a snapshot row landing after a fresher delta would be a
     /// stale overwrite). `None` = live.
     pub(crate) seed_buffer: Option<Vec<Tup2<Row, ZWeight>>>,
+    /// Commit LSN of the newest delta in [`Self::seed_buffer`] — the high-water mark of what the
+    /// install-time replay reflects. Stamped onto the envelopes that replay produces, for the same
+    /// reason the outer buffer carries one ([`PendingSubqueryShape::buffer_lsn`]): a move-in/move-out
+    /// row delivered with no `lsn` floors to 0 on the Electric wire and is dropped by any consumer
+    /// that has seen a real one.
+    pub(crate) seed_buffer_lsn: Option<String>,
     /// The node's key in the membership circuit (registry-assigned, unique per live node).
     pub node_id: i64,
     /// The template this node is a bind of (see [`crate::predicate::subquery_template`]).
@@ -93,6 +99,7 @@ impl HeapSize for SubqueryNode {
             + self.where_json.heap_bytes()
             + self.gate.heap_bytes()
             + self.seed_buffer.heap_bytes()
+            + self.seed_buffer_lsn.heap_bytes()
             + self.template_key.heap_bytes()
             + self.bind.heap_bytes()
     }
@@ -116,6 +123,7 @@ impl SubqueryNode {
             where_json: None,
             gate: crate::pg::SnapshotGate::passthrough(),
             seed_buffer: None,
+            seed_buffer_lsn: None,
             node_id,
             template_key: String::new(),
             bind: Row(Vec::new()),
@@ -286,6 +294,42 @@ impl HeapSize for PendingSubqueryShape {
             + self.stream_path.heap_bytes()
             + self.collect_log.heap_bytes()
             + self.buffer.heap_bytes()
+            + self.buffer_lsn.heap_bytes()
+    }
+}
+
+/// What phase C hands back: the flips a create's buffered replays produced, and the commit LSN to
+/// stamp them with.
+///
+/// The LSN is load-bearing. Deltas that land mid-create are buffered — outer rows on the pending
+/// shape, inner rows on each fresh node — and replayed at install, so their move-in/move-out rows
+/// reach the stream **after** their transaction did. Unstamped, they floor to 0 on the Electric
+/// wire and are dropped by any consumer that has already seen a real LSN on that shape.
+///
+/// The stamp is not a complete answer to that ordering, and cannot be: the OUTER replay is emitted
+/// inside `finish_create` under the registry lock, so it is enqueued ahead of any live delta, but
+/// these inner-node flips need Postgres query-backs and are therefore propagated after the lock is
+/// released. A change on the new shape committed in that window is emitted first, with a HIGHER
+/// LSN, and the replay's rows land below the consumer's per-shape frontier whatever they carry.
+/// The residue is narrow (a create must have buffered inner deltas, and an outer commit must land
+/// in the milliseconds before the query-back returns) and self-repairing, because emission is
+/// absolute per pk: the next change to touch those rows re-states their membership. Closing it
+/// properly means ordering the creation replay ahead of the shape's first live emission — a
+/// reserved slot in the stream's emission lane — not a different LSN.
+pub struct CreateReplay {
+    pub work: VecDeque<(SubquerySig, Flip)>,
+    /// High-water commit LSN of the replayed inner deltas (`None` = nothing was buffered).
+    pub lsn: Option<String>,
+}
+
+/// The later of two LSNs in Postgres `hi/lo` hex form. Not a string comparison: `"0/9"` sorts after
+/// `"0/10"` lexically and before it numerically.
+fn max_lsn(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            Some(if crate::pg::lsn_to_u64(&b) > crate::pg::lsn_to_u64(&a) { b } else { a })
+        }
+        (a, b) => a.or(b),
     }
 }
 
@@ -804,7 +848,7 @@ impl SubqueryRegistry {
         outer_gate: crate::pg::SnapshotGate,
         seeded: u64,
         seeded_pks: std::collections::HashSet<String>,
-    ) -> Result<VecDeque<(SubquerySig, Flip)>> {
+    ) -> Result<CreateReplay> {
         let idx = self
             .pending_shapes
             .iter()
@@ -812,6 +856,9 @@ impl SubqueryRegistry {
             .context("finish_create: pending shape vanished")?;
         let pending = self.pending_shapes.remove(idx);
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+        // High-water commit LSN across every fresh node's buffered replay — what the flips that
+        // replay produces are stamped with (see [`CreateReplay`]).
+        let mut replay_lsn: Option<String> = None;
         // 1. Install node seeds, then replay each node's buffered deltas through its gate.
         for (sig, rows, gate) in node_seeds {
             let (ts, proj_col) = {
@@ -834,11 +881,12 @@ impl SubqueryRegistry {
             // already reflects the seeded set), so this step's deltas are discarded — only
             // the replay below propagates.
             let _ = self.apply_asserts(seed).await;
-            let buffered = self
+            let (buffered, buffered_lsn) = self
                 .nodes
                 .get_mut(&sig)
-                .and_then(|n| n.seed_buffer.take())
+                .map(|n| (n.seed_buffer.take().unwrap_or_default(), n.seed_buffer_lsn.take()))
                 .unwrap_or_default();
+            replay_lsn = max_lsn(replay_lsn, buffered_lsn);
             if !buffered.is_empty() {
                 // Replay through the gate: only deltas the snapshot could NOT contain apply.
                 // (Buffered stamps aren't retained; the gate's xid test is per-eval at the
@@ -882,11 +930,11 @@ impl SubqueryRegistry {
             // Stamp the replay with the newest commit it reflects, so these rows clear a consumer's
             // dedup frontier (see `emit_for_shapes`); an unstamped replay floors to LSN 0 and is
             // discarded by any consumer whose frontier has moved.
-            let replay_lsn = pending.buffer_lsn.clone();
+            let outer_lsn = pending.buffer_lsn.clone();
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
-            self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None, replay_lsn).await?;
+            self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None, outer_lsn).await?;
         }
-        Ok(work)
+        Ok(CreateReplay { work, lsn: replay_lsn })
     }
 
     /// Install a fully-built outer shape. The shapes map, the feed-id reverse map and the
@@ -1095,8 +1143,12 @@ impl SubqueryRegistry {
                 // Mid-seed: buffer the raw delta for gated replay at install (a half-seeded
                 // set must not be reconciled — the snapshot could stale-overwrite a fresher
                 // delta).
-                if let Some(buf) = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.as_mut()) {
-                    buf.extend(delta.iter().cloned());
+                if let Some(n) = self.nodes.get_mut(&sig).filter(|n| n.seed_buffer.is_some()) {
+                    n.seed_buffer.as_mut().expect("seed buffer").extend(delta.iter().cloned());
+                    // Deltas arrive in commit order, so the last one buffered is the high-water mark.
+                    if commit_lsn.is_some() {
+                        n.seed_buffer_lsn = commit_lsn.clone();
+                    }
                     hop(&mut trace, format!("node:{sig}"), "buffered");
                 } else if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
                     hop(&mut trace, format!("node:{sig}"), "dropped");
@@ -1302,8 +1354,10 @@ impl SubqueryRegistry {
     /// It is load-bearing, not decoration: an Electric consumer positions its dedup frontier on the
     /// `up-to-date` watermark and DISCARDS any change at or below it, and a change delivered with no
     /// `lsn` header floors to 0 — so an unstamped move-in/move-out row is silently dropped the
-    /// moment that consumer's frontier has moved off zero. `None` only where no commit is the cause
-    /// (a shape's own creation replay).
+    /// moment that consumer's frontier has moved off zero. A creation replay is no exception: it
+    /// carries the high-water commit of what it replays (`PendingSubqueryShape::buffer_lsn` for the
+    /// outer rows, [`CreateReplay::lsn`] for the inner ones). `None` only where no commit is the
+    /// cause at all — a create that buffered nothing.
     async fn emit_for_shapes(
         &mut self,
         ts: &TableSchema,
@@ -2567,5 +2621,99 @@ mod tests {
         // And it stays stopped: a later, perfectly healthy commit cannot un-poison it.
         frontier.commit_flushed("0/20");
         assert_eq!(frontier.published(), "0/0");
+    }
+
+    /// **A creation replay must say which commit it reflects.** Inner-table deltas that land while a
+    /// subquery shape is being created are buffered on the fresh node and replayed at install, so
+    /// the membership rows they move reach the stream long after their transaction did. Handing
+    /// those flips on with no LSN floors them to 0 on the Electric wire, where any consumer that has
+    /// seen a real LSN on that shape drops them — a row silently missing from, or stuck in, the
+    /// shape for as long as nothing else touches it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_creation_replay_carries_the_commit_it_reflects() {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def(name, &def).unwrap()
+        };
+        let (inner_ts, outer_ts) = (mk("inner_t"), mk("outer_t"));
+        let mut schemas = HashMap::new();
+        schemas.insert("outer_t".to_string(), outer_ts);
+        schemas.insert("inner_t".to_string(), inner_ts.clone());
+        let (ds_url, _store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        reg.set_schemas(Arc::new(schemas));
+        let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        assert_eq!(begin.seeds.len(), 1, "one fresh node, buffering");
+
+        // Commit 0/20 lands mid-create: the node is still seeding, so the delta is buffered.
+        let delta = vec![Tup2(Row(vec![Value::Int(1), Value::Int(7)]), 1)];
+        let work = reg
+            .on_table_delta(&inner_ts, &delta, 0x20, Some("0/20".into()), None, None, None)
+            .await
+            .unwrap();
+        assert!(work.is_empty(), "a buffered delta produces no live flip work — that is the hole");
+
+        // Phase C: install with an empty seed, replaying the buffer through the gate.
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        let replay = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+        assert!(!replay.work.is_empty(), "the replayed delta flips the inner set");
+        assert_eq!(
+            replay.lsn.as_deref(),
+            Some("0/20"),
+            "the replay's flips must be stamped with the commit they reflect, not left unstamped"
+        );
+    }
+
+    /// Every owned field counts. Byte-exact self-accounting is what `GET /memory` reports and what
+    /// the memory-reduction work is measured against, so a field added to a heap-carrying struct
+    /// without a matching `heap_bytes` term does not shrink the number — it silently stops being
+    /// true. Both LSN stamps are `Option<String>`: owned, unshared, and easy to forget.
+    #[test]
+    fn the_replay_lsn_stamps_are_counted_in_heap_bytes() {
+        let pred = Arc::new(CompiledPredicate::MatchAll);
+        let pending = |lsn: Option<&str>| PendingSubqueryShape {
+            shape_id: "s1".into(),
+            outer_table: "t".into(),
+            stream_path: "shape/s1".into(),
+            pred: pred.clone(),
+            out_cols: None,
+            changes_only: false,
+            collect_log: Vec::new(),
+            buffer: Vec::new(),
+            buffer_lsn: lsn.map(str::to_string),
+        };
+        let stamp = "0/1AEB9F8";
+        let stamp_bytes = stamp.to_string().heap_bytes();
+        assert_eq!(
+            pending(Some(stamp)).heap_bytes() - pending(None).heap_bytes(),
+            stamp_bytes,
+            "PendingSubqueryShape::buffer_lsn must be accounted for"
+        );
+
+        let node = |lsn: Option<&str>| {
+            let mut n = SubqueryNode::new("sig".into(), "t".into(), 0, 1, pred.clone(), 1);
+            n.seed_buffer_lsn = lsn.map(str::to_string);
+            n
+        };
+        assert_eq!(
+            node(Some(stamp)).heap_bytes() - node(None).heap_bytes(),
+            stamp_bytes,
+            "SubqueryNode::seed_buffer_lsn must be accounted for"
+        );
     }
 }

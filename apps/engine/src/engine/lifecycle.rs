@@ -901,6 +901,15 @@ impl Engine {
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
     ) -> Result<()> {
+        // From registration to phase C, deltas that land are BUFFERED (outer rows on the pending
+        // shape, inner rows on each fresh node) and only replayed at install — so their effects are
+        // not on the streams yet. Hold the fan-out barrier across the whole window, taken BEFORE
+        // the first delta can be buffered: without it the sequencer, seeing no flip work for those
+        // commits, would publish a frontier past changes whose membership consequences are still
+        // sitting in a buffer. The cost is conservative lag — a create's Postgres seeding stalls
+        // the watermark (not delivery) for its duration — and every exit path below must give the
+        // hold back, or the stall is permanent.
+        self.frontier.hold();
         // Phase A (brief lock), with conflict retry.
         let begin = {
             let mut attempt = 0u32;
@@ -914,7 +923,10 @@ impl Engine {
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        self.frontier.release();
+                        return Err(e);
+                    }
                 }
             }
         };
@@ -977,23 +989,39 @@ impl Engine {
         // Phase C (brief lock): install + gated replay, or exact rollback on a phase-B failure.
         match phase_b {
             Ok((node_seeds, outer_gate, seeded, seeded_pks)) => {
-                let work = self
+                let replay = self
                     .subqueries
                     .lock()
                     .await
                     .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
-                    .await?;
-                if !work.is_empty() {
-                    // Replay flips propagate exactly like live ones (barrier-covered).
+                    .await;
+                let replay = match replay {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.frontier.release();
+                        return Err(e);
+                    }
+                };
+                if !replay.work.is_empty() {
+                    // Replay flips propagate exactly like live ones (barrier-covered), stamped with
+                    // the newest commit they reflect so a consumer does not discard them.
                     self.frontier.hold();
-                    if self.flip_tx.send(FlipWork { work, txid: None, lsn: None }).is_err() {
+                    if self
+                        .flip_tx
+                        .send(FlipWork { work: replay.work, txid: None, lsn: replay.lsn })
+                        .is_err()
+                    {
                         self.frontier.release();
                     }
                 }
+                // The create's own hold, released only once its replay is enqueued behind one of
+                // its own — so the barrier never dips to zero between the two.
+                self.frontier.release();
                 Ok(())
             }
             Err(e) => {
                 self.subqueries.lock().await.abort_create(id);
+                self.frontier.release();
                 Err(e)
             }
         }
