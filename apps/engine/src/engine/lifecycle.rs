@@ -996,7 +996,7 @@ impl Engine {
             Ok::<_, anyhow::Error>((node_seeds, outer_gate, seeded, seeded_pks))
         }
         .await;
-        // Phase C (brief lock): install + gated replay, or exact rollback on a phase-B failure.
+        // Phase C (brief lock): register + seed the feed, or exact rollback on a phase-B failure.
         match phase_b {
             Ok((node_seeds, outer_gate, seeded, seeded_pks)) => {
                 let replay = self
@@ -1004,21 +1004,29 @@ impl Engine {
                     .lock()
                     .await
                     .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
-                    .await;
-                let replay = replay?;
+                    .await?;
+                // Phase C₂ (no lock): propagate the creation replay's flips HERE, before the shape
+                // is visible to live evaluation, rather than handing them to the propagator task.
+                // The query-backs cannot run under the registry lock, and a shape that went live
+                // first would have a change committed in between emitted ahead of these rows — with
+                // a higher LSN, which buries them under the consumer's per-shape dedup frontier for
+                // good. Waiting costs this create a Postgres round-trip it was already paying for.
                 if !replay.work.is_empty() {
-                    // Replay flips propagate exactly like live ones (barrier-covered), stamped with
-                    // the newest commit they reflect so a consumer does not discard them. The
-                    // replay's own permit is taken while the create still holds its own, so the
-                    // barrier never dips to zero between the two.
-                    let permit = crate::engine::frontier::Permit::take(&self.frontier);
-                    if let Err(e) =
-                        self.flip_tx.send(FlipWork { work: replay.work, txid: None, lsn: replay.lsn, permit })
-                    {
-                        tracing::error!("flip propagator channel closed; creation replay dropped");
-                        e.0.permit.lost();
-                    }
+                    let mut work = replay.work;
+                    propagate_with_retry(
+                        &self.subqueries,
+                        &mut work,
+                        None,
+                        replay.lsn,
+                        &self.trace_tx,
+                        &self.frontier,
+                    )
+                    .await;
                 }
+                // Phase C₃ (brief lock): replay the outer deltas buffered throughout, then make the
+                // shape a live candidate — one lock, in that order, so nothing live can be enqueued
+                // on its stream ahead of its own creation replay.
+                self.subqueries.lock().await.install_visible(id).await?;
                 creating.disarm();
                 Ok(())
             }

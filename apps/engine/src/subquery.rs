@@ -854,7 +854,11 @@ impl SubqueryRegistry {
             .iter()
             .position(|p| p.shape_id == shape_id)
             .context("finish_create: pending shape vanished")?;
-        let pending = self.pending_shapes.remove(idx);
+        // Deliberately NOT removed: the shape stays pending — and its outer deltas stay buffered —
+        // until [`Self::install_visible`]. See the doc comment above.
+        let pending = &self.pending_shapes[idx];
+        let (outer_table, stream_path, pred, out_cols) =
+            (pending.outer_table.clone(), pending.stream_path.clone(), pending.pred.clone(), pending.out_cols.clone());
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         // High-water commit LSN across every fresh node's buffered replay — what the flips that
         // replay produces are stamped with (see [`CreateReplay`]).
@@ -898,21 +902,16 @@ impl SubqueryRegistry {
                 }
             }
         }
-        // 2. Register the shape, then replay its buffered outer deltas through the gate
-        //    (absolute emission; idempotent against the backfill for snapshot-visible rows).
-        let ts = self
-            .schemas
-            .get(&pending.outer_table)
-            .cloned()
-            .context("finish_create: unknown outer table")?;
+        // 2. Register the shape so the replay can reach it — WITHOUT making it a candidate for live
+        //    deltas, which keeps its stream ordered (see [`Self::register_shape`]).
         let feed_id = self.next_feed_id;
         self.next_feed_id += 1;
-        self.install_shape(SubqueryShape {
+        self.register_shape(SubqueryShape {
             shape_id: shape_id.to_string(),
-            outer_table: pending.outer_table.clone(),
-            stream_path: pending.stream_path.clone(),
-            pred: pending.pred.clone(),
-            out_cols: pending.out_cols.clone(),
+            outer_table,
+            stream_path,
+            pred,
+            out_cols,
             gate: outer_gate,
             emitted: std::sync::atomic::AtomicU64::new(seeded),
             feed_id,
@@ -926,28 +925,68 @@ impl SubqueryRegistry {
             let pk_id = self.pk_dict.get_or_insert(&pk);
             self.feed_sets.insert(feed_id, pk_id);
         }
+        Ok(CreateReplay { work, lsn: replay_lsn })
+    }
+
+    /// The tail of creation: replay the outer deltas buffered up to this instant, then make the
+    /// shape a candidate for live evaluation. Both under one lock, in that order, so the replay is
+    /// enqueued on the shape's stream ahead of anything live — which is the property the two-step
+    /// install exists for.
+    ///
+    /// Called once per successful [`Self::finish_create`], after its flips have propagated.
+    pub async fn install_visible(&mut self, shape_id: &str) -> Result<()> {
+        let idx = self
+            .pending_shapes
+            .iter()
+            .position(|p| p.shape_id == shape_id)
+            .context("install_visible: pending shape vanished")?;
+        let pending = self.pending_shapes.remove(idx);
+        let ts = self
+            .schemas
+            .get(&pending.outer_table)
+            .cloned()
+            .context("install_visible: unknown outer table")?;
         if !pending.buffer.is_empty() {
             // Stamp the replay with the newest commit it reflects, so these rows clear a consumer's
             // dedup frontier (see `emit_for_shapes`); an unstamped replay floors to LSN 0 and is
-            // discarded by any consumer whose frontier has moved.
+            // discarded by any consumer whose frontier has moved. Absolute emission, so this is
+            // idempotent against the backfill for snapshot-visible rows.
             let outer_lsn = pending.buffer_lsn.clone();
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
             self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None, outer_lsn).await?;
         }
-        Ok(CreateReplay { work, lsn: replay_lsn })
+        if let Some(shape) = self.shapes.get(shape_id) {
+            let (table, pred) = (shape.outer_table.clone(), shape.pred.clone());
+            self.shape_index.insert(shape_id, &table, &pred);
+        }
+        Ok(())
     }
 
-    /// Install a fully-built outer shape. The shapes map, the feed-id reverse map and the
-    /// necessary-conjunct index MUST move together — an index entry outliving its shape is a
-    /// wasted probe, but a shape with no index entry is invisible to every later delta (silently
-    /// dropped envelopes). One call site so they cannot drift, and one synchronous `&mut self`
-    /// step so no live delta can observe a half-installed shape. Registration is only reachable
-    /// from `finish_create`, the atomic tail of shape creation: a create that fails earlier
-    /// (`abort_create`) never got here, so there is nothing for it to roll back.
-    fn install_shape(&mut self, shape: SubqueryShape) {
+    /// Register an outer shape so it can be **emitted to**, without making it a candidate for live
+    /// deltas. Deliberately half of an install, and safe only in the one window it is used in.
+    ///
+    /// A shape with no index entry is invisible to `outer_candidates`, which for a normal shape
+    /// would mean silently dropped envelopes. Here it means *buffered* ones: the create's pending
+    /// entry is still in `pending_shapes`, so live outer deltas keep accumulating there until
+    /// [`Self::install_visible`] replays them and adds the index entry, under one lock.
+    ///
+    /// That window is what keeps the shape's stream ordered. The creation replay's rows come from
+    /// Postgres query-backs that cannot run under the registry lock, so they are enqueued after the
+    /// lock is released; if the shape were live by then, a change committed in between would be
+    /// emitted FIRST, with a higher LSN, and a consumer would discard the replay behind it (the
+    /// dedup frontier is per shape and only moves forward). Staying unindexed until the replay has
+    /// landed removes the race rather than narrowing it.
+    fn register_shape(&mut self, shape: SubqueryShape) {
         self.feed_by_id.insert(shape.feed_id, shape.shape_id.clone());
-        self.shape_index.insert(&shape.shape_id, &shape.outer_table, &shape.pred);
         self.shapes.insert(shape.shape_id.clone(), shape);
+    }
+
+    /// Register an outer shape AND index it in one step — the whole install, for callers with no
+    /// creation replay to order (tests, and any future non-buffered path).
+    #[cfg(test)]
+    fn install_shape(&mut self, shape: SubqueryShape) {
+        self.shape_index.insert(&shape.shape_id, &shape.outer_table, &shape.pred);
+        self.register_shape(shape);
     }
 
     /// The subquery shapes on `table` that a change described by `delta` can possibly move —
@@ -2789,5 +2828,81 @@ mod tests {
         assert_eq!(work.len(), 2, "a failed attempt must not consume the work it did not finish");
         assert_eq!(work[0].1.value, Value::Int(100), "the failed item goes back at the front");
         assert_eq!(work[1].1.value, Value::Int(200), "and the untouched item keeps its place");
+    }
+
+    /// **A shape being created is not a live candidate until its own replay has landed.**
+    ///
+    /// The creation replay's rows come from Postgres query-backs, which cannot run under the
+    /// registry lock, so they reach the stream after the lock is released. If the shape were live by
+    /// then, a change committed in between would be emitted FIRST and with a higher LSN, and the
+    /// consumer's per-shape dedup frontier — which only moves forward — would bury the replay behind
+    /// it. Membership silently wrong until something else happens to touch those rows.
+    ///
+    /// So between `finish_create` and `install_visible` the shape can be emitted TO but is not a
+    /// candidate: live outer deltas keep buffering, and `install_visible` replays them and indexes
+    /// the shape under one lock, in that order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shape_mid_create_buffers_live_deltas_instead_of_racing_its_replay() {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def(name, &def).unwrap()
+        };
+        let (inner_ts, outer_ts) = (mk("inner_t"), mk("outer_t"));
+        let mut schemas = HashMap::new();
+        schemas.insert("outer_t".to_string(), outer_ts.clone());
+        schemas.insert("inner_t".to_string(), inner_ts.clone());
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        reg.set_schemas(Arc::new(schemas));
+        let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        // Seed the node with gid 7 present, so an outer row with gid 7 is a member.
+        let seeds: Vec<_> = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| {
+                // `TableSchema` orders columns alphabetically: (gid, id).
+                (sig.clone(), vec![Row(vec![Value::Int(7), Value::Int(1)])], crate::pg::SnapshotGate::passthrough())
+            })
+            .collect();
+        let replay = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+        assert!(replay.work.is_empty(), "nothing was buffered on the node");
+
+        // Registered, but not yet visible: a live outer delta must NOT reach the stream here — this
+        // is the window in which the creation replay is still in flight.
+        let delta = vec![Tup2(Row(vec![Value::Int(7), Value::Int(10)]), 1)];
+        reg.on_table_delta(&outer_ts, &delta, 0x30, Some("0/30".into()), None, None, None).await.unwrap();
+        assert!(
+            reg.outer_candidates("outer_t", &delta).is_empty(),
+            "a mid-create shape must not be a candidate for live evaluation"
+        );
+        assert!(
+            ops_for(&store, "shape/s1").is_empty(),
+            "the live delta must be buffered, not emitted ahead of the creation replay"
+        );
+
+        // The tail of creation: the buffered delta is replayed, and only then does the shape go live.
+        reg.install_visible("s1").await.unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert"], "the buffered delta is replayed at install");
+        assert_eq!(
+            reg.outer_candidates("outer_t", &delta),
+            vec!["s1".to_string()],
+            "and the shape is a live candidate from here on"
+        );
+
+        // A change after install flows live, in stream order behind the replay.
+        let after = vec![Tup2(Row(vec![Value::Int(7), Value::Int(11)]), 1)];
+        reg.on_table_delta(&outer_ts, &after, 0x40, Some("0/40".into()), None, None, None).await.unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert", "upsert"]);
     }
 }
