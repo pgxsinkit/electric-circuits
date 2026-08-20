@@ -391,6 +391,12 @@ struct StreamFold {
     /// engine appends the backfill in a deterministic order and the adapter must not shuffle
     /// it. Deleted keys keep their slot here and are filtered at emission by map membership.
     order: Vec<String>,
+    /// Every key ever pushed to `order`. A key that LEAVES the shape and later RE-ENTERS it
+    /// (delete → upsert, i.e. membership churn on a subquery shape) would otherwise be pushed a
+    /// second time — `rows.insert` returns `None` because the delete removed it — and both slots
+    /// then resolve in `ordered_rows()`, emitting the key twice as `insert` in one snapshot.
+    /// Found while evaluating Circuits as a sync core for pgxsinkit (offline-resume + membership-churn suites).
+    seen: HashSet<String>,
     offset: String,
     until: Option<String>,
     done: bool,
@@ -398,13 +404,14 @@ struct StreamFold {
 
 impl StreamFold {
     fn to_tail() -> Self {
-        StreamFold { rows: HashMap::new(), order: Vec::new(), offset: "-1".into(), until: None, done: false }
+        StreamFold { rows: HashMap::new(), order: Vec::new(), seen: HashSet::new(), offset: "-1".into(), until: None, done: false }
     }
 
     fn up_to(offset: &str) -> Self {
         StreamFold {
             rows: HashMap::new(),
             order: Vec::new(),
+            seen: HashSet::new(),
             offset: "-1".into(),
             until: Some(offset.to_string()),
             done: false,
@@ -430,7 +437,10 @@ impl StreamFold {
                 }
                 _ => {
                     if let Some(v) = env.value {
-                        if self.rows.insert(env.key.clone(), v).is_none() {
+                        self.rows.insert(env.key.clone(), v);
+                        // Guard on `seen`, NOT on `rows.insert(..).is_none()`: a key that was
+                        // deleted and re-enters returns None there and would get a 2nd `order` slot.
+                        if self.seen.insert(env.key.clone()) {
                             self.order.push(env.key);
                         }
                     }
