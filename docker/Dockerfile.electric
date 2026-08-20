@@ -26,7 +26,7 @@ RUN touch apps/engine/src/main.rs apps/engine/src/lib.rs \
 
 # --- stage 2: build the durable-streams-server binary (see docker/Dockerfile.ds) --------------
 FROM rust:1.83-slim AS ds-build
-RUN cargo install durable-streams --version 0.1.4 --locked
+RUN cargo install durable-streams --version 0.1.5 --locked
 
 # --- stage 3: node deps for the durable-streams server ----------------------
 FROM node:22-slim AS node-deps

@@ -23,7 +23,7 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
-const CRATE_VERSION = '0.1.4'
+const CRATE_VERSION = '0.1.5'
 const BIN_NAME = 'durable-streams-server'
 
 export interface TestServerOptions {

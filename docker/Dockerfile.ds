@@ -7,7 +7,7 @@
 #   DS_PORT (8791) · BIND_HOST (0.0.0.0) · DS_DATA_DIR (/data) · DS_MEMORY=1 (--durability memory)
 
 FROM rust:1.83-slim AS builder
-RUN cargo install durable-streams --version 0.1.4 --locked
+RUN cargo install durable-streams --version 0.1.5 --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
