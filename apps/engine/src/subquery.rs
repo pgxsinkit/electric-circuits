@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crate::value::{Tup2, ZWeight};
 
 use crate::ds::{DsClient, Envelope};
@@ -347,11 +347,18 @@ pub struct CreateReplay {
 /// visibility; `Installed` means the pending entry was empty, its outer buffer was replayed, and
 /// the shape was indexed under the same registry lock.
 pub(crate) enum InstallStep {
-    Deferred(VecDeque<DeferredShapeWork>),
+    Deferred {
+        work: VecDeque<DeferredShapeWork>,
+        retry_after: std::time::Duration,
+    },
     Installed,
 }
 
 const MAX_CREATE_DEFERRED_BATCHES: u8 = 8;
+
+#[derive(Debug, thiserror::Error)]
+#[error("subquery create did not quiesce after {MAX_CREATE_DEFERRED_BATCHES} deferred batches")]
+pub(crate) struct CreateDrainExhausted;
 
 /// The later of two LSNs in Postgres `hi/lo` hex form. Not a string comparison: `"0/9"` sorts after
 /// `"0/10"` lexically and before it numerically.
@@ -1003,12 +1010,14 @@ impl SubqueryRegistry {
             .context("install_step: pending shape vanished")?;
         if !self.pending_shapes[idx].deferred.is_empty() {
             if self.pending_shapes[idx].deferred_batches >= MAX_CREATE_DEFERRED_BATCHES {
-                bail!(
-                    "subquery create did not quiesce after {MAX_CREATE_DEFERRED_BATCHES} deferred batches"
-                );
+                return Err(CreateDrainExhausted.into());
             }
             self.pending_shapes[idx].deferred_batches += 1;
-            return Ok(InstallStep::Deferred(std::mem::take(&mut self.pending_shapes[idx].deferred)));
+            let round = self.pending_shapes[idx].deferred_batches;
+            return Ok(InstallStep::Deferred {
+                work: std::mem::take(&mut self.pending_shapes[idx].deferred),
+                retry_after: std::time::Duration::from_millis(10u64 << (round.saturating_sub(1).min(4))),
+            });
         }
         let pending = self.pending_shapes.remove(idx);
         let ts = self
@@ -1569,6 +1578,95 @@ impl SubqueryRegistry {
 //    hold-the-lock-across-append design gave, without network under the lock and without a
 //    single-task bottleneck. Postgres round-trips run outside the lock, concurrently.
 
+/// Transaction metadata and ownership for one complete DAG propagation.
+///
+/// Keeping creation reachability here makes it impossible for a caller to forget the boolean that
+/// decides whether exhausting retries is shape-local or has lost effects in shared topology.
+pub(crate) struct PropagationContext<'a> {
+    txid: Option<String>,
+    lsn: Option<String>,
+    trace_tx: Option<&'a tokio::sync::broadcast::Sender<Arc<String>>>,
+    owner: PropagationOwner<'a>,
+}
+
+enum PropagationOwner<'a> {
+    Live,
+    Creating { shape_id: &'a str, reached_shared_topology: bool },
+}
+
+impl<'a> PropagationContext<'a> {
+    pub(crate) fn live(
+        txid: Option<String>,
+        lsn: Option<String>,
+        trace_tx: &'a tokio::sync::broadcast::Sender<Arc<String>>,
+    ) -> Self {
+        Self {
+            txid,
+            lsn,
+            trace_tx: Some(trace_tx),
+            owner: PropagationOwner::Live,
+        }
+    }
+
+    pub(crate) fn creating(
+        txid: Option<String>,
+        lsn: Option<String>,
+        trace_tx: &'a tokio::sync::broadcast::Sender<Arc<String>>,
+        shape_id: &'a str,
+    ) -> Self {
+        Self {
+            txid,
+            lsn,
+            trace_tx: Some(trace_tx),
+            owner: PropagationOwner::Creating { shape_id, reached_shared_topology: false },
+        }
+    }
+
+    /// Draining work already queued for the shape being created. No trace sink: tracing lights a
+    /// *propagation path* (`table:` → `node:` → `shape:`) from [`propagate_one`], and this drain
+    /// re-runs only the dependent query-back at the end of one — there is no path left to light.
+    fn deferred(txid: Option<String>, lsn: Option<String>, shape_id: &'a str) -> Self {
+        Self {
+            txid,
+            lsn,
+            trace_tx: None,
+            owner: PropagationOwner::Creating { shape_id, reached_shared_topology: false },
+        }
+    }
+
+    fn creating_shape(&self) -> Option<&'a str> {
+        match &self.owner {
+            PropagationOwner::Live => None,
+            PropagationOwner::Creating { shape_id, .. } => Some(*shape_id),
+        }
+    }
+
+    /// The shape whose reachability is still undecided, if any. Escape is monotone — once the walk
+    /// is known to touch shared topology the answer cannot change — so this stops asking, rather
+    /// than taking the registry lock and re-walking the DAG for every remaining item.
+    fn undecided_creating_shape(&self) -> Option<&'a str> {
+        match &self.owner {
+            PropagationOwner::Creating { shape_id, reached_shared_topology: false } => Some(*shape_id),
+            _ => None,
+        }
+    }
+
+    fn note_reachability(&mut self, reaches_another_shape: bool) {
+        if reaches_another_shape
+            && let PropagationOwner::Creating { reached_shared_topology, .. } = &mut self.owner
+        {
+            *reached_shared_topology = true;
+        }
+    }
+
+    pub(crate) fn poisons_on_exhaustion(&self) -> bool {
+        match self.owner {
+            PropagationOwner::Live => true,
+            PropagationOwner::Creating { reached_shared_topology, .. } => reached_shared_topology,
+        }
+    }
+}
+
 /// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
 ///
 /// `work` is drained in place and is the **retry state**, not just an input. A failed attempt leaves
@@ -1585,40 +1683,24 @@ pub async fn propagate_flips(
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
-    let mut escaped_creation = false;
-    propagate_flips_for(registry, work, txid, lsn, trace_tx, None, &mut escaped_creation).await
+    let mut context = PropagationContext::live(txid, lsn, trace_tx);
+    propagate_flips_for(registry, work, &mut context).await
 }
 
-/// Creation-owned propagation may reach exactly its own pending shape. Ordinary live propagation
-/// passes `None` and queues dependent query-backs on any shape whose creation still owns its
-/// stream.
+/// Creation-owned propagation may reach exactly its own pending shape. Live propagation queues
+/// dependent query-backs on any shape whose creation still owns its stream.
 pub(crate) async fn propagate_flips_for(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
-    txid: Option<String>,
-    lsn: Option<String>,
-    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
-    creating_shape: Option<&str>,
-    escaped_creation: &mut bool,
+    context: &mut PropagationContext<'_>,
 ) -> Result<()> {
     while let Some((sig, flip)) = work.pop_front() {
-        if let Some(shape_id) = creating_shape
-            && !*escaped_creation
-            && registry.lock().await.node_reaches_shape_other_than(&sig, shape_id)
-        {
-            *escaped_creation = true;
+        if let Some(shape_id) = context.undecided_creating_shape() {
+            let reaches_another_shape =
+                registry.lock().await.node_reaches_shape_other_than(&sig, shape_id);
+            context.note_reachability(reaches_another_shape);
         }
-        if let Err(e) = propagate_one(
-            registry,
-            &sig,
-            &flip,
-            txid.clone(),
-            lsn.clone(),
-            trace_tx,
-            work,
-            creating_shape,
-        )
-        .await
+        if let Err(e) = propagate_one(registry, &sig, &flip, context, work).await
         {
             // Back on the queue for the retry. Its already-walked edges are re-walked there: a shape
             // move re-emits absolutely (converges), and a parent already reconciled yields no second
@@ -1632,16 +1714,12 @@ pub(crate) async fn propagate_flips_for(
 
 /// One flip: walk its node's edges, moving dependent shapes and re-deriving dependent parent nodes,
 /// pushing whatever the parents flip in turn onto `work`.
-#[allow(clippy::too_many_arguments)]
 async fn propagate_one(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     sig: &SubquerySig,
     flip: &Flip,
-    txid: Option<String>,
-    lsn: Option<String>,
-    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    context: &PropagationContext<'_>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
-    creating_shape: Option<&str>,
 ) -> Result<()> {
     // The flipped inner-set node's dependents, plus the table its change entered through: the
     // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
@@ -1658,31 +1736,31 @@ async fn propagate_one(
         // monotone over FALSE < UNKNOWN < TRUE), so skip.
         if matches!(flip.value, Value::Null) {
             if edge.null_sensitive {
-                rederive_dependent(registry, &edge, txid.clone(), lsn.clone(), work, creating_shape).await?;
+                rederive_dependent(registry, &edge, context, work).await?;
             }
             continue;
         }
         match &edge.dependent {
             Dependent::Shape(id) => {
                 let moved =
-                    move_shape_for_value(
-                        registry, id, edge.connecting_col, &flip.value, txid.clone(), lsn.clone(), creating_shape,
-                    )
+                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, context)
                         .await?;
                 // Light the whole path only when the shape actually moved rows: source
                 // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
                 if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
-                    emit_flip_trace(
-                        trace_tx,
-                        &outer,
-                        src,
-                        &sig,
-                        format!("shape:{id}"),
-                        vec![id.clone()],
-                        net,
-                        lsn.clone(),
-                        txid.clone(),
-                    );
+                    if let Some(trace_tx) = context.trace_tx {
+                        emit_flip_trace(
+                            trace_tx,
+                            &outer,
+                            src,
+                            &sig,
+                            format!("shape:{id}"),
+                            vec![id.clone()],
+                            net,
+                            context.lsn.clone(),
+                            context.txid.clone(),
+                        );
+                    }
                 }
             }
             Dependent::Node(parent_sig) => {
@@ -1693,17 +1771,19 @@ async fn propagate_one(
                     // `node:<parent_sig>` it re-derived, so the propagation reads through. The
                     // parent's own downstream shape lights when its flips reach a shape edge.
                     if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
-                        emit_flip_trace(
-                            trace_tx,
-                            src,
-                            src,
-                            &sig,
-                            format!("node:{parent_sig}"),
-                            Vec::new(),
-                            flip_net(&flips),
-                            lsn.clone(),
-                            txid.clone(),
-                        );
+                        if let Some(trace_tx) = context.trace_tx {
+                            emit_flip_trace(
+                                trace_tx,
+                                src,
+                                src,
+                                &sig,
+                                format!("node:{parent_sig}"),
+                                Vec::new(),
+                                flip_net(&flips),
+                                context.lsn.clone(),
+                                context.txid.clone(),
+                            );
+                        }
                     }
                     for f in flips {
                         work.push_back((parent_sig.clone(), f));
@@ -1725,22 +1805,20 @@ async fn move_shape_for_value(
     shape_id: &str,
     connecting_col: usize,
     value: &Value,
-    txid: Option<String>,
-    lsn: Option<String>,
-    creating_shape: Option<&str>,
+    context: &PropagationContext<'_>,
 ) -> Result<Option<(String, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url) = {
         let mut reg = registry.lock().await;
-        if creating_shape != Some(shape_id)
+        if context.creating_shape() != Some(shape_id)
             && let Some(pending) = reg.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id)
         {
-            pending.replay_lsn = max_lsn(pending.replay_lsn.take(), lsn.clone());
+            pending.replay_lsn = max_lsn(pending.replay_lsn.take(), context.lsn.clone());
             pending.deferred.push_back(DeferredShapeWork::Value {
                 connecting_col,
                 value: value.clone(),
-                txid,
-                lsn,
+                txid: context.txid.clone(),
+                lsn: context.lsn.clone(),
             });
             return Ok(None);
         }
@@ -1756,7 +1834,13 @@ async fn move_shape_for_value(
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
     let results =
-        reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, lsn).await?;
+        reg.emit_for_shapes(
+            &ts,
+            vec![(shape_id.to_string(), candidates)],
+            context.txid.clone(),
+            context.lsn.clone(),
+        )
+        .await?;
     Ok(match results.first() {
         Some((_, true, net)) => Some((ts.name.clone(), *net)),
         _ => None,
@@ -1807,14 +1891,12 @@ async fn requery_and_reconcile_parent(
 async fn rederive_dependent(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     edge: &Edge,
-    txid: Option<String>,
-    lsn: Option<String>,
+    context: &PropagationContext<'_>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
-    creating_shape: Option<&str>,
 ) -> Result<()> {
     match &edge.dependent {
         Dependent::Shape(id) => {
-            rederive_shape(registry, id, txid, lsn, creating_shape).await?;
+            rederive_shape(registry, id, context).await?;
         }
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
@@ -1834,17 +1916,18 @@ async fn rederive_dependent(
 async fn rederive_shape(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     shape_id: &str,
-    txid: Option<String>,
-    lsn: Option<String>,
-    creating_shape: Option<&str>,
+    context: &PropagationContext<'_>,
 ) -> Result<()> {
     let (ts, pg_url) = {
         let mut reg = registry.lock().await;
-        if creating_shape != Some(shape_id)
+        if context.creating_shape() != Some(shape_id)
             && let Some(pending) = reg.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id)
         {
-            pending.replay_lsn = max_lsn(pending.replay_lsn.take(), lsn.clone());
-            pending.deferred.push_back(DeferredShapeWork::Full { txid, lsn });
+            pending.replay_lsn = max_lsn(pending.replay_lsn.take(), context.lsn.clone());
+            pending.deferred.push_back(DeferredShapeWork::Full {
+                txid: context.txid.clone(),
+                lsn: context.lsn.clone(),
+            });
             return Ok(());
         }
         let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
@@ -1853,7 +1936,13 @@ async fn rederive_shape(
     let rows = query_all(&pg_url, &ts).await?;
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-    reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, lsn).await?;
+    reg.emit_for_shapes(
+        &ts,
+        vec![(shape_id.to_string(), candidates)],
+        context.txid.clone(),
+        context.lsn.clone(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1866,13 +1955,15 @@ pub(crate) async fn propagate_deferred_shape_work(
 ) -> Result<()> {
     while let Some(item) = work.pop_front() {
         let result = match &item {
-            DeferredShapeWork::Value { connecting_col, value, txid, lsn } => move_shape_for_value(
-                registry, shape_id, *connecting_col, value, txid.clone(), lsn.clone(), Some(shape_id),
-            )
-            .await
-            .map(|_| ()),
+            DeferredShapeWork::Value { connecting_col, value, txid, lsn } => {
+                let context = PropagationContext::deferred(txid.clone(), lsn.clone(), shape_id);
+                move_shape_for_value(registry, shape_id, *connecting_col, value, &context)
+                    .await
+                    .map(|_| ())
+            }
             DeferredShapeWork::Full { txid, lsn } => {
-                rederive_shape(registry, shape_id, txid.clone(), lsn.clone(), Some(shape_id)).await
+                let context = PropagationContext::deferred(txid.clone(), lsn.clone(), shape_id);
+                rederive_shape(registry, shape_id, &context).await
             }
         };
         if let Err(error) = result {
@@ -2903,14 +2994,12 @@ mod tests {
         frontier.commit_flushed("0/10");
         let mut work: VecDeque<(SubquerySig, Flip)> =
             [(sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
+        let context = PropagationContext::live(None, Some("0/10".into()), &trace_tx);
         let result = crate::engine::propagate_with_retry(
             &registry,
             &mut work,
-            None,
-            Some("0/10".into()),
-            &trace_tx,
+            context,
             &frontier,
-            None,
         )
         .await;
         assert!(result.is_err(), "retry exhaustion must fail its caller, not only poison side state");
@@ -2950,14 +3039,12 @@ mod tests {
             Flip { value: Value::Int(100), dir: FlipDir::Enter },
         )]);
 
+        let context = PropagationContext::creating(None, Some("0/10".into()), &trace_tx, "s1");
         let result = crate::engine::propagate_with_retry(
             &registry,
             &mut work,
-            None,
-            Some("0/10".into()),
-            &trace_tx,
+            context,
             &frontier,
-            Some("s1"),
         )
         .await;
 
@@ -2995,14 +3082,13 @@ mod tests {
             Flip { value: Value::Int(100), dir: FlipDir::Enter },
         )]);
 
+        let context =
+            PropagationContext::creating(None, Some("0/10".into()), &trace_tx, "creating");
         let result = crate::engine::propagate_with_retry(
             &registry,
             &mut work,
-            None,
-            Some("0/10".into()),
-            &trace_tx,
+            context,
             &frontier,
-            Some("creating"),
         )
         .await;
 
@@ -3228,7 +3314,7 @@ mod tests {
         let mut reg = registry.into_inner();
 
         let deferred_lsn = match reg.install_step("s1").await.unwrap() {
-            InstallStep::Deferred(mut work) => match work.pop_front().unwrap() {
+            InstallStep::Deferred { mut work, .. } => match work.pop_front().unwrap() {
                 DeferredShapeWork::Value { lsn, .. } | DeferredShapeWork::Full { lsn, .. } => lsn,
             },
             InstallStep::Installed => panic!("the newer inner effect must be drained before install"),
@@ -3298,15 +3384,21 @@ mod tests {
             .await
             .unwrap();
 
+        let mut retry_delays = Vec::new();
         for round in 1..=8 {
             reg.pending_shapes[0]
                 .deferred
                 .push_back(DeferredShapeWork::Full { txid: None, lsn: Some(format!("0/{round:X}")) });
-            assert!(
-                matches!(reg.install_step("s1").await.unwrap(), InstallStep::Deferred(_)),
-                "round {round} is inside the bounded drain allowance"
-            );
+            match reg.install_step("s1").await.unwrap() {
+                InstallStep::Deferred { retry_after, .. } => retry_delays.push(retry_after),
+                InstallStep::Installed => panic!("round {round} must still have deferred work"),
+            }
         }
+        assert!(retry_delays.iter().all(|delay| !delay.is_zero()), "every busy retry must pause");
+        assert!(
+            retry_delays.windows(2).all(|pair| pair[0] <= pair[1]),
+            "busy-create backoff must be non-decreasing"
+        );
         reg.pending_shapes[0]
             .deferred
             .push_back(DeferredShapeWork::Full { txid: None, lsn: Some("0/9".into()) });
@@ -3314,6 +3406,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("the ninth continuously refilled batch must stop creation"),
         };
+        assert!(error.downcast_ref::<CreateDrainExhausted>().is_some());
         assert!(format!("{error:#}").contains("did not quiesce after 8 deferred batches"));
     }
 

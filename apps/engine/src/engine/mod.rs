@@ -167,8 +167,9 @@ fn spawn_flip_propagator(
             let trace_tx = trace_tx.clone();
             tokio::spawn(async move {
                 let FlipWork { mut work, txid, lsn, permit: barrier } = fw;
+                let context = crate::subquery::PropagationContext::live(txid, lsn, &trace_tx);
                 if let Err(error) =
-                    propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx, &frontier, None).await
+                    propagate_with_retry(&registry, &mut work, context, &frontier).await
                 {
                     tracing::error!("{error:#}");
                 }
@@ -237,25 +238,12 @@ const FLIP_ATTEMPTS: u32 = 5;
 pub(crate) async fn propagate_with_retry(
     registry: &Mutex<SubqueryRegistry>,
     work: &mut std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
-    txid: Option<String>,
-    lsn: Option<String>,
-    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    mut context: crate::subquery::PropagationContext<'_>,
     frontier: &Frontier,
-    creating_shape: Option<&str>,
 ) -> Result<()> {
     let mut backoff = std::time::Duration::from_millis(50);
-    let mut escaped_creation = false;
     for attempt in 1..=FLIP_ATTEMPTS {
-        let r = crate::subquery::propagate_flips_for(
-            registry,
-            work,
-            txid.clone(),
-            lsn.clone(),
-            trace_tx,
-            creating_shape,
-            &mut escaped_creation,
-        )
-        .await;
+        let r = crate::subquery::propagate_flips_for(registry, work, &mut context).await;
         match r {
             Ok(()) => return Ok(()),
             Err(e) if attempt < FLIP_ATTEMPTS => {
@@ -268,7 +256,7 @@ pub(crate) async fn propagate_with_retry(
                 // guard rolls the half-created shape and all of its private node state back. Live
                 // propagation, or a creation replay that escaped to another shape through shared
                 // topology, has lost established effects and must still fail closed globally.
-                if creating_shape.is_none() || escaped_creation {
+                if context.poisons_on_exhaustion() {
                     tracing::error!(
                         "subquery flip propagation failed after {FLIP_ATTEMPTS} attempts, ABANDONED \
                          (established membership effects lost; fan-out frontier poisoned): {e:#}"

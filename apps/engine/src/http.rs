@@ -648,7 +648,12 @@ struct AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
-        AppError { status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("{e:#}") }
+        let status = if e.chain().any(|cause| cause.is::<crate::subquery::CreateDrainExhausted>()) {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        AppError { status, msg: format!("{e:#}") }
     }
 }
 
@@ -660,7 +665,7 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::health_json;
+    use super::{AppError, health_json};
 
     // The fleet's healthcheck does an awk string-compare against the exact body, so byte-for-byte
     // exactness (no whitespace) matters more than JSON equivalence.
@@ -670,5 +675,11 @@ mod tests {
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
         assert_eq!(health_json("degraded"), r#"{"status":"degraded"}"#);
+    }
+
+    #[test]
+    fn a_busy_subquery_create_is_reported_as_retryable() {
+        let error = AppError::from(anyhow::Error::new(crate::subquery::CreateDrainExhausted));
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

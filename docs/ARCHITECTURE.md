@@ -442,9 +442,10 @@ comes from Postgres query-backs, which cannot run under the registry lock, so `f
 registers the shape without making it a **candidate** for live evaluation: outer deltas keep
 buffering on its pending entry while the replay propagates, and live inner propagation queues its
 dependent query-backs there too. The creator drains those inner query-backs in arrival order, for at
-most eight batches; a continuously refilled queue fails and rolls back the create instead of holding
-the global fan-out permit forever. `install_step` then atomically observes that queue empty, replays
-the outer buffer, and files the index entry. That final outer replay is stamped with the maximum LSN
+most eight batches, pausing with bounded exponential backoff (10–160ms) between rounds. A
+continuously refilled queue answers 503 and rolls back the create instead of holding the global
+fan-out permit forever; clients may retry. `install_step` then atomically observes that queue empty,
+replays the outer buffer, and files the index entry. That final outer replay is stamped with the maximum LSN
 already reflected by the initial replay, deferred query-backs, and the buffer itself, so its later
 append cannot move a consumer's per-stream frontier backwards. A live path therefore either queues
 before that transition or evaluates after it.

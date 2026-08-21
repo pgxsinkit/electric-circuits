@@ -992,14 +992,17 @@ impl Engine {
                 // good. Waiting costs this create a Postgres round-trip it was already paying for.
                 if !replay.work.is_empty() {
                     let mut work = replay.work;
-                    propagate_with_retry(
-                        &self.subqueries,
-                        &mut work,
+                    let context = crate::subquery::PropagationContext::creating(
                         None,
                         replay.lsn,
                         &self.trace_tx,
+                        id,
+                    );
+                    propagate_with_retry(
+                        &self.subqueries,
+                        &mut work,
+                        context,
                         &self.frontier,
-                        Some(id),
                     )
                     .await?;
                 }
@@ -1010,8 +1013,9 @@ impl Engine {
                         bail!("degraded during subquery creation; rolling the shape back");
                     }
                     match self.subqueries.lock().await.install_step(id).await? {
-                        crate::subquery::InstallStep::Deferred(mut work) => {
+                        crate::subquery::InstallStep::Deferred { mut work, retry_after } => {
                             propagate_deferred_with_retry(&self.subqueries, id, &mut work).await?;
+                            tokio::time::sleep(retry_after).await;
                         }
                         crate::subquery::InstallStep::Installed => break,
                     }

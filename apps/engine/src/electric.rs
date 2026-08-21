@@ -412,6 +412,12 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.chain().any(|cause| cause.is::<crate::subquery::CreateDrainExhausted>()) {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("{e:#}"),
+            };
+        }
         // A read the stream refused because of the POSITION is the client's problem to fix, not a
         // server fault: answer it the way Electric answers any offset that can no longer be placed.
         // Every read on this path is at an offset the client supplied, directly (the positioned
@@ -1176,6 +1182,12 @@ async fn shape_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_busy_subquery_snapshot_is_reported_as_retryable() {
+        let error = ApiError::from(anyhow::Error::new(crate::subquery::CreateDrainExhausted));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
     use crate::ds::EnvelopeHeaders;
 
     /// NOTE the `offset: None`: durable-streams never stamps a per-envelope offset, and nothing in
