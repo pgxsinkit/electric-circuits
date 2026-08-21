@@ -255,7 +255,9 @@ subqueries).
    exponential pauses between rounds, so a hot table cannot hold the global creation permit
    forever. Exhaustion is a retryable 503 rather than an undifferentiated server error.
    Permits are fail-closed: only explicit completion releases cleanly, so a worker panic, abort, or
-   discarded queued item poisons too. The degraded reaper deletes subquery streams consumed directly from durable-streams.
+   discarded queued item poisons too. Once the binary has received SIGINT/SIGTERM and committed to
+   shutdown, permit drops release without poisoning; durable-input recovery owns unfinished work on
+   restart. The degraded reaper deletes subquery streams consumed directly from durable-streams.
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 

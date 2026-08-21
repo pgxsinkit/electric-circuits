@@ -7,6 +7,7 @@
 //! comes from `ELECTRIC_CIRCUITS_DS_URL`; the engine binds `0.0.0.0:$ELECTRIC_PORT` (default 3000 under the
 //! fleet, `127.0.0.1:0` in dev) and prints `ENGINE_LISTENING <url>` to stdout for harness discovery.
 
+use std::future::IntoFuture;
 use std::io::Write;
 use std::time::Duration;
 
@@ -94,7 +95,7 @@ async fn main() -> Result<()> {
     statsd::spawn_system_sampler(config.metrics_period);
     statsd::spawn_storage_sampler(config.storage_dir.clone());
 
-    let app = electric_circuits_engine::http::router_with_introspection(engine, config.trace);
+    let app = electric_circuits_engine::http::router_with_introspection(engine.clone(), config.trace);
 
     let listener =
         tokio::net::TcpListener::bind(&config.bind).await.with_context(|| format!("binding {}", config.bind))?;
@@ -105,8 +106,57 @@ async fn main() -> Result<()> {
     std::io::stdout().flush().ok();
     tracing::info!("electric-circuits engine listening on http://{addr}, ds={ds_url}");
 
-    axum::serve(listener, app).await?;
+    // The drain is BOUNDED. A `live=true` long-poll is held open for `ELECTRIC_LIVE_TIMEOUT_MS`
+    // (20s by default), so waiting for every in-flight request would make each restart as slow as
+    // the slowest long-poll still running — while the supervisor's own grace period (10s under
+    // compose) SIGKILLs the process before that anyway. A restart re-seeds every node from
+    // Postgres, so abandoning a long-poll costs its client one reconnect, which is what refusing it
+    // would have cost too. What the drain is actually for is the flag, not the connections: it must
+    // be set before the runtime cancels workers holding permits.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel();
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(engine, signalled_tx))
+        .into_future();
+    tokio::select! {
+        result = served => result?,
+        () = async move {
+            // Errors only if the signal handler was dropped with the server, in which case the
+            // other arm has already finished and this one is about to be dropped.
+            let _ = signalled_rx.await;
+            tokio::time::sleep(DRAIN_GRACE).await;
+        } => tracing::warn!("connections still open after {DRAIN_GRACE:?}; exiting anyway"),
+    }
     Ok(())
+}
+
+/// How long in-flight requests get to finish after a shutdown signal — see the call site for why
+/// this is bounded rather than "until the last connection closes".
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+async fn shutdown_signal(engine: Engine, signalled: tokio::sync::oneshot::Sender<()>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("installing Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    // Set this before Axum begins draining and the runtime eventually cancels background workers.
+    engine.begin_shutdown();
+    let _ = signalled.send(());
+    tracing::info!("shutdown requested; draining HTTP connections for at most {DRAIN_GRACE:?}");
 }
 
 fn init_tracing(filter: &str) {

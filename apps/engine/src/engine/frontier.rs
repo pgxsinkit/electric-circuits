@@ -25,6 +25,9 @@ pub(crate) struct Frontier {
     /// Flip batches abandoned after exhausting their retries — the reason for a poisoning, counted
     /// so an operator can tell "one bad minute" from "Postgres is gone".
     failures: AtomicU64,
+    /// Set before a deliberate runtime teardown. At that point abandoned in-memory work is handled
+    /// by restart recovery, not an in-process degraded transition.
+    shutting_down: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     degraded: tokio::sync::watch::Sender<bool>,
 }
@@ -47,6 +50,7 @@ impl Frontier {
         Frontier {
             pending: AtomicI64::new(0),
             failures: AtomicU64::new(0),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(State { published: "0/0".to_string(), candidate: None, poisoned: false }),
             degraded,
         }
@@ -88,7 +92,13 @@ impl Frontier {
     }
 
     /// Record that subquery effects were lost and stop advancing, permanently.
+    ///
+    /// This is intentionally a no-op after [`Frontier::begin_shutdown`]: once runtime teardown has
+    /// begun, dropped in-memory work belongs to restart recovery and is not an in-process failure.
     pub(crate) fn poison(&self) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         self.failures.fetch_add(1, Ordering::SeqCst);
         self.state.lock().unwrap().poisoned = true;
         let _ = self.degraded.send(true);
@@ -106,6 +116,11 @@ impl Frontier {
 
     pub(crate) fn subscribe_degraded(&self) -> tokio::sync::watch::Receiver<bool> {
         self.degraded.subscribe()
+    }
+
+    /// Suppress false lost-work reports while a deliberate runtime teardown cancels workers.
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
     }
 
     /// Promote the candidate if nothing is in flight.
@@ -220,6 +235,17 @@ mod tests {
         assert!(f.poisoned());
         assert_eq!(f.pending(), 0);
         assert_eq!(f.published(), "0/0");
+    }
+
+    #[test]
+    fn dropping_queued_work_during_deliberate_shutdown_does_not_poison() {
+        let f = Arc::new(Frontier::new());
+        let permit = Permit::take(&f);
+        f.begin_shutdown();
+        drop(permit);
+        assert!(!f.poisoned(), "runtime teardown is not an in-process loss event");
+        assert_eq!(f.failures(), 0);
+        assert_eq!(f.pending(), 0);
     }
 
     /// A permit whose work is gone is not a permit whose work is done.

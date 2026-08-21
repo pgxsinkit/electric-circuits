@@ -436,6 +436,12 @@ membership. A creation failure still confined to its new shape is rolled back wi
 no established materialization could have lost an effect. A restart re-seeds the nodes and clients
 recreate the disposable streams deleted after a global failure.
 Observability and cleanup endpoints stay up — that is how the operator finds out and recovers.
+On SIGINT/SIGTERM the binary marks the engine as shutting down before Axum drains and the runtime
+cancels its workers. Permit drops during that deliberate teardown release the barrier without
+reporting false lost-work failures; restart recovery owns work that was still only in memory. The
+drain itself is bounded (2s) rather than "until the last connection closes": a `live=true` long-poll
+is held for up to `ELECTRIC_LIVE_TIMEOUT_MS`, and a restart that waited for it would exceed the
+supervisor's own grace period and be killed anyway.
 
 **Creation is atomic on the stream, not just in the registry.** A subquery shape's creation replay
 comes from Postgres query-backs, which cannot run under the registry lock, so `finish_create`

@@ -434,6 +434,15 @@ impl Engine {
         e
     }
 
+    /// Mark the process as deliberately shutting down before the runtime cancels background work.
+    ///
+    /// Unfinished in-memory work is recovered from durable inputs on the next boot. It therefore
+    /// must not be reported as an in-process lost-effect failure while this process is already
+    /// committed to exiting.
+    pub fn begin_shutdown(&self) {
+        self.frontier.begin_shutdown();
+    }
+
     fn new_inner(ds: DsClient, pg_url: Option<String>) -> Self {
         let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
