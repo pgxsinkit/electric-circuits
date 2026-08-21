@@ -248,8 +248,14 @@ subqueries).
    eval order per shape. The in-flight count (flips + enqueued-but-unlanded batches) is the
    extra convergence-barrier term (`GET /replication/lsn` → `pendingFlips`). A batch whose
    query-backs fail is retried from where the failed attempt stopped (the walk consumes parent
-   transitions, so it cannot restart from its roots); work that outlives its retries is abandoned,
-   and the fan-out frontier is poisoned rather than advanced past effects that will never land.
+   transitions, so it cannot restart from its roots); live work that outlives its retries is
+   abandoned, and the fan-out frontier is poisoned rather than advanced past effects that will
+   never land. Creation-owned failure is shape-local and rolls back cleanly unless its walk reached
+   shared topology; its pending inner queue is capped at eight drain batches so a hot table cannot
+   hold the global creation permit forever.
+   Permits are fail-closed: only explicit completion releases cleanly, so a worker panic, abort, or
+   discarded queued item poisons too. The degraded reaper deletes subquery streams consumed
+   directly from durable-streams.
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 

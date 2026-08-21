@@ -424,24 +424,30 @@ are still sitting in a buffer.
 A commit that flushes while flips are in flight is published by whichever worker drains the **last**
 of them (`engine::frontier::Frontier`), not by the next transaction — otherwise a terminal flip on a
 source that then goes quiet strands the watermark, with the changes delivered and nothing to release
-them. And when flip work is abandoned, the frontier is **poisoned**: those effects are lost rather
-than late, so the engine stops claiming any commit is fully fanned out, counts it on
+them. When live flip work is abandoned — or creation-owned work has reached shared topology — the
+frontier is **poisoned**: established-shape effects are lost rather than late, so the engine stops
+claiming any commit is fully fanned out, counts it on
 `/replication/lsn` as `flipFailures`, reports `{"status":"degraded"}` (503) on `/v1/health`, and
-**stops serving shape data** — `/v1/shape`, `/shapes/{id}/rows`, `/shapes/{id}/log` and `/query` all
-answer 503. Membership is known to be wrong and nothing in the engine repairs it, so answering at
-all is the worse outcome: the client cannot tell, and neither can its user. 503 is retryable, so
-clients resume by themselves once an operator restarts the engine, which re-seeds every node from
-Postgres. Observability stays up — that is how the operator finds out. Note the gate covers what the
-*engine* serves: an extended client long-polling a shape stream from durable-streams directly is
-past it.
+**stops serving shape data or minting handles** — `/v1/shape`, shape/aggregate creation and lookup,
+`/shapes/{id}/rows`, `/shapes/{id}/log`, and `/query` all answer 503. Extended clients read durable
+streams directly, beyond that HTTP gate, so poisoning also deletes every registered subquery stream
+(retrying deletion until storage accepts it); their long-polls fail instead of continuing on stale
+membership. A creation failure still confined to its new shape is rolled back without poisoning;
+no established materialization could have lost an effect. A restart re-seeds the nodes and clients
+recreate the disposable streams deleted after a global failure.
+Observability and cleanup endpoints stay up — that is how the operator finds out and recovers.
 
 **Creation is atomic on the stream, not just in the registry.** A subquery shape's creation replay
 comes from Postgres query-backs, which cannot run under the registry lock, so `finish_create`
 registers the shape without making it a **candidate** for live evaluation: outer deltas keep
-buffering on its pending entry while the replay propagates. `install_visible` then replays that
-buffer and files the index entry under one lock, in that order. Otherwise a change committed in the
-gap would be emitted first, with a higher LSN, and the replay behind it would fall below the
-consumer's per-shape dedup frontier — which only moves forward — and be discarded for good.
+buffering on its pending entry while the replay propagates, and live inner propagation queues its
+dependent query-backs there too. The creator drains those inner query-backs in arrival order, for at
+most eight batches; a continuously refilled queue fails and rolls back the create instead of holding
+the global fan-out permit forever. `install_step` then atomically observes that queue empty, replays
+the outer buffer, and files the index entry. That final outer replay is stamped with the maximum LSN
+already reflected by the initial replay, deferred query-backs, and the buffer itself, so its later
+append cannot move a consumer's per-stream frontier backwards. A live path therefore either queues
+before that transition or evaluates after it.
 
 **Resuming at an offset.** A client that reconnects at an older offset than the handle last served
 needs the key set *it* holds at that offset (the adapter reconstructs insert-vs-update, and suppresses
@@ -451,10 +457,10 @@ answers exactly is **how many envelopes lie after a position**, and the stream i
 `electric.rs::keys_at` counts the whole stream, counts what the client has not seen, and folds the
 difference as a prefix — and a prefix never changes, however much arrives meanwhile.
 
-That costs about two passes over the stream's history and retains nothing. It is bounded by the same
-thing a snapshot is bounded by, and the alternative to reconstruction *is* that snapshot:
-`must-refetch` re-folds the stream from `-1` **and** re-delivers the whole key set to the client, so
-refusing an old position to save the work would raise the total, not lower it.
+That costs at least one full historical scan and commonly nearly two, fully deserializing every
+envelope while retaining no tail map. The cost is unbounded as a stream's history grows; production
+deployments need storage retention and, for long-lived hot shapes, a future checkpoint/index seam to
+avoid paying the full log history on every rewind.
 
 The two counts come from separate reads, so an append landing between them would skew the
 subtraction. The surplus is itself a count-after, measurable the same way, so the corrections
@@ -462,7 +468,8 @@ alternate in sign and shrink to the appends that landed during the previous read
 (`SuffixCorrection`); the series settles as soon as one read sees a quiet stream. A stream that never
 goes quiet, or an offset the stream never issued, is answered `409 must-refetch` rather than served
 from a guessed key set — one rebuilt from the wrong window fails silently in the retain-data
-direction (a revoked row is never evicted).
+direction (a revoked row is never evicted). A deleted/expired shared stream is evicted and freshly
+backfilled on that re-snapshot, so the client cannot loop forever rejoining the same dead stream.
 
 Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
