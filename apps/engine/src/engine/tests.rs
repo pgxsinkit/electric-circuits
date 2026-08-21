@@ -1113,6 +1113,12 @@ async fn a_terminal_flip_publishes_the_commit_that_was_waiting_on_it() {
     // synchronously, before the transaction's own boundary. The signature has no dependents, so
     // propagation is a no-op that still has to release the barrier.
     let permit = super::frontier::Permit::take(&subq.frontier);
+    // Assert the barrier BEFORE handing the permit to the propagator. Afterwards it can drain and
+    // complete on another thread before this one runs its next line, and `commit_flushed` then
+    // publishes immediately — the correct end state, reached by the route this test is not about,
+    // and indistinguishable here from the stall it does test.
+    subq.frontier.commit_flushed("0/10");
+    assert_eq!(subq.frontier.published(), "0/0", "not while its flips are in flight");
     assert!(
         subq.flip_tx
             .send(FlipWork {
@@ -1125,8 +1131,6 @@ async fn a_terminal_flip_publishes_the_commit_that_was_waiting_on_it() {
             })
             .is_ok()
     );
-    subq.frontier.commit_flushed("0/10");
-    assert_eq!(subq.frontier.published(), "0/0", "not while its flips are in flight");
 
     // No further transaction ever arrives. The drain is the only thing that can publish it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
