@@ -57,6 +57,22 @@ async function readFeed(streamUrl: string): Promise<StreamEnvelope[]> {
 }
 
 describe('subset LSN positioning (end-to-end)', () => {
+  it('seeds the same offset page through subset() as query()', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)')
+    await drainEngine(h)
+
+    const def = { table: 'items', orderBy: { col: 'n' }, limit: 2, offset: 2 } as const
+    const expected = await h.client.query(def)
+    expect(expected.rows.map((row) => row.id)).toEqual([3, 4])
+
+    const sub = await h.client.subset(def)
+    try {
+      expect((sub.collection.toArray as unknown as Row[]).map((row) => row.id)).toEqual([3, 4])
+    } finally {
+      await sub.close()
+    }
+  })
+
   it('drops the overlap-window delta already in the page — exactly-once, no double-count', async () => {
     // 1. Seed the table and let the engine ingest it.
     await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 30)')
