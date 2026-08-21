@@ -265,13 +265,19 @@ impl DsClient {
             return Ok(ReadResult { envelopes: Vec::new(), next_offset, up_to_date });
         }
         if !status.is_success() {
-            // 400 (malformed offset) and 410 (before the earliest retained position) are the server
-            // saying this POSITION cannot be served — not that the read failed. Typed, so the
-            // Electric adapter can answer its client `409 must-refetch` instead of a 500:
-            // re-snapshotting is the protocol's own answer to an offset that no longer places.
+            // 400 is a malformed position; 404/410 mean the stream itself is gone
+            // (deleted/expired, with 410 used while a fork still pins the deleted parent).
+            // Keep that distinction typed so the Electric adapter can answer `409 must-refetch`
+            // instead of flattening either into a 500.
             // (durable-streams PROTOCOL.md §GET response codes.)
-            if matches!(status.as_u16(), 400 | 410) {
-                return Err(anyhow::Error::new(UnplaceableOffset { status: status.as_u16() })
+            if matches!(status.as_u16(), 400 | 404 | 410) {
+                let kind = match status.as_u16() {
+                    400 => OffsetErrorKind::Malformed,
+                    404 => OffsetErrorKind::Missing,
+                    410 => OffsetErrorKind::Gone,
+                    _ => unreachable!(),
+                };
+                return Err(anyhow::Error::new(UnplaceableOffset { kind })
                     .context(format!("GET {path} at offset {offset}")));
             }
             bail!("GET {path} -> {status}");
@@ -286,15 +292,27 @@ impl DsClient {
     }
 }
 
-/// The stream could not place the offset it was asked for: malformed, or aged out of retention.
+/// The stream could not place the offset it was asked for: malformed, or the stream is gone.
 #[derive(Debug)]
 pub struct UnplaceableOffset {
-    pub status: u16,
+    kind: OffsetErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetErrorKind {
+    Malformed,
+    Missing,
+    Gone,
 }
 
 impl std::fmt::Display for UnplaceableOffset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the stream cannot place this offset (durable-streams answered {})", self.status)
+        let status = match self.kind {
+            OffsetErrorKind::Malformed => 400,
+            OffsetErrorKind::Missing => 404,
+            OffsetErrorKind::Gone => 410,
+        };
+        write!(f, "the stream cannot place this offset (durable-streams answered {status})")
     }
 }
 
@@ -303,6 +321,10 @@ impl std::error::Error for UnplaceableOffset {}
 /// Whether this error, or anything it wraps, is an [`UnplaceableOffset`].
 pub fn is_unplaceable_offset(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<UnplaceableOffset>())
+}
+
+pub fn offset_error_kind(e: &anyhow::Error) -> Option<OffsetErrorKind> {
+    e.chain().find_map(|cause| cause.downcast_ref::<UnplaceableOffset>().map(|offset| offset.kind))
 }
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {

@@ -64,7 +64,7 @@ fn tok(n: usize) -> String {
 fn parse_offset(q: &str, floor: usize) -> Result<usize, u16> {
     let raw = q.split('&').find_map(|kv| kv.strip_prefix("offset=")).unwrap_or("-1");
     if raw == "-1" {
-        return if floor == 0 { Ok(0) } else { Err(410) };
+        return Ok(0);
     }
     if raw.len() != 16 || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(400);
@@ -404,4 +404,8 @@ async fn an_offset_below_the_retained_window_is_answered_must_refetch() {
     let res = get_shape(&engine, &format!("table=t&handle={handle}&offset={persisted}")).await;
     assert_eq!(res.status, StatusCode::CONFLICT, "expected must-refetch, got {:?}", res.messages);
     assert_eq!(res.messages[0]["headers"]["control"], "must-refetch");
+
+    let fresh = get_shape(&engine, "table=t&offset=-1").await;
+    assert_eq!(fresh.status, StatusCode::OK, "the recovery sentinel must remain placeable");
+    assert_eq!(fresh.changes().len(), 1, "re-snapshot returns the retained current row");
 }

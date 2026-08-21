@@ -36,7 +36,9 @@ describe('conformance: an offset the stream cannot place', () => {
     const snap = await fetch(`${h.engineUrl}/v1/shape?table=items&offset=-1`)
     expect(snap.status).toBe(200)
     const handle = snap.headers.get('electric-handle')
+    const offset = snap.headers.get('electric-offset')
     expect(handle).toBeTruthy()
+    expect(offset).toBeTruthy()
     expect((await snap.json()).filter((m: { headers: { operation?: string } }) => m.headers.operation)).toHaveLength(1)
 
     // The offset, however, is not a token this stream ever issued — truncated storage, a client that
@@ -53,5 +55,30 @@ describe('conformance: an offset the stream cannot place', () => {
     expect(again.status).toBe(200)
     const rows = (await again.json()) as Array<{ headers: { operation?: string }; key?: string }>
     expect(rows.filter((m) => m.headers.operation).map((m) => m.key)).toEqual(['i1'])
+
+    // Drive a genuine 410 from the pinned Rust server. This version exposes no retention control,
+    // but a deleted stream has the same wire answer and exercises the exact adapter branch. A new
+    // snapshot must rebuild rather than rejoin the dead shared stream.
+    const shapeId = handle!.match(/^s\d+/)?.[0]
+    expect(shapeId).toBeTruthy()
+    // A fork pins the parent after DELETE, making direct parent operations answer 410 instead of
+    // immediately removing the path and answering 404.
+    const fork = await fetch(`${h.dsUrl}/test/offset-410-pin`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'stream-forked-from': `/shape/${shapeId}` },
+    })
+    expect(fork.status).toBe(201)
+    const deleted = await fetch(`${h.dsUrl}/shape/${shapeId}`, { method: 'DELETE' })
+    expect(deleted.status).toBe(204)
+
+    const gone = await fetch(`${h.engineUrl}/v1/shape?table=items&handle=${handle}&offset=${offset}`)
+    expect(gone.status).toBe(409)
+    expect(await gone.json()).toEqual([{ headers: { control: 'must-refetch' } }])
+
+    const rebuilt = await fetch(`${h.engineUrl}/v1/shape?table=items&offset=-1`)
+    expect(rebuilt.status).toBe(200)
+    const rebuiltRows = (await rebuilt.json()) as Array<{ headers: { operation?: string }; key?: string }>
+    expect(rebuiltRows.filter((m) => m.headers.operation).map((m) => m.key)).toEqual(['i1'])
+    expect(rebuilt.headers.get('electric-handle')).not.toContain(`${shapeId}h`)
   })
 })

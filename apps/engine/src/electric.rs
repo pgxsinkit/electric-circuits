@@ -1050,11 +1050,31 @@ async fn shape_inner(
         // returning client's re-snapshot rejoins the retained shape — reactivated inside
         // `create_shape` if it went dormant — instead of re-backfilling from Postgres. The handle
         // minted below stays per-client (see the module docs).
-        let rec = engine.create_shape(&p.table, pred, columns.clone(), false, true).await?;
+        let mut rec = engine.create_shape(&p.table, pred.clone(), columns.clone(), false, true).await?;
         // Captured before the materialize, for the same reason as in `positioned_read`.
         let frontier = engine.sequenced_lsn();
         let (rows, tail) = match materialize(&engine, &rec.stream_path).await {
             Ok(v) => v,
+            Err(e)
+                if matches!(
+                    crate::ds::offset_error_kind(&e),
+                    Some(crate::ds::OffsetErrorKind::Missing | crate::ds::OffsetErrorKind::Gone)
+                ) =>
+            {
+                // The retained shared stream itself expired. Every subscriber is already broken,
+                // so evict that record and backfill a new stream rather than sending the client
+                // into an endless `must-refetch` loop on the same dead shape.
+                engine.release_shape(&rec.id).await;
+                engine.purge_shape(&rec.id).await.map_err(ApiError::from)?;
+                rec = engine.create_shape(&p.table, pred, columns.clone(), false, true).await?;
+                match materialize(&engine, &rec.stream_path).await {
+                    Ok(v) => v,
+                    Err(error) => {
+                        engine.release_shape(&rec.id).await;
+                        return Err(error.into());
+                    }
+                }
+            }
             Err(e) => {
                 // Failed after taking the create/join subscription: give it back, or the dead
                 // subscription pins the shape active forever.
