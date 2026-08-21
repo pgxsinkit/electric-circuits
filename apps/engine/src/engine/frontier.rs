@@ -26,6 +26,7 @@ pub(crate) struct Frontier {
     /// so an operator can tell "one bad minute" from "Postgres is gone".
     failures: AtomicU64,
     state: Mutex<State>,
+    degraded: tokio::sync::watch::Sender<bool>,
 }
 
 struct State {
@@ -42,10 +43,12 @@ struct State {
 
 impl Frontier {
     pub(crate) fn new() -> Frontier {
+        let (degraded, _rx) = tokio::sync::watch::channel(false);
         Frontier {
             pending: AtomicI64::new(0),
             failures: AtomicU64::new(0),
             state: Mutex::new(State { published: "0/0".to_string(), candidate: None, poisoned: false }),
+            degraded,
         }
     }
 
@@ -88,6 +91,7 @@ impl Frontier {
     pub(crate) fn poison(&self) {
         self.failures.fetch_add(1, Ordering::SeqCst);
         self.state.lock().unwrap().poisoned = true;
+        let _ = self.degraded.send(true);
     }
 
     /// How many flip batches were abandoned (each one a poisoning).
@@ -98,6 +102,10 @@ impl Frontier {
     /// Whether the frontier has stopped advancing because effects were lost.
     pub(crate) fn poisoned(&self) -> bool {
         self.state.lock().unwrap().poisoned
+    }
+
+    pub(crate) fn subscribe_degraded(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.degraded.subscribe()
     }
 
     /// Promote the candidate if nothing is in flight.
@@ -129,31 +137,40 @@ impl Frontier {
 ///
 /// Every piece of work the frontier waits on holds one for as long as its effects are not yet on
 /// the streams: an enqueued emission batch, a flip batch in flight, a shape create's buffering
-/// window. `Drop` releases, so a `?`, a panic, or a **cancelled future** (an HTTP client that
-/// disconnects mid-create) cannot strand the barrier — which manual pairing could not promise.
-///
-/// A permit whose work was lost rather than completed is retired with [`Permit::lost`] instead.
+/// window. Completion is explicit; an armed permit that is merely dropped means its work vanished
+/// with its owner, so `Drop` poisons before releasing. Cancellation-safe operations transfer the
+/// permit to their asynchronous rollback and complete it only after rollback settles.
 pub(crate) struct Permit {
     frontier: Arc<Frontier>,
+    completed: bool,
 }
 
 impl Permit {
     /// Take a hold on `frontier`.
     pub(crate) fn take(frontier: &Arc<Frontier>) -> Permit {
         frontier.hold();
-        Permit { frontier: frontier.clone() }
+        Permit { frontier: frontier.clone(), completed: false }
+    }
+
+    /// The work this permit covered has landed, or has been fully rolled back.
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
     }
 
     /// This permit's work will never land — the worker it was handed to is gone, or its retries are
     /// spent. Poison the frontier before releasing: a barrier that drains on lost work is a
     /// watermark that advances past effects no client will ever see.
-    pub(crate) fn lost(self) {
+    pub(crate) fn lost(mut self) {
         self.frontier.poison();
+        self.completed = true;
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
+        if !self.completed {
+            self.frontier.poison();
+        }
         self.frontier.release();
     }
 }
@@ -176,24 +193,33 @@ mod tests {
         let two = Permit::take(&f);
         f.commit_flushed("0/10");
         assert_eq!(f.published(), "0/0", "flips still in flight");
-        drop(one);
+        one.complete();
         assert_eq!(f.published(), "0/0", "one still in flight");
         // The terminal flip publishes it — no later transaction is needed, which is the whole point.
-        drop(two);
+        two.complete();
         assert_eq!(f.published(), "0/10");
     }
 
-    /// The leak this type exists to prevent: work that returns early, panics, or is cancelled.
+    /// Work is done only when its owner says so.
     #[test]
-    fn a_permit_releases_however_its_scope_ends() {
+    fn an_explicitly_completed_permit_releases_cleanly() {
         let f = Arc::new(Frontier::new());
-        {
-            let _permit = Permit::take(&f);
-            f.commit_flushed("0/10");
-            assert_eq!(f.published(), "0/0");
-        }
-        assert_eq!(f.published(), "0/10", "the permit released on the way out of scope");
+        let permit = Permit::take(&f);
+        f.commit_flushed("0/10");
+        permit.complete();
+        assert_eq!(f.published(), "0/10");
         assert_eq!(f.pending(), 0);
+    }
+
+    #[test]
+    fn a_dropped_permit_is_lost_work_and_poisons() {
+        let f = Arc::new(Frontier::new());
+        let permit = Permit::take(&f);
+        f.commit_flushed("0/10");
+        drop(permit);
+        assert!(f.poisoned());
+        assert_eq!(f.pending(), 0);
+        assert_eq!(f.published(), "0/0");
     }
 
     /// A permit whose work is gone is not a permit whose work is done.
@@ -212,7 +238,7 @@ mod tests {
     fn a_drained_barrier_with_nothing_waiting_publishes_nothing() {
         let f = Arc::new(Frontier::new());
         f.commit_flushed("0/10");
-        drop(Permit::take(&f));
+        Permit::take(&f).complete();
         assert_eq!(f.published(), "0/10", "no candidate to promote; stays put");
     }
 
@@ -222,7 +248,7 @@ mod tests {
         let permit = Permit::take(&f);
         f.commit_flushed("0/10");
         f.commit_flushed("0/20");
-        drop(permit);
+        permit.complete();
         assert_eq!(f.published(), "0/20");
     }
 

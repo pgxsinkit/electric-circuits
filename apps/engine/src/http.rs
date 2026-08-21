@@ -26,9 +26,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/health", get(health_v1))
         .route("/health", get(|| async { "ok" }))
         .route("/schema", post(define_schema))
-        .route("/shapes", post(create_shape))
-        .route("/aggregate", post(create_aggregate))
-        .route("/shapes/{id}", get(get_shape).delete(release_shape))
+        .route("/shapes/{id}", axum::routing::delete(release_shape))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
         // Table schema (columns + pk), a parameterized single-row INSERT (the visualizer's add-row
@@ -49,6 +47,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         // Everything whose answer IS shape membership, behind the degraded gate.
         .merge(
             Router::new()
+                .route("/shapes", post(create_shape))
+                .route("/aggregate", post(create_aggregate))
+                .route("/shapes/{id}", get(get_shape))
                 .route("/shapes/{id}/rows", get(get_shape_rows))
                 .route("/shapes/{id}/log", get(get_shape_log))
                 .route("/query", post(query_subset))
@@ -78,8 +79,8 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
 /// and starts working again the moment an operator restarts the engine (which re-seeds every node
 /// from Postgres).
 ///
-/// Applies to what the ENGINE serves. Extended clients long-polling a shape stream from
-/// durable-streams directly are past this gate — see `docs/ARCHITECTURE.md` §8.
+/// Extended clients long-poll durable-streams directly, so poisoning also deletes every subquery
+/// stream; this gate covers engine-served reads and prevents minting replacement handles.
 async fn refuse_when_degraded(
     State(engine): State<Engine>,
     req: axum::extract::Request,

@@ -1147,7 +1147,7 @@ async fn a_terminal_flip_publishes_the_commit_that_was_waiting_on_it() {
 #[tokio::test]
 async fn a_poisoned_frontier_refuses_to_serve_shape_data() {
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
     let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
@@ -1165,8 +1165,17 @@ async fn a_poisoned_frontier_refuses_to_serve_shape_data() {
     engine.frontier.poison();
 
     assert_eq!(get("/v1/shape?table=t&offset=-1").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(get("/shapes/s1").await.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(get("/shapes/s1/rows").await.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(get("/shapes/s1/log").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    for uri in ["/shapes", "/aggregate"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri(uri).body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri} minted a handle while degraded");
+    }
     let health = get("/v1/health").await;
     assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = axum::body::to_bytes(health.into_body(), 4096).await.unwrap();
@@ -1178,4 +1187,58 @@ async fn a_poisoned_frontier_refuses_to_serve_shape_data() {
     let body = axum::body::to_bytes(lsn.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["flipFailures"], 1);
+}
+
+#[tokio::test]
+async fn poisoning_deletes_subquery_streams_read_directly_by_extended_clients() {
+    use axum::extract::{Request, State};
+    use axum::http::{Method, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn ds(State(deletes): State<Arc<AtomicUsize>>, req: Request) -> Response {
+        match *req.method() {
+            Method::DELETE => {
+                deletes.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Method::PUT | Method::POST => StatusCode::OK.into_response(),
+            Method::GET => ([
+                ("stream-next-offset", "0"),
+                ("stream-up-to-date", "1"),
+            ], "[]")
+                .into_response(),
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(ds).with_state(deletes.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let engine = Engine::new(DsClient::new(&url));
+    engine.subqueries.lock().await.shapes.insert(
+        "s1".into(),
+        crate::subquery::SubqueryShape {
+            shape_id: "s1".into(),
+            outer_table: "t".into(),
+            stream_path: "shape/s1".into(),
+            pred: Arc::new(CompiledPredicate::MatchAll),
+            out_cols: None,
+            gate: crate::pg::SnapshotGate::passthrough(),
+            emitted: std::sync::atomic::AtomicU64::new(0),
+            feed_id: 1,
+        },
+    );
+
+    engine.frontier.poison();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while deletes.load(Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline, "degraded stream reaper never deleted shape/s1");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(deletes.load(Ordering::SeqCst), 1);
 }

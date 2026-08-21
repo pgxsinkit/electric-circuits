@@ -167,13 +167,51 @@ fn spawn_flip_propagator(
             let trace_tx = trace_tx.clone();
             tokio::spawn(async move {
                 let FlipWork { mut work, txid, lsn, permit: barrier } = fw;
-                propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx, &frontier).await;
+                if let Err(error) =
+                    propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx, &frontier, None).await
+                {
+                    tracing::error!("{error:#}");
+                }
                 // Dropped only after propagation finished enqueueing every resulting batch — each
                 // batch carries its own permit until it lands, so the barrier never reads zero with
                 // effects in flight.
-                drop(barrier);
+                barrier.complete();
                 drop(permit);
             });
+        }
+    });
+}
+
+/// Existing extended clients read durable streams directly, beyond the HTTP degraded gate. Once
+/// membership effects are lost, delete every subquery stream so those clients fail closed instead
+/// of continuing to serve a silently stale materialization. Deletion retries until storage accepts
+/// it; catalog restore already treats subquery streams as disposable, deletes them, and relies on
+/// subscribers to recreate their shapes after restart.
+fn spawn_degraded_stream_reaper(
+    registry: Arc<Mutex<SubqueryRegistry>>,
+    ds: DsClient,
+    frontier: Arc<Frontier>,
+) {
+    let mut degraded = frontier.subscribe_degraded();
+    tokio::spawn(async move {
+        while !*degraded.borrow() {
+            if degraded.changed().await.is_err() {
+                return;
+            }
+        }
+        let paths = registry.lock().await.shape_stream_paths();
+        for path in paths {
+            let mut backoff = std::time::Duration::from_millis(100);
+            loop {
+                match ds.delete_stream(&path).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::error!("degraded fail-closed: could not delete {path}: {error:#}; retrying");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                    }
+                }
+            }
         }
     });
 }
@@ -190,12 +228,12 @@ const FLIP_ATTEMPTS: u32 = 5;
 /// [`crate::subquery::emit_for_shapes`]), but the DAG walk is not restartable, because reconciling a
 /// parent node consumes the transition that produced its flips. See [`crate::subquery::propagate_flips`].
 ///
-/// If every attempt fails the effects are LOST — the rows a subquery moved in or out never reach
-/// their shape streams, and nothing will retry them. That is not a lag the frontier can wait out,
-/// so the frontier is poisoned: the engine stops claiming any commit is fully fanned out, and
-/// `/v1/health` reports `degraded` so the fleet restarts it (a restart re-seeds every node from
-/// Postgres, which is what actually repairs the divergence). Silently continuing would leave
-/// consumers with permanently wrong membership and no signal — see `docs/ARCHITECTURE.md`.
+/// If every attempt fails during live propagation, or after a creation replay has reached shared
+/// topology, the effects are LOST — the rows a subquery moved in or out never reach established
+/// shape streams, and nothing will retry them. That is not lag the frontier can wait out, so the
+/// frontier is poisoned and the fail-closed reaper deletes subquery streams. Work still confined
+/// to the shape being created is different: its create guard rolls all of that private state back,
+/// so the error fails only that request and leaves the engine healthy.
 pub(crate) async fn propagate_with_retry(
     registry: &Mutex<SubqueryRegistry>,
     work: &mut std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
@@ -203,25 +241,74 @@ pub(crate) async fn propagate_with_retry(
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     frontier: &Frontier,
-) {
+    creating_shape: Option<&str>,
+) -> Result<()> {
     let mut backoff = std::time::Duration::from_millis(50);
+    let mut escaped_creation = false;
     for attempt in 1..=FLIP_ATTEMPTS {
-        let r = crate::subquery::propagate_flips(registry, work, txid.clone(), lsn.clone(), trace_tx).await;
+        let r = crate::subquery::propagate_flips_for(
+            registry,
+            work,
+            txid.clone(),
+            lsn.clone(),
+            trace_tx,
+            creating_shape,
+            &mut escaped_creation,
+        )
+        .await;
         match r {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(e) if attempt < FLIP_ATTEMPTS => {
                 tracing::warn!("subquery flip propagation failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
             }
             Err(e) => {
-                tracing::error!(
-                    "subquery flip propagation failed after {FLIP_ATTEMPTS} attempts, ABANDONED                      (membership effects lost; fan-out frontier poisoned): {e:#}"
-                );
-                frontier.poison();
+                // A creation-owned walk that never reached shared topology is recoverable: its
+                // guard rolls the half-created shape and all of its private node state back. Live
+                // propagation, or a creation replay that escaped to another shape through shared
+                // topology, has lost established effects and must still fail closed globally.
+                if creating_shape.is_none() || escaped_creation {
+                    tracing::error!(
+                        "subquery flip propagation failed after {FLIP_ATTEMPTS} attempts, ABANDONED \
+                         (established membership effects lost; fan-out frontier poisoned): {e:#}"
+                    );
+                    frontier.poison();
+                } else {
+                    tracing::warn!(
+                        "subquery creation replay failed after {FLIP_ATTEMPTS} attempts; rolling \
+                         back shape-local work without poisoning the engine: {e:#}"
+                    );
+                }
+                return Err(e).context("subquery flip propagation exhausted its retries");
             }
         }
     }
+    unreachable!("the retry loop always returns")
+}
+
+pub(crate) async fn propagate_deferred_with_retry(
+    registry: &Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    work: &mut std::collections::VecDeque<crate::subquery::DeferredShapeWork>,
+) -> Result<()> {
+    let mut backoff = std::time::Duration::from_millis(50);
+    for attempt in 1..=FLIP_ATTEMPTS {
+        match crate::subquery::propagate_deferred_shape_work(registry, shape_id, work).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < FLIP_ATTEMPTS => {
+                tracing::warn!(
+                    "deferred shape propagation failed (attempt {attempt}), retrying in {backoff:?}: {error:#}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(error) => {
+                return Err(error).context("deferred shape propagation exhausted its retries");
+            }
+        }
+    }
+    unreachable!("the retry loop always returns")
 }
 
 struct EngineState {
@@ -373,6 +460,7 @@ impl Engine {
             frontier.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
+        spawn_degraded_stream_reaper(subqueries.clone(), ds.clone(), frontier.clone());
         spawn_flip_propagator(subqueries.clone(), flip_rx, frontier.clone(), trace_tx.clone());
         let (catalog_tx, catalog_rx) = mpsc::unbounded_channel();
         spawn_catalog_writer(ds.clone(), catalog_rx);

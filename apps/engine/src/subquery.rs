@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crate::value::{Tup2, ZWeight};
 
 use crate::ds::{DsClient, Envelope};
@@ -76,7 +76,7 @@ pub struct SubqueryNode {
     pub(crate) seed_buffer: Option<Vec<Tup2<Row, ZWeight>>>,
     /// Commit LSN of the newest delta in [`Self::seed_buffer`] — the high-water mark of what the
     /// install-time replay reflects. Stamped onto the envelopes that replay produces, for the same
-    /// reason the outer buffer carries one ([`PendingSubqueryShape::buffer_lsn`]): a move-in/move-out
+    /// reason the pending create carries one ([`PendingSubqueryShape::replay_lsn`]): a move-in/move-out
     /// row delivered with no `lsn` floors to 0 on the Electric wire and is dropped by any consumer
     /// that has seen a real one.
     pub(crate) seed_buffer_lsn: Option<String>,
@@ -280,10 +280,17 @@ pub struct PendingSubqueryShape {
     collect_log: Vec<SubquerySig>,
     /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install.
     buffer: Vec<Tup2<Row, ZWeight>>,
-    /// Commit LSN of the newest delta in `buffer` — the high-water mark of what the replay emission
-    /// reflects, stamped onto its envelopes so they clear a consumer's dedup frontier (see
-    /// [`SubqueryRegistry::emit_for_shapes`]).
-    buffer_lsn: Option<String>,
+    /// High-water commit LSN already reflected by any creation-owned emission: initial inner
+    /// replay, deferred live-inner query-backs, or the outer buffer itself. The outer buffer is
+    /// stamped with this maximum when it lands last, so the stream's consumer-visible LSN never
+    /// moves backwards.
+    replay_lsn: Option<String>,
+    /// Live inner-set effects that reached this shape while its creation replay owned the stream.
+    /// They are query-backed, in arrival order, before the shape becomes visible.
+    deferred: VecDeque<DeferredShapeWork>,
+    /// Number of deferred batches handed to the creator. A continuously-written inner table must
+    /// eventually fail this create instead of holding the engine-wide frontier permit forever.
+    deferred_batches: u8,
 }
 
 impl HeapSize for PendingSubqueryShape {
@@ -294,7 +301,27 @@ impl HeapSize for PendingSubqueryShape {
             + self.stream_path.heap_bytes()
             + self.collect_log.heap_bytes()
             + self.buffer.heap_bytes()
-            + self.buffer_lsn.heap_bytes()
+            + self.replay_lsn.heap_bytes()
+            + self.deferred.capacity() * std::mem::size_of::<DeferredShapeWork>()
+            + self.deferred.iter().map(HeapSize::heap_bytes).sum::<usize>()
+    }
+}
+
+/// A live inner-set effect whose dependent shape is still being created. Node state has already
+/// moved, so this stores the dependent query-back itself rather than attempting to replay the root
+/// flip (which may no longer produce the consumed transition on retry).
+#[derive(Debug, Clone)]
+pub(crate) enum DeferredShapeWork {
+    Value { connecting_col: usize, value: Value, txid: Option<String>, lsn: Option<String> },
+    Full { txid: Option<String>, lsn: Option<String> },
+}
+
+impl HeapSize for DeferredShapeWork {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Value { value, txid, lsn, .. } => value.heap_bytes() + txid.heap_bytes() + lsn.heap_bytes(),
+            Self::Full { txid, lsn } => txid.heap_bytes() + lsn.heap_bytes(),
+        }
     }
 }
 
@@ -306,21 +333,25 @@ impl HeapSize for PendingSubqueryShape {
 /// reach the stream **after** their transaction did. Unstamped, they floor to 0 on the Electric
 /// wire and are dropped by any consumer that has already seen a real LSN on that shape.
 ///
-/// The stamp is not a complete answer to that ordering, and cannot be: the OUTER replay is emitted
-/// inside `finish_create` under the registry lock, so it is enqueued ahead of any live delta, but
-/// these inner-node flips need Postgres query-backs and are therefore propagated after the lock is
-/// released. A change on the new shape committed in that window is emitted first, with a HIGHER
-/// LSN, and the replay's rows land below the consumer's per-shape frontier whatever they carry.
-/// The residue is narrow (a create must have buffered inner deltas, and an outer commit must land
-/// in the milliseconds before the query-back returns) and self-repairing, because emission is
-/// absolute per pk: the next change to touch those rows re-states their membership. Closing it
-/// properly means ordering the creation replay ahead of the shape's first live emission — a
-/// reserved slot in the stream's emission lane — not a different LSN.
+/// Ordering is enforced separately from the stamp: while this work runs, outer deltas remain in the
+/// pending shape's buffer and live inner propagation queues its dependent query-backs on that same
+/// pending entry. The creator drains those query-backs after this replay; only an atomic empty
+/// check + outer replay + index install makes the shape reachable by live evaluation.
 pub struct CreateReplay {
     pub work: VecDeque<(SubquerySig, Flip)>,
     /// High-water commit LSN of the replayed inner deltas (`None` = nothing was buffered).
     pub lsn: Option<String>,
 }
+
+/// One atomic step toward making a created shape live. Work is returned without changing
+/// visibility; `Installed` means the pending entry was empty, its outer buffer was replayed, and
+/// the shape was indexed under the same registry lock.
+pub(crate) enum InstallStep {
+    Deferred(VecDeque<DeferredShapeWork>),
+    Installed,
+}
+
+const MAX_CREATE_DEFERRED_BATCHES: u8 = 8;
 
 /// The later of two LSNs in Postgres `hi/lo` hex form. Not a string comparison: `"0/9"` sorts after
 /// `"0/10"` lexically and before it numerically.
@@ -718,6 +749,31 @@ impl SubqueryRegistry {
         self.edges.get(sig).cloned().unwrap_or_default()
     }
 
+    /// Whether propagation through `sig` can affect a shape other than the creation currently
+    /// being rolled back. The dependency graph is acyclic by construction, but keep a visited set
+    /// so malformed/restored topology cannot recurse forever while deciding whether lost work is
+    /// engine-global.
+    fn node_reaches_shape_other_than(&self, sig: &SubquerySig, creating_shape: &str) -> bool {
+        fn visit(
+            registry: &SubqueryRegistry,
+            sig: &SubquerySig,
+            creating_shape: &str,
+            visited: &mut HashSet<SubquerySig>,
+        ) -> bool {
+            if !visited.insert(sig.clone()) {
+                return false;
+            }
+            registry.edges.get(sig).is_some_and(|edges| {
+                edges.iter().any(|edge| match &edge.dependent {
+                    Dependent::Shape(id) => id != creating_shape,
+                    Dependent::Node(parent) => visit(registry, parent, creating_shape, visited),
+                })
+            })
+        }
+
+        visit(self, sig, creating_shape, &mut HashSet::new())
+    }
+
     /// Every edge in the registry (introspection only — hot paths use [`edges_of`]).
     pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
         self.edges.values().flatten()
@@ -830,7 +886,9 @@ impl SubqueryRegistry {
             changes_only,
             collect_log: log,
             buffer: Vec::new(),
-            buffer_lsn: None,
+            replay_lsn: None,
+            deferred: VecDeque::new(),
+            deferred_batches: 0,
         });
         Ok(BeginCreate { seeds, schemas: self.schemas.clone() })
     }
@@ -855,7 +913,7 @@ impl SubqueryRegistry {
             .position(|p| p.shape_id == shape_id)
             .context("finish_create: pending shape vanished")?;
         // Deliberately NOT removed: the shape stays pending — and its outer deltas stay buffered —
-        // until [`Self::install_visible`]. See the doc comment above.
+        // until [`Self::install_step`]. See the doc comment above.
         let pending = &self.pending_shapes[idx];
         let (outer_table, stream_path, pred, out_cols) =
             (pending.outer_table.clone(), pending.stream_path.clone(), pending.pred.clone(), pending.out_cols.clone());
@@ -902,6 +960,8 @@ impl SubqueryRegistry {
                 }
             }
         }
+        let pending_lsn = self.pending_shapes[idx].replay_lsn.take();
+        self.pending_shapes[idx].replay_lsn = max_lsn(pending_lsn, replay_lsn.clone());
         // 2. Register the shape so the replay can reach it — WITHOUT making it a candidate for live
         //    deltas, which keeps its stream ordered (see [`Self::register_shape`]).
         let feed_id = self.next_feed_id;
@@ -928,30 +988,40 @@ impl SubqueryRegistry {
         Ok(CreateReplay { work, lsn: replay_lsn })
     }
 
-    /// The tail of creation: replay the outer deltas buffered up to this instant, then make the
-    /// shape a candidate for live evaluation. Both under one lock, in that order, so the replay is
-    /// enqueued on the shape's stream ahead of anything live — which is the property the two-step
-    /// install exists for.
+    /// Advance the tail of creation. If live inner work reached the shape while its creation replay
+    /// was running, hand that work to the creator without changing visibility. Once none remains,
+    /// replay the outer deltas buffered up to this instant and make the shape a live candidate.
+    /// The empty check, outer replay, and visibility transition happen under one lock, so a live
+    /// path either queues here or runs after installation; it cannot slip between them.
     ///
     /// Called once per successful [`Self::finish_create`], after its flips have propagated.
-    pub async fn install_visible(&mut self, shape_id: &str) -> Result<()> {
+    pub(crate) async fn install_step(&mut self, shape_id: &str) -> Result<InstallStep> {
         let idx = self
             .pending_shapes
             .iter()
             .position(|p| p.shape_id == shape_id)
-            .context("install_visible: pending shape vanished")?;
+            .context("install_step: pending shape vanished")?;
+        if !self.pending_shapes[idx].deferred.is_empty() {
+            if self.pending_shapes[idx].deferred_batches >= MAX_CREATE_DEFERRED_BATCHES {
+                bail!(
+                    "subquery create did not quiesce after {MAX_CREATE_DEFERRED_BATCHES} deferred batches"
+                );
+            }
+            self.pending_shapes[idx].deferred_batches += 1;
+            return Ok(InstallStep::Deferred(std::mem::take(&mut self.pending_shapes[idx].deferred)));
+        }
         let pending = self.pending_shapes.remove(idx);
         let ts = self
             .schemas
             .get(&pending.outer_table)
             .cloned()
-            .context("install_visible: unknown outer table")?;
+            .context("install_step: unknown outer table")?;
         if !pending.buffer.is_empty() {
             // Stamp the replay with the newest commit it reflects, so these rows clear a consumer's
             // dedup frontier (see `emit_for_shapes`); an unstamped replay floors to LSN 0 and is
             // discarded by any consumer whose frontier has moved. Absolute emission, so this is
             // idempotent against the backfill for snapshot-visible rows.
-            let outer_lsn = pending.buffer_lsn.clone();
+            let outer_lsn = pending.replay_lsn.clone();
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
             self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None, outer_lsn).await?;
         }
@@ -959,7 +1029,7 @@ impl SubqueryRegistry {
             let (table, pred) = (shape.outer_table.clone(), shape.pred.clone());
             self.shape_index.insert(shape_id, &table, &pred);
         }
-        Ok(())
+        Ok(InstallStep::Installed)
     }
 
     /// Register an outer shape so it can be **emitted to**, without making it a candidate for live
@@ -968,7 +1038,7 @@ impl SubqueryRegistry {
     /// A shape with no index entry is invisible to `outer_candidates`, which for a normal shape
     /// would mean silently dropped envelopes. Here it means *buffered* ones: the create's pending
     /// entry is still in `pending_shapes`, so live outer deltas keep accumulating there until
-    /// [`Self::install_visible`] replays them and adds the index entry, under one lock.
+    /// [`Self::install_step`] replays them and adds the index entry, under one lock.
     ///
     /// That window is what keeps the shape's stream ordered. The creation replay's rows come from
     /// Postgres query-backs that cannot run under the registry lock, so they are enqueued after the
@@ -1000,12 +1070,22 @@ impl SubqueryRegistry {
         self.shape_index.candidates(table, delta)
     }
 
-    /// Abort an in-flight create (phase B failed): drop the pending entry and roll back the
-    /// registration exactly (edges, refcounts, fresh nodes with their buffers).
-    pub fn abort_create(&mut self, shape_id: &str) {
-        let Some(idx) = self.pending_shapes.iter().position(|p| p.shape_id == shape_id) else {
+    pub(crate) fn shape_stream_paths(&self) -> Vec<String> {
+        self.shapes.values().map(|shape| shape.stream_path.clone()).collect()
+    }
+
+    /// Abort a create in any phase. Before `finish_create`, unwind its compile log. Afterwards the
+    /// ordinary shape-drop path also retracts seeded circuit state and feed bookkeeping.
+    pub async fn abort_create(&mut self, shape_id: &str) {
+        let pending_idx = self.pending_shapes.iter().position(|p| p.shape_id == shape_id);
+        if self.shapes.contains_key(shape_id) {
+            if let Some(idx) = pending_idx {
+                self.pending_shapes.remove(idx);
+            }
+            self.drop_subquery_shape(shape_id).await;
             return;
-        };
+        }
+        let Some(idx) = pending_idx else { return };
         let pending = self.pending_shapes.remove(idx);
         // Shape edges live under the pred's leaf sigs — remove only there, not a global scan.
         self.remove_shape_edges(&pending.pred, &pending.shape_id);
@@ -1220,7 +1300,10 @@ impl SubqueryRegistry {
         let shape_ids: Vec<String> = if trace.is_some() {
             self.shapes
                 .iter()
-                .filter(|(_, s)| s.outer_table == table)
+                .filter(|(id, s)| {
+                    s.outer_table == table
+                        && !self.pending_shapes.iter().any(|pending| pending.shape_id == id.as_str())
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         } else {
@@ -1240,9 +1323,7 @@ impl SubqueryRegistry {
         // 2b. Pending shapes (mid-create) on this table: buffer for gated replay at install.
         for p in self.pending_shapes.iter_mut().filter(|p| p.outer_table == table) {
             p.buffer.extend(delta.iter().cloned());
-            if commit_lsn.is_some() {
-                p.buffer_lsn = commit_lsn.clone();
-            }
+            p.replay_lsn = max_lsn(p.replay_lsn.take(), commit_lsn.clone());
         }
 
         // 3. Flip propagation (the Postgres query-backs) is deferred: the caller enqueues `work`
@@ -1394,7 +1475,7 @@ impl SubqueryRegistry {
     /// `up-to-date` watermark and DISCARDS any change at or below it, and a change delivered with no
     /// `lsn` header floors to 0 — so an unstamped move-in/move-out row is silently dropped the
     /// moment that consumer's frontier has moved off zero. A creation replay is no exception: it
-    /// carries the high-water commit of what it replays (`PendingSubqueryShape::buffer_lsn` for the
+    /// carries the high-water commit of what it replays (`PendingSubqueryShape::replay_lsn` for the
     /// outer rows, [`CreateReplay::lsn`] for the inner ones). `None` only where no commit is the
     /// cause at all — a create that buffered nothing.
     async fn emit_for_shapes(
@@ -1504,9 +1585,40 @@ pub async fn propagate_flips(
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
+    let mut escaped_creation = false;
+    propagate_flips_for(registry, work, txid, lsn, trace_tx, None, &mut escaped_creation).await
+}
+
+/// Creation-owned propagation may reach exactly its own pending shape. Ordinary live propagation
+/// passes `None` and queues dependent query-backs on any shape whose creation still owns its
+/// stream.
+pub(crate) async fn propagate_flips_for(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    creating_shape: Option<&str>,
+    escaped_creation: &mut bool,
+) -> Result<()> {
     while let Some((sig, flip)) = work.pop_front() {
-        if let Err(e) =
-            propagate_one(registry, &sig, &flip, txid.clone(), lsn.clone(), trace_tx, work).await
+        if let Some(shape_id) = creating_shape
+            && !*escaped_creation
+            && registry.lock().await.node_reaches_shape_other_than(&sig, shape_id)
+        {
+            *escaped_creation = true;
+        }
+        if let Err(e) = propagate_one(
+            registry,
+            &sig,
+            &flip,
+            txid.clone(),
+            lsn.clone(),
+            trace_tx,
+            work,
+            creating_shape,
+        )
+        .await
         {
             // Back on the queue for the retry. Its already-walked edges are re-walked there: a shape
             // move re-emits absolutely (converges), and a parent already reconciled yields no second
@@ -1529,6 +1641,7 @@ async fn propagate_one(
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
+    creating_shape: Option<&str>,
 ) -> Result<()> {
     // The flipped inner-set node's dependents, plus the table its change entered through: the
     // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
@@ -1545,14 +1658,16 @@ async fn propagate_one(
         // monotone over FALSE < UNKNOWN < TRUE), so skip.
         if matches!(flip.value, Value::Null) {
             if edge.null_sensitive {
-                rederive_dependent(registry, &edge, txid.clone(), lsn.clone(), work).await?;
+                rederive_dependent(registry, &edge, txid.clone(), lsn.clone(), work, creating_shape).await?;
             }
             continue;
         }
         match &edge.dependent {
             Dependent::Shape(id) => {
                 let moved =
-                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone(), lsn.clone())
+                    move_shape_for_value(
+                        registry, id, edge.connecting_col, &flip.value, txid.clone(), lsn.clone(), creating_shape,
+                    )
                         .await?;
                 // Light the whole path only when the shape actually moved rows: source
                 // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
@@ -1612,10 +1727,23 @@ async fn move_shape_for_value(
     value: &Value,
     txid: Option<String>,
     lsn: Option<String>,
+    creating_shape: Option<&str>,
 ) -> Result<Option<(String, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url) = {
-        let reg = registry.lock().await;
+        let mut reg = registry.lock().await;
+        if creating_shape != Some(shape_id)
+            && let Some(pending) = reg.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id)
+        {
+            pending.replay_lsn = max_lsn(pending.replay_lsn.take(), lsn.clone());
+            pending.deferred.push_back(DeferredShapeWork::Value {
+                connecting_col,
+                value: value.clone(),
+                txid,
+                lsn,
+            });
+            return Ok(None);
+        }
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
         (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone())
     };
@@ -1682,19 +1810,11 @@ async fn rederive_dependent(
     txid: Option<String>,
     lsn: Option<String>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
+    creating_shape: Option<&str>,
 ) -> Result<()> {
     match &edge.dependent {
         Dependent::Shape(id) => {
-            let (ts, pg_url) = {
-                let reg = registry.lock().await;
-                let Some(s) = reg.shapes.get(id) else { return Ok(()) };
-                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
-            };
-            let rows = query_all(&pg_url, &ts).await?;
-            // Full re-derive: every row is a candidate; the ONE emission tail decides.
-            let mut reg = registry.lock().await;
-            let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-            reg.emit_for_shapes(&ts, vec![(id.clone(), candidates)], txid, lsn).await?;
+            rederive_shape(registry, id, txid, lsn, creating_shape).await?;
         }
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
@@ -1706,6 +1826,58 @@ async fn rederive_dependent(
                     work.push_back((parent_sig.clone(), f));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+async fn rederive_shape(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    txid: Option<String>,
+    lsn: Option<String>,
+    creating_shape: Option<&str>,
+) -> Result<()> {
+    let (ts, pg_url) = {
+        let mut reg = registry.lock().await;
+        if creating_shape != Some(shape_id)
+            && let Some(pending) = reg.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id)
+        {
+            pending.replay_lsn = max_lsn(pending.replay_lsn.take(), lsn.clone());
+            pending.deferred.push_back(DeferredShapeWork::Full { txid, lsn });
+            return Ok(());
+        }
+        let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
+        (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
+    };
+    let rows = query_all(&pg_url, &ts).await?;
+    let mut reg = registry.lock().await;
+    let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+    reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, lsn).await?;
+    Ok(())
+}
+
+/// Drain dependent query-backs that arrived while `shape_id`'s creation replay owned its stream.
+/// The queue is retry state: the failed item is restored at the front, just like the DAG walk.
+pub(crate) async fn propagate_deferred_shape_work(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    work: &mut VecDeque<DeferredShapeWork>,
+) -> Result<()> {
+    while let Some(item) = work.pop_front() {
+        let result = match &item {
+            DeferredShapeWork::Value { connecting_col, value, txid, lsn } => move_shape_for_value(
+                registry, shape_id, *connecting_col, value, txid.clone(), lsn.clone(), Some(shape_id),
+            )
+            .await
+            .map(|_| ()),
+            DeferredShapeWork::Full { txid, lsn } => {
+                rederive_shape(registry, shape_id, txid.clone(), lsn.clone(), Some(shape_id)).await
+            }
+        };
+        if let Err(error) = result {
+            work.push_front(item);
+            return Err(error);
         }
     }
     Ok(())
@@ -2214,12 +2386,58 @@ mod tests {
         assert_eq!(reg.nodes.len(), 1);
         assert!(reg.nodes.values().all(|n| n.seed_buffer.is_some()), "fresh node buffers");
         assert!(reg.touches("outer_t"), "pending shape routes its outer table");
-        reg.abort_create("s1");
+        reg.abort_create("s1").await;
         assert_eq!(reg.nodes.len(), 0, "aborted create left an orphaned node");
         assert_eq!(reg.edges_count(), 0, "aborted create left orphaned edges");
         assert_eq!(reg.pending_seed.len(), 0, "aborted create left a pending seed");
         assert!(reg.shapes.is_empty());
         assert!(reg.pending_shapes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn abort_after_finish_retracts_the_registered_feed_and_seeded_nodes() {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def(name, &def).unwrap()
+        };
+        let schemas = Arc::new(
+            [("outer_t".to_string(), mk("outer_t")), ("inner_t".to_string(), mk("inner_t"))]
+                .into_iter()
+                .collect(),
+        );
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.set_schemas(schemas);
+        let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        let sig = begin.seeds[0].0.clone();
+        reg.finish_create(
+            "s1",
+            vec![(sig, vec![Row(vec![Value::Int(7), Value::Int(1)])], crate::pg::SnapshotGate::passthrough())],
+            crate::pg::SnapshotGate::passthrough(),
+            1,
+            ["10".to_string()].into_iter().collect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg.shapes.len(), 1);
+        assert_eq!(reg.nodes.len(), 1);
+        assert_eq!(reg.feed_sets.total_entries(), 1);
+
+        reg.abort_create("s1").await;
+
+        assert!(reg.shapes.is_empty());
+        assert!(reg.nodes.is_empty());
+        assert!(reg.pending_shapes.is_empty());
+        assert_eq!(reg.edges_count(), 0);
+        assert_eq!(reg.feed_sets.total_entries(), 0);
+        assert!(reg.feed_by_id.is_empty());
     }
 
     /// The per-feed key set is the fix for the live-poll wake-storm bug, now structural:
@@ -2376,6 +2594,16 @@ mod tests {
     /// The operations (`"upsert"`/`"delete"`) delivered to one stream path so far, in append order.
     fn ops_for(store: &DsStore, path: &str) -> Vec<String> {
         store.0.lock().unwrap().get(path).map(|v| v.iter().map(|e| e.headers.operation.clone()).collect()).unwrap_or_default()
+    }
+
+    fn lsns_for(store: &DsStore, path: &str) -> Vec<Option<String>> {
+        store
+            .0
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|v| v.iter().map(|e| e.headers.lsn.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// `issues(id, project_id)`, matching the brief's example shape:
@@ -2675,16 +2903,18 @@ mod tests {
         frontier.commit_flushed("0/10");
         let mut work: VecDeque<(SubquerySig, Flip)> =
             [(sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
-        crate::engine::propagate_with_retry(
+        let result = crate::engine::propagate_with_retry(
             &registry,
             &mut work,
             None,
             Some("0/10".into()),
             &trace_tx,
             &frontier,
+            None,
         )
         .await;
-        drop(permit);
+        assert!(result.is_err(), "retry exhaustion must fail its caller, not only poison side state");
+        permit.complete();
 
         assert!(frontier.poisoned(), "abandoned membership effects must poison the frontier");
         assert_eq!(frontier.failures(), 1);
@@ -2692,6 +2922,93 @@ mod tests {
         // And it stays stopped: a later, perfectly healthy commit cannot un-poison it.
         frontier.commit_flushed("0/20");
         assert_eq!(frontier.published(), "0/0");
+    }
+
+    /// Retry exhaustion while creating one shape is rolled back with that shape. If propagation
+    /// never escapes the shape being created, no established stream has lost an effect and the
+    /// whole engine must remain healthy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abandoned_creation_owned_work_does_not_poison_the_frontier() {
+        let ts = issues_ts();
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+        reg.add_edge(Edge {
+            node_sig: sig.clone(),
+            dependent: Dependent::Shape("s1".into()),
+            connecting_col: 1,
+            negated: false,
+            null_sensitive: false,
+        });
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let frontier = Arc::new(crate::engine::frontier::Frontier::new());
+        let mut work = VecDeque::from([(
+            sig,
+            Flip { value: Value::Int(100), dir: FlipDir::Enter },
+        )]);
+
+        let result = crate::engine::propagate_with_retry(
+            &registry,
+            &mut work,
+            None,
+            Some("0/10".into()),
+            &trace_tx,
+            &frontier,
+            Some("s1"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!frontier.poisoned(), "shape-local creation failure is recoverable by rollback");
+        assert_eq!(frontier.failures(), 0);
+    }
+
+    /// A creation replay is no longer shape-local once its node also feeds an established shape.
+    /// Even when the creating shape's failing edge comes first, abandoning the root would drop the
+    /// later established-shape effect, so the engine must fail closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abandoned_creation_work_that_reaches_another_shape_poisons_the_frontier() {
+        let ts = issues_ts();
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "creating", &sig, 1);
+        insert_membership_shape(&mut reg, "established", &sig, 1);
+        for id in ["creating", "established"] {
+            reg.add_edge(Edge {
+                node_sig: sig.clone(),
+                dependent: Dependent::Shape(id.into()),
+                connecting_col: 1,
+                negated: false,
+                null_sensitive: false,
+            });
+        }
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let frontier = Arc::new(crate::engine::frontier::Frontier::new());
+        let mut work = VecDeque::from([(
+            sig,
+            Flip { value: Value::Int(100), dir: FlipDir::Enter },
+        )]);
+
+        let result = crate::engine::propagate_with_retry(
+            &registry,
+            &mut work,
+            None,
+            Some("0/10".into()),
+            &trace_tx,
+            &frontier,
+            Some("creating"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(frontier.poisoned(), "established-shape effects were abandoned");
+        assert_eq!(frontier.failures(), 1);
     }
 
     /// **A creation replay must say which commit it reflects.** Inner-table deltas that land while a
@@ -2766,14 +3083,16 @@ mod tests {
             changes_only: false,
             collect_log: Vec::new(),
             buffer: Vec::new(),
-            buffer_lsn: lsn.map(str::to_string),
+            replay_lsn: lsn.map(str::to_string),
+            deferred: VecDeque::new(),
+            deferred_batches: 0,
         };
         let stamp = "0/1AEB9F8";
         let stamp_bytes = stamp.to_string().heap_bytes();
         assert_eq!(
             pending(Some(stamp)).heap_bytes() - pending(None).heap_bytes(),
             stamp_bytes,
-            "PendingSubqueryShape::buffer_lsn must be accounted for"
+            "PendingSubqueryShape::replay_lsn must be accounted for"
         );
 
         let node = |lsn: Option<&str>| {
@@ -2838,8 +3157,8 @@ mod tests {
     /// consumer's per-shape dedup frontier — which only moves forward — would bury the replay behind
     /// it. Membership silently wrong until something else happens to touch those rows.
     ///
-    /// So between `finish_create` and `install_visible` the shape can be emitted TO but is not a
-    /// candidate: live outer deltas keep buffering, and `install_visible` replays them and indexes
+    /// So between `finish_create` and `install_step` the shape can be emitted TO but is not a
+    /// candidate: live outer deltas keep buffering, and `install_step` replays them and indexes
     /// the shape under one lock, in that order.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_shape_mid_create_buffers_live_deltas_instead_of_racing_its_replay() {
@@ -2881,19 +3200,58 @@ mod tests {
         // Registered, but not yet visible: a live outer delta must NOT reach the stream here — this
         // is the window in which the creation replay is still in flight.
         let delta = vec![Tup2(Row(vec![Value::Int(7), Value::Int(10)]), 1)];
-        reg.on_table_delta(&outer_ts, &delta, 0x30, Some("0/30".into()), None, None, None).await.unwrap();
+        let mut trace = Vec::new();
+        reg.on_table_delta(&outer_ts, &delta, 0x30, Some("0/30".into()), None, None, Some(&mut trace))
+            .await
+            .unwrap();
         assert!(
             reg.outer_candidates("outer_t", &delta).is_empty(),
             "a mid-create shape must not be a candidate for live evaluation"
         );
         assert!(
             ops_for(&store, "shape/s1").is_empty(),
-            "the live delta must be buffered, not emitted ahead of the creation replay"
+            "the live delta must be buffered even when tracing bypasses the candidate index"
         );
 
-        // The tail of creation: the buffered delta is replayed, and only then does the shape go live.
-        reg.install_visible("s1").await.unwrap();
-        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert"], "the buffered delta is replayed at install");
+        // A newer inner flip lands behind the creation replay and is deferred. Drive the real
+        // queueing path; the query-back itself is simulated below because this focused harness has
+        // no Postgres.
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut inner_work = VecDeque::from([(
+            begin.seeds[0].0.clone(),
+            Flip { value: Value::Int(7), dir: FlipDir::Enter },
+        )]);
+        propagate_flips(&registry, &mut inner_work, None, Some("0/40".into()), &trace_tx)
+            .await
+            .unwrap();
+        let mut reg = registry.into_inner();
+
+        let deferred_lsn = match reg.install_step("s1").await.unwrap() {
+            InstallStep::Deferred(mut work) => match work.pop_front().unwrap() {
+                DeferredShapeWork::Value { lsn, .. } | DeferredShapeWork::Full { lsn, .. } => lsn,
+            },
+            InstallStep::Installed => panic!("the newer inner effect must be drained before install"),
+        };
+        reg.emit_for_shapes(
+            &outer_ts,
+            vec![("s1".to_string(), vec![(Row(vec![Value::Int(7), Value::Int(11)]), true)])],
+            None,
+            deferred_lsn,
+        )
+        .await
+        .unwrap();
+
+        // The tail of creation: the older buffered outer row is replayed after the newer deferred
+        // effect. Its stamp must be raised to the high-water LSN the shape already reflects, or a
+        // consumer that advanced to 0/40 drops this row at 0/30.
+        assert!(matches!(reg.install_step("s1").await.unwrap(), InstallStep::Installed));
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert", "upsert"]);
+        assert_eq!(
+            lsns_for(&store, "shape/s1"),
+            vec![Some("0/40".into()), Some("0/40".into())],
+            "creation emissions must never move the stream's consumer-visible LSN backwards"
+        );
         assert_eq!(
             reg.outer_candidates("outer_t", &delta),
             vec!["s1".to_string()],
@@ -2901,8 +3259,102 @@ mod tests {
         );
 
         // A change after install flows live, in stream order behind the replay.
-        let after = vec![Tup2(Row(vec![Value::Int(7), Value::Int(11)]), 1)];
-        reg.on_table_delta(&outer_ts, &after, 0x40, Some("0/40".into()), None, None, None).await.unwrap();
-        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert", "upsert"]);
+        let after = vec![Tup2(Row(vec![Value::Int(7), Value::Int(12)]), 1)];
+        reg.on_table_delta(&outer_ts, &after, 0x50, Some("0/50".into()), None, None, None).await.unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert", "upsert", "upsert"]);
+    }
+
+    /// A hot inner table must not keep one create — and therefore the global fan-out permit it
+    /// owns — alive forever. After eight deferred batches the create fails and its guard rolls the
+    /// shape back; the client can retry from a fresh snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_step_bounds_continuously_arriving_deferred_work() {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def(name, &def).unwrap()
+        };
+        let (inner_ts, outer_ts) = (mk("inner_t"), mk("outer_t"));
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.set_schemas(Arc::new(
+            [("outer_t".to_string(), outer_ts), ("inner_t".to_string(), inner_ts)]
+                .into_iter()
+                .collect(),
+        ));
+        let pred: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &pred, None, false).unwrap();
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+
+        for round in 1..=8 {
+            reg.pending_shapes[0]
+                .deferred
+                .push_back(DeferredShapeWork::Full { txid: None, lsn: Some(format!("0/{round:X}")) });
+            assert!(
+                matches!(reg.install_step("s1").await.unwrap(), InstallStep::Deferred(_)),
+                "round {round} is inside the bounded drain allowance"
+            );
+        }
+        reg.pending_shapes[0]
+            .deferred
+            .push_back(DeferredShapeWork::Full { txid: None, lsn: Some("0/9".into()) });
+        let error = match reg.install_step("s1").await {
+            Err(error) => error,
+            Ok(_) => panic!("the ninth continuously refilled batch must stop creation"),
+        };
+        assert!(format!("{error:#}").contains("did not quiesce after 8 deferred batches"));
+    }
+
+    /// A registered-but-not-visible shape must also be isolated from INNER-table propagation.
+    /// Otherwise a live flip can enqueue a higher-LSN row while creation replay still owns the
+    /// stream, permanently burying that replay at the consumer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shape_mid_create_defers_live_inner_flips_until_its_replay_has_landed() {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def(name, &def).unwrap()
+        };
+        let (inner_ts, outer_ts) = (mk("inner_t"), mk("outer_t"));
+        let schemas = Arc::new(
+            [("outer_t".to_string(), outer_ts), ("inner_t".to_string(), inner_ts)]
+                .into_iter()
+                .collect(),
+        );
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.set_schemas(schemas);
+        let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        let sig = begin.seeds[0].0.clone();
+        let seeds = vec![(sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough())];
+        reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut work = VecDeque::from([(sig, Flip { value: Value::Int(7), dir: FlipDir::Enter })]);
+        propagate_flips(&registry, &mut work, None, Some("0/30".into()), &trace_tx)
+            .await
+            .expect("live inner work is deferred without querying while creation replay owns the shape");
+        assert!(work.is_empty());
     }
 }

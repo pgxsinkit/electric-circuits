@@ -54,8 +54,8 @@ impl EmissionLanes {
                     // shape's subscribers. 404 (shape dropped mid-flight) discards, correctly.
                     ds.append_reliable(&b.stream_path, &b.envs).await;
                     // The append landed: this batch's effects are on the stream, so the commit
-                    // waiting on the barrier may now be published (the permit drops here).
-                    drop(b.permit);
+                    // waiting on the barrier may now be published.
+                    b.permit.complete();
                 }
             });
             lanes.push(tx);

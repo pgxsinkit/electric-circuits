@@ -121,10 +121,21 @@ async fn a_cancelled_subquery_create_gives_back_its_barrier_and_its_registration
 
     // The rollback is detached (it needs the registry lock, which `drop` cannot await).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !engine.subquery_stats().await.is_empty() {
-        assert!(std::time::Instant::now() < deadline, "a cancelled create left its nodes registered");
+    while !engine.subquery_stats().await.is_empty()
+        || engine.get_shape("s1").await.is_some()
+        || engine.pending_flips() != 0
+    {
+        assert!(std::time::Instant::now() < deadline, "a cancelled create did not finish rolling back");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        engine.get_shape("s1").await.is_none(),
+        "a cancelled create must remove the outer shape record as well as its subquery nodes"
+    );
+    assert!(
+        engine.graph().await.shapes.is_empty(),
+        "a cancelled create must not remain visible through graph/introspection state"
+    );
     assert_eq!(
         engine.pending_flips(),
         0,

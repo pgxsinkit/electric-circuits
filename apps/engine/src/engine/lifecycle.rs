@@ -18,6 +18,9 @@ impl Engine {
         changes_only: bool,
         share: bool,
     ) -> Result<ShapeRecord> {
+        if self.frontier_poisoned() {
+            bail!("degraded: subquery membership effects were lost; restart required");
+        }
         // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
         // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
         let created_at = std::time::Instant::now();
@@ -113,6 +116,7 @@ impl Engine {
             // shared pool) → finish (brief lock: install seeds, gated replay of buffered
             // deltas, register the shape). Replay flips propagate through the worker pool.
             drop(st);
+            let mut creating = SubqueryCreateGuard::new(self.clone(), id.clone(), stream_path.clone());
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
                 self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only)
@@ -121,6 +125,7 @@ impl Engine {
             .await;
             match res {
                 Ok(()) => {
+                    creating.complete();
                     let _ = ready_tx.send(Some(true));
                     trace_lifecycle(
                         &self.trace_tx,
@@ -130,18 +135,8 @@ impl Engine {
                     return Ok(rec);
                 }
                 Err(e) => {
-                    // Registration failed (the registry rolled its own state back). Remove the shape
-                    // record + share entries so later identical creates don't join a dead stream, and
-                    // wake any joiners with the failure.
-                    let mut st = self.state.lock().await;
-                    st.shapes.remove(&id);
-                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    if let Some(share) = st.feed_shares.remove(&id) {
-                        st.feed_by_sig.remove(&share.sig);
-                    }
-                    drop(st);
                     let _ = ready_tx.send(Some(false));
-                    let _ = self.ds.delete_stream(&stream_path).await;
+                    creating.rollback().await;
                     return Err(e);
                 }
             }
@@ -245,6 +240,9 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
     ) -> Result<ShapeRecord> {
+        if self.frontier_poisoned() {
+            bail!("degraded: subquery membership effects were lost; restart required");
+        }
         let mut st = self.state.lock().await;
         let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
         if where_.as_ref().is_some_and(predicate_has_subquery) {
@@ -901,24 +899,6 @@ impl Engine {
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
     ) -> Result<()> {
-        // From registration to phase C, deltas that land are BUFFERED (outer rows on the pending
-        // shape, inner rows on each fresh node) and only replayed at install — so their effects are
-        // not on the streams yet. Hold the fan-out barrier across the whole window, taken BEFORE
-        // the first delta can be buffered: without it the sequencer, seeing no flip work for those
-        // commits, would publish a frontier past changes whose membership consequences are still
-        // sitting in a buffer. The cost is conservative lag — a create's Postgres seeding stalls
-        // the watermark (not delivery) for its duration.
-        //
-        // A guard, not manual pairing: this future is awaited straight from the HTTP handler, so a
-        // client that disconnects mid-create DROPS it, and cleanup that only ran on the enumerated
-        // returns would freeze the watermark for every consumer, permanently — and leave a pending
-        // shape buffering deltas for a create nobody is finishing.
-        let mut creating = CreateGuard {
-            engine: self.clone(),
-            shape_id: id.to_string(),
-            permit: crate::engine::frontier::Permit::take(&self.frontier),
-            armed: true,
-        };
         // Phase A (brief lock), with conflict retry.
         let begin = {
             let mut attempt = 0u32;
@@ -932,11 +912,7 @@ impl Engine {
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
-                    Err(e) => {
-                        // Nothing was registered, so there is nothing to roll back.
-                        creating.disarm();
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
         };
@@ -999,6 +975,9 @@ impl Engine {
         // Phase C (brief lock): register + seed the feed, or exact rollback on a phase-B failure.
         match phase_b {
             Ok((node_seeds, outer_gate, seeded, seeded_pks)) => {
+                if self.frontier_poisoned() {
+                    bail!("degraded during subquery creation; rolling the shape back");
+                }
                 let replay = self
                     .subqueries
                     .lock()
@@ -1020,50 +999,70 @@ impl Engine {
                         replay.lsn,
                         &self.trace_tx,
                         &self.frontier,
+                        Some(id),
                     )
-                    .await;
+                    .await?;
                 }
-                // Phase C₃ (brief lock): replay the outer deltas buffered throughout, then make the
-                // shape a live candidate — one lock, in that order, so nothing live can be enqueued
-                // on its stream ahead of its own creation replay.
-                self.subqueries.lock().await.install_visible(id).await?;
-                creating.disarm();
+                // Drain live inner effects that arrived behind the creation replay. The final empty
+                // check, outer replay, and visibility transition are one registry-lock operation.
+                loop {
+                    if self.frontier_poisoned() {
+                        bail!("degraded during subquery creation; rolling the shape back");
+                    }
+                    match self.subqueries.lock().await.install_step(id).await? {
+                        crate::subquery::InstallStep::Deferred(mut work) => {
+                            propagate_deferred_with_retry(&self.subqueries, id, &mut work).await?;
+                        }
+                        crate::subquery::InstallStep::Installed => break,
+                    }
+                }
                 Ok(())
             }
-            Err(e) => {
-                self.subqueries.lock().await.abort_create(id);
-                creating.disarm();
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 }
 
-/// Everything a subquery create must give back if it does not reach its own end.
+/// Everything a subquery create must give back if it does not reach its own end. It starts before
+/// the first storage/registry await and owns both the outer engine transaction and registry work.
 ///
 /// The create's future is awaited straight from the HTTP handler, so a client that disconnects
 /// takes it away mid-flight — during the conflict sleep, a Postgres round-trip, a stream append, or
-/// phase C. Two things outlive that drop unless something reclaims them: the fan-out barrier permit
-/// (the watermark stops for every consumer of the engine, forever) and the registry's pending shape,
-/// whose fresh nodes go on buffering every inner-table delta for a create that will never install.
-/// `Drop` reclaims both; the create disarms it once it has settled its own outcome.
-struct CreateGuard {
+/// phase C. The guard's detached rollback removes the shape/share/lifecycle/catalog state, stream,
+/// pending registry entry, edges, feeds, and seeded circuit state. It transfers the frontier permit
+/// to that rollback, completing it only after cleanup settles; if the cleanup task itself dies, the
+/// permit's fail-closed drop poisons the frontier.
+struct SubqueryCreateGuard {
     engine: Engine,
     shape_id: String,
-    /// Dropped with the guard — see [`crate::engine::frontier::Permit`].
-    #[allow(dead_code)]
-    permit: crate::engine::frontier::Permit,
+    stream_path: String,
+    permit: Option<crate::engine::frontier::Permit>,
     armed: bool,
 }
 
-impl CreateGuard {
-    /// The create settled its own outcome (installed, or rolled back).
-    fn disarm(&mut self) {
+impl SubqueryCreateGuard {
+    fn new(engine: Engine, shape_id: String, stream_path: String) -> Self {
+        let permit = Some(crate::engine::frontier::Permit::take(&engine.frontier));
+        Self { engine, shape_id, stream_path, permit, armed: true }
+    }
+
+    fn complete(&mut self) {
         self.armed = false;
+        if let Some(permit) = self.permit.take() {
+            permit.complete();
+        }
+    }
+
+    async fn rollback(&mut self) {
+        self.engine.rollback_subquery_create(&self.shape_id, &self.stream_path).await;
+        self.armed = false;
+        if let Some(permit) = self.permit.take() {
+            permit.complete();
+        }
     }
 }
 
-impl Drop for CreateGuard {
+impl Drop for SubqueryCreateGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -1071,7 +1070,168 @@ impl Drop for CreateGuard {
         // Cancelled. The rollback needs the registry lock, which `drop` cannot await, so it runs as
         // a detached task — the same shape as the reactivation path, and for the same reason.
         tracing::warn!("subquery create for '{}' was cancelled; rolling back", self.shape_id);
-        let (engine, shape_id) = (self.engine.clone(), self.shape_id.clone());
-        tokio::spawn(async move { engine.subqueries.lock().await.abort_create(&shape_id) });
+        let (engine, shape_id, stream_path, permit) = (
+            self.engine.clone(),
+            self.shape_id.clone(),
+            self.stream_path.clone(),
+            self.permit.take(),
+        );
+        tokio::spawn(async move {
+            engine.rollback_subquery_create(&shape_id, &stream_path).await;
+            if let Some(permit) = permit {
+                permit.complete();
+            }
+        });
+    }
+}
+
+impl Engine {
+    async fn rollback_subquery_create(&self, id: &str, stream_path: &str) {
+        self.subqueries.lock().await.abort_create(id).await;
+        let mut st = self.state.lock().await;
+        let existed = st.shapes.remove(id).is_some();
+        if let Some(share) = st.feed_shares.remove(id) {
+            st.feed_by_sig.remove(&share.sig);
+        }
+        drop(st);
+        self.lives.lock().unwrap().remove(id);
+        if existed {
+            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+        }
+        let _ = self.ds.delete_stream(stream_path).await;
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use axum::Router;
+    use axum::extract::{Request, State};
+    use axum::http::{Method, StatusCode};
+    use axum::response::{IntoResponse, Response};
+
+    #[derive(Clone, Default)]
+    struct DsDeletes(Arc<std::sync::Mutex<Vec<String>>>);
+
+    async fn ds_handler(State(deletes): State<DsDeletes>, request: Request) -> Response {
+        match *request.method() {
+            Method::DELETE => {
+                deletes.0.lock().unwrap().push(request.uri().path().to_string());
+                StatusCode::OK.into_response()
+            }
+            Method::PUT | Method::POST => StatusCode::OK.into_response(),
+            Method::GET => {
+                ([
+                    ("stream-next-offset", "tip"),
+                    ("stream-up-to-date", "1"),
+                ], "[]")
+                    .into_response()
+            }
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    async fn fake_ds() -> (String, DsDeletes) {
+        let deletes = DsDeletes::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().fallback(ds_handler).with_state(deletes.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), deletes)
+    }
+
+    /// Cancellation after `finish_create` has both outer Engine state and registered registry/feed
+    /// state to unwind. Dropping the real create guard at that point must remove both atomically and
+    /// complete — not poison — its frontier permit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_in_phase_c_rolls_back_outer_and_registry_state() {
+        let (ds_url, deletes) = fake_ds().await;
+        let engine = Engine::new(DsClient::new(&ds_url));
+        let schema: crate::schema::Schema = serde_json::from_value(serde_json::json!({
+            "tables": {
+                "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },
+                "inner_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" }
+            }
+        }))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let predicate: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "gid", "in": { "table": "inner_t", "project": "gid" }
+        }))
+        .unwrap();
+        let id = "s1";
+        let stream_path = "shape/s1";
+        engine.ds.ensure_stream(stream_path).await.unwrap();
+
+        let record = ShapeRecord {
+            id: id.into(),
+            table: "outer_t".into(),
+            stream_path: stream_path.into(),
+            changes_only: false,
+            where_json: Some(predicate.clone()),
+            columns: None,
+            family_key: None,
+            is_subquery: true,
+            aggregate: None,
+        };
+        {
+            let mut state = engine.state.lock().await;
+            state.shapes.insert(id.into(), record);
+            let signature = "phase-c-share".to_string();
+            let (_ready_tx, ready) = tokio::sync::watch::channel(None);
+            state.feed_by_sig.insert(signature.clone(), id.into());
+            state.feed_shares.insert(
+                id.into(),
+                FeedShare { sig: signature, refcount: 1, ready },
+            );
+        }
+        engine.lives.lock().unwrap().insert(id.into(), ShapeLife::active());
+        let guard = SubqueryCreateGuard::new(engine.clone(), id.into(), stream_path.into());
+
+        let begin = engine
+            .subqueries
+            .lock()
+            .await
+            .begin_create(id, "outer_t", stream_path, &predicate, None, false)
+            .unwrap();
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        engine
+            .subqueries
+            .lock()
+            .await
+            .finish_create(
+                id,
+                seeds,
+                crate::pg::SnapshotGate::passthrough(),
+                0,
+                HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert!(engine.get_shape(id).await.is_some());
+        assert!(!engine.subquery_stats().await.is_empty());
+
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.get_shape(id).await.is_some()
+            || !engine.subquery_stats().await.is_empty()
+            || engine.pending_flips() != 0
+        {
+            assert!(std::time::Instant::now() < deadline, "phase-C rollback did not settle");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(engine.graph().await.shapes.is_empty());
+        assert_eq!(engine.flip_failures(), 0, "successful cancellation rollback is not lost work");
+        assert!(
+            deletes.0.lock().unwrap().iter().any(|path| path == "/shape/s1"),
+            "the phase-C stream must be deleted with its engine and registry state"
+        );
     }
 }
