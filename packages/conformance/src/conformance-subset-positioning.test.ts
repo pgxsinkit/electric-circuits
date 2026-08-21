@@ -57,6 +57,32 @@ async function readFeed(streamUrl: string): Promise<StreamEnvelope[]> {
 }
 
 describe('subset LSN positioning (end-to-end)', () => {
+  it('paginates through NULL sort keys using the public native subset API', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, NULL), (2, 10), (3, 20)')
+    await drainEngine(h)
+
+    // PostgreSQL's native ascending order puts NULL last. The first public page therefore contains
+    // id=2, while later pages must still reach id=3 and the NULL-keyed id=1.
+    const sub = await h.client.subset({ table: 'items', orderBy: { col: 'n' }, limit: 1 })
+    try {
+      expect((sub.collection.toArray as unknown as Row[]).map((r) => r.id)).toEqual([2])
+      expect(await sub.loadMore()).toBe(1)
+      expect(await sub.loadMore()).toBe(1)
+
+      const got = (sub.collection.toArray as unknown as Row[])
+        .map((r) => ({ id: r.id, n: r.n }))
+        .sort((a, b) => Number(a.id) - Number(b.id))
+      expect(got).toEqual([
+        { id: 1, n: null },
+        { id: 2, n: 10 },
+        { id: 3, n: 20 },
+      ])
+      expect(sub.hasMore()).toBe(false)
+    } finally {
+      await sub.close()
+    }
+  })
+
   it('drops the overlap-window delta already in the page — exactly-once, no double-count', async () => {
     // 1. Seed the table and let the engine ingest it.
     await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 30)')
