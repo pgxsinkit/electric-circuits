@@ -1,6 +1,11 @@
 # Pinned: rustc stable 1.97.0 ICEs (rustc_next_trait_solver panic in
 # structural_traits.rs) while compiling dbsp 0.318.0 (edition 2024, backend-mode).
 # Re-checked 2026-08-21: 1.97.1 and 1.98.0 still ICE at the same site.
+# Re-checked 2026-09-05: 1.98.1 (2026-09-01) still ICEs; 1.99.0-beta.3 (2026-08-28)
+# and nightly 1.100.0-nightly (2026-09-04) both check dbsp clean, so the fix ships in
+# stable 1.99 — unpin then (full build + test, and re-run `cargo fmt --check`:
+# rustfmt changes across releases). A dbsp bump is NOT an escape hatch: 0.344.0
+# ICEs on 1.98.1 at the same site (tried 2026-09-05) — the bug is purely rustc's.
 # 1.96.0 is the last known-good stable. Do NOT float back to "stable" until the
 # upstream ICE is fixed. See PR #24.
 #
