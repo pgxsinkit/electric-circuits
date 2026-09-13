@@ -4,6 +4,7 @@
 //! arrive via logical replication (see `replication.rs`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -281,9 +282,8 @@ pub fn pool_for(url: &str) -> Pool {
 }
 
 /// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
-/// Backfills/query-backs are self-contained `BEGIN … COMMIT` units with no session state, so
-/// checkin only has to clear a possibly-aborted transaction (`ROLLBACK`, a no-op warning on a
-/// clean session) before the connection is reusable.
+/// Backfills/query-backs mark their explicit transaction bracket, so check-in only rolls back a
+/// checkout that may actually have left a transaction open or aborted.
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<PoolInner>,
@@ -316,21 +316,41 @@ impl Pool {
             Some(c) => c,
             None => connect(&self.inner.url).await?,
         };
-        Ok(PooledClient { client: Some(client), inner: self.inner.clone(), permit: Some(permit) })
+        Ok(PooledClient {
+            client: Some(client),
+            inner: self.inner.clone(),
+            permit: Some(permit),
+            transaction_open: AtomicBool::new(false),
+        })
     }
 }
 
 /// A pooled connection checkout. Derefs to `tokio_postgres::Client`.
+///
+/// Explicit transactions on a checkout must use the transaction-tracked helpers in this module.
+/// Issuing a raw `BEGIN` through [`std::ops::Deref`] bypasses [`PooledClient::transaction_started`]
+/// and can return an open or aborted transaction to the idle pool.
 pub struct PooledClient {
     client: Option<Client>,
     inner: Arc<PoolInner>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    transaction_open: AtomicBool,
 }
 
 impl std::ops::Deref for PooledClient {
     type Target = Client;
     fn deref(&self) -> &Client {
         self.client.as_ref().expect("client present until drop")
+    }
+}
+
+impl PooledClient {
+    fn transaction_started(&self) {
+        self.transaction_open.store(true, Ordering::SeqCst);
+    }
+
+    fn transaction_finished(&self) {
+        self.transaction_open.store(false, Ordering::SeqCst);
     }
 }
 
@@ -341,10 +361,16 @@ impl Drop for PooledClient {
         if client.is_closed() {
             return; // permit drops here, freeing the slot
         }
+        if !self.transaction_open.load(Ordering::SeqCst) {
+            self.inner.idle.lock().unwrap().push(client);
+            return;
+        }
         let inner = self.inner.clone();
-        // Clear any transaction the caller left open/aborted, then check the connection back in.
-        // The permit is held until the connection is actually idle again, so live connections
-        // never exceed the pool size.
+        // A cancelled or failed explicit transaction may be open or aborted. Clean it before reuse;
+        // clean read-only checkouts skip this path, avoiding both a round trip and PostgreSQL's
+        // `there is no transaction in progress` warning. A failed BEGIN or a COMMIT whose response
+        // was lost can conservatively reach this path after PostgreSQL already ended the transaction,
+        // so a rare warning is preferable to reusing a connection whose state is uncertain.
         tokio::spawn(async move {
             if client.batch_execute("ROLLBACK").await.is_ok() {
                 inner.idle.lock().unwrap().push(client);
@@ -564,20 +590,23 @@ pub async fn ensure_replica_identity_full(client: &Client, table: &TableRef) -> 
 /// `lock_timeout` the statement gives up instead, the caller marks the table unresolved, and its
 /// retry task tries again later while ingest keeps flowing.
 pub async fn ensure_replica_identity_full_bounded(
-    client: &Client,
+    client: &PooledClient,
     table: &TableRef,
     lock_timeout: std::time::Duration,
 ) -> Result<()> {
-    // `SET LOCAL` needs a transaction to be local to; a failed statement leaves it aborted, which
-    // `PooledClient::drop` clears with its `ROLLBACK` before the connection is reused.
-    client
+    client.transaction_started();
+    let result = client
         .batch_execute(&format!(
             "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
             lock_timeout.as_millis().max(1),
             table.quote_qualified()
         ))
         .await
-        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"))
+        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"));
+    if result.is_ok() {
+        client.transaction_finished();
+    }
+    result
 }
 
 /// The only output plugin the engine speaks (`replication.rs` decodes pgoutput frames).
@@ -935,7 +964,7 @@ pub fn chunk_is_full(chunk_rows: usize, chunk_bytes: u64, row_bytes: u64, budget
 /// gated activation), so appending the snapshot chunk by chunk needs no protocol change: the shape
 /// is not live until `ActivateShape` lands either way.
 pub struct BackfillReader<'a> {
-    client: &'a Client,
+    client: &'a PooledClient,
     ts: &'a TableSchema,
     /// `None` once the cursor is exhausted.
     stream: Option<std::pin::Pin<Box<tokio_postgres::RowStream>>>,
@@ -1033,7 +1062,9 @@ impl<'a> BackfillReader<'a> {
         // Drop the cursor before COMMIT: tokio-postgres discards whatever is left of an abandoned
         // portal, and the transaction is READ ONLY, so nothing is lost either way.
         self.stream = None;
-        self.client.batch_execute("COMMIT").await.ok();
+        if self.client.batch_execute("COMMIT").await.is_ok() {
+            self.client.transaction_finished();
+        }
         self.fences
     }
 }
@@ -1043,7 +1074,7 @@ impl<'a> BackfillReader<'a> {
 /// Text literals are bound parameters; numeric/bool/null are inlined (see [`crate::sql`]). The
 /// engine still applies `matches()` afterwards, so the SQL only has to be a sound superset filter.
 pub async fn backfill_reader<'a>(
-    client: &'a Client,
+    client: &'a PooledClient,
     ts: &'a TableSchema,
     filter: Option<&CompiledPredicate>,
 ) -> Result<BackfillReader<'a>> {
@@ -1058,24 +1089,25 @@ pub async fn backfill_reader<'a>(
 /// The `REPEATABLE READ READ ONLY` bracket and the fence capture are byte-for-byte what the
 /// materialising version did; only the row transport changed (`query` → `query_raw`).
 pub async fn backfill_where_reader<'a>(
-    client: &'a Client,
+    client: &'a PooledClient,
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
 ) -> Result<BackfillReader<'a>> {
+    client.transaction_started();
     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin backfill snapshot")?;
     match backfill_open_in_txn(client, ts, where_sql).await {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            // Leave no transaction open on the pooled connection (its check-in ROLLBACKs anyway,
-            // but a failed open must not depend on that).
-            client.batch_execute("ROLLBACK").await.ok();
-            Err(e)
+        Ok(reader) => Ok(reader),
+        Err(error) => {
+            if client.batch_execute("ROLLBACK").await.is_ok() {
+                client.transaction_finished();
+            }
+            Err(error)
         }
     }
 }
 
 async fn backfill_open_in_txn<'a>(
-    client: &'a Client,
+    client: &'a PooledClient,
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
 ) -> Result<BackfillReader<'a>> {
@@ -1123,16 +1155,19 @@ async fn backfill_open_in_txn<'a>(
 /// columns populated (the counts pipeline projects exactly those positions); text-mapped
 /// columns are cast `::text` for live-path byte identity.
 pub async fn backfill_group_counts(
-    client: &Client,
+    client: &PooledClient,
     ts: &TableSchema,
     group_cols: &[usize],
 ) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
+    client.transaction_started();
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .context("begin counts seed snapshot")?;
     let result = group_counts_in_txn(client, ts, group_cols).await;
-    client.batch_execute("COMMIT").await.ok();
+    if client.batch_execute("COMMIT").await.is_ok() {
+        client.transaction_finished();
+    }
     result
 }
 
@@ -1212,7 +1247,7 @@ pub struct SubsetQuery {
 /// subset/pagination view uses (the live tail is followed separately). `order` is `(column index,
 /// descending?)`; the pk is appended as a tiebreaker so the window is total/stable.
 pub async fn query_subset(
-    client: &Client,
+    client: &PooledClient,
     ts: &TableSchema,
     filter: Option<&CompiledPredicate>,
     order: Option<(usize, bool)>,
@@ -1226,16 +1261,19 @@ pub async fn query_subset(
 /// contains an `IN (SELECT …)` subquery (the JSON SQL emitter builds it; Postgres evaluates it natively,
 /// so paginated subquery lists work without engine-side subquery state).
 pub async fn query_subset_where(
-    client: &Client,
+    client: &PooledClient,
     ts: &TableSchema,
     where_sql: Option<(String, Vec<String>)>,
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
+    client.transaction_started();
     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin subset snapshot")?;
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
-    client.batch_execute("COMMIT").await.ok();
+    if client.batch_execute("COMMIT").await.is_ok() {
+        client.transaction_finished();
+    }
     result
 }
 

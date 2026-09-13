@@ -1001,7 +1001,7 @@ impl Engine {
         // every boot; the seed's SnapshotGate fences change-log replay exactly like a shape
         // backfill.
         let url = self.pg_url.clone().context("counts pipelines need a pg_url to seed")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = crate::pg::pool_for(&url).get().await?;
         let mut gates = HashMap::new();
         for spec in &counts {
             let ts = schemas.get(&spec.table).expect("resolved above");
