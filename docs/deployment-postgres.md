@@ -123,17 +123,21 @@ kind: Deployment
 metadata:
   name: electric-circuits-engine
 spec:
-  # ONE replica. The engine binds a logical replication slot, and Postgres allows exactly one
-  # walsender per slot — a second pod does not share the work, it waits. It is not a cold standby
-  # either: it holds no state until it gets the slot. During a rolling update the new pod boots,
-  # finds the slot `busy` (its predecessor's walsender is still attached), and parks in its
-  # reconnect backoff answering `GET /ready` with 503 until the old pod's slot is released; then it
-  # restores the durable catalog and takes over. Give each engine its OWN slot
+  # ONE replica, and `Recreate` — never a rolling update. The engine binds a logical replication
+  # slot and Postgres allows exactly one walsender per slot, but a second engine does NOT wait on
+  # it: a busy slot is "wait for it", not an epoch break (ADR-0004), so the new pod restores the
+  # durable catalog, spawns its ingestor and answers `GET /ready` 200 straight away — only the
+  # ingestor's connect backs off until the slot is free. Two ready pods over one catalog both
+  # accept creates and both mint shape ids from the same restored counter, so the overlap a
+  # rolling update creates is two live writers colliding on the same `shape/sN`. `Recreate` stops
+  # the old pod before the new one starts. The cost is bounded: after a crash the dead walsender
+  # lingers for up to `wal_sender_timeout` (60 s by default), during which the new pod serves
+  # the restored catalog and its ingestor waits. Give each engine its OWN slot
   # (`ELECTRIC_CIRCUITS_PG_SLOT`) if you genuinely want more than one — they are independent
   # engines, not replicas of each other.
   replicas: 1
   strategy:
-    type: Recreate # or RollingUpdate with maxSurge: 1 — the new pod waits on `busy` either way
+    type: Recreate # required — a surge pod is a second live writer on the same catalog
   selector:
     matchLabels: { app: electric-circuits-engine }
   template:
