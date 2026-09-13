@@ -12,7 +12,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { DurableStreamTestServer, type TestServerOptions } from '@electric-circuits/ds-rust'
 import { type ApiServer, createApiServer } from '@electric-circuits/api'
 import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-circuits/client'
 import { createPgOracle, createPgTables, type Oracle } from '@electric-circuits/oracle'
@@ -191,10 +191,17 @@ export interface Harness {
    * `SIGTERM`, say) rather than killing it.
    */
   startEngine(): Promise<void>
+  /**
+   * Test-only Durable Streams crash/restart seam. The wrapper retains the same binary, endpoint,
+   * and data directory; callers never receive its process or storage internals.
+   */
+  crashAndRestartDurableStreams(): Promise<void>
   shutdown(): Promise<void>
 }
 
 export interface BootOptions {
+  /** Test-only durable-streams persistence mode. Recovery tests use explicit WAL on every host. */
+  durableStreamsDurability?: TestServerOptions['durability']
   /** TEST-ONLY: inject an engine fault (e.g. 'drop_deletes', 'off_by_one_cmp') for negative controls. */
   fault?: string
   /** TEST-ONLY: raw DDL run (before the engine starts) INSTEAD of createPgTables — for exercising real
@@ -308,7 +315,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     await opts.beforeEngine?.({ pgUrl, slot })
 
     // 2. Boot durable-streams + the engine (Postgres mode) + API + client + oracle.
-    server = new DurableStreamTestServer({ port: 0 })
+    server = new DurableStreamTestServer({ port: 0, durability: opts.durableStreamsDurability })
     const dsUrl = await server.start()
     engineDs = await opts.wrapEngineDs?.(dsUrl)
     const engineDsUrl = engineDs?.url ?? dsUrl
@@ -342,12 +349,16 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
         h.engineUrl = spawned.url
       },
       restartEngine: async (whileDown?: () => Promise<void>) => {
-        proc?.kill('SIGKILL')
-        await new Promise((r) => proc?.once('exit', r))
+        spawned.raw.signal('SIGKILL')
+        await spawned.raw.waitForExit()
         await whileDown?.()
         await h.startEngine()
         // NOTE: the API server keeps pointing at the dead engine; restart tests exercise the
         // engine + streams directly (the catalog restore is engine state, not API state).
+      },
+      crashAndRestartDurableStreams: async () => {
+        if (!server) throw new Error('durable-streams server was not started')
+        await server.crashAndRestart()
       },
       shutdown: teardown,
     }

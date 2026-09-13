@@ -35,6 +35,11 @@ export interface TestServerOptions {
   dataDir?: string
   /** `live=long-poll` block time in ms (server default 30000). */
   longPollTimeout?: number
+  /**
+   * Storage durability passed explicitly to the pinned server. `wal` is supported on every host
+   * used by this suite; `memory` is retained for the Linux-only ephemeral compatibility mode.
+   */
+  durability?: 'wal' | 'memory'
 }
 
 function cargoBin(): string {
@@ -108,6 +113,12 @@ export class DurableStreamTestServer {
   private proc: ChildProcess | undefined
   private tempDir: string | undefined
   private url_: string | undefined
+  // These are fixed after the first successful start so crash/restart cannot accidentally point
+  // at a new store. In particular, `port: 0` is resolved once by the wrapper, not by the server.
+  private bin: string | undefined
+  private host: string | undefined
+  private port: number | undefined
+  private dataDir: string | undefined
 
   constructor(opts: TestServerOptions = {}) {
     this.opts = opts
@@ -122,30 +133,34 @@ export class DurableStreamTestServer {
     return this.proc?.pid
   }
 
+  /** Read-only test-fixture seam for lifecycle assertions; never use this as a production storage API. */
+  get testStoragePath(): string | undefined {
+    return this.dataDir
+  }
+
   /** Spawn the server and resolve with its base URL once it reports listening. */
   async start(): Promise<string> {
     if (this.proc) throw new Error('already started')
-    const bin = ensureServerBinary()
-    const host = this.opts.host ?? '127.0.0.1'
-    let dataDir = this.opts.dataDir
-    const ephemeral = dataDir === undefined
-    if (dataDir === undefined) {
-      dataDir = mkdtempSync(join(tmpdir(), 'ds-rust-'))
-      this.tempDir = dataDir
+    this.bin ??= ensureServerBinary()
+    this.host ??= this.opts.host ?? '127.0.0.1'
+    if (!this.dataDir) {
+      this.dataDir = this.opts.dataDir
+      if (this.dataDir === undefined) {
+        this.dataDir = mkdtempSync(join(tmpdir(), 'ds-rust-'))
+        this.tempDir = this.dataDir
+      }
     }
+
+    // A restart must use the precise resolved endpoint, not a freshly selected port. First boot
+    // retains the small bind-race retry that `port: 0` historically provided.
+    if (this.port !== undefined) return this.startAt(this.port)
     // Bind-conflict retry: freePort()'s reservation is released before the spawn, so another
     // process can steal it; the binary exits immediately on a failed bind and we re-roll.
     let lastErr: unknown
     for (let attempt = 0; attempt < 5; attempt++) {
-      const port = this.opts.port && this.opts.port !== 0 ? this.opts.port : await freePort(host)
-      const args = ['--host', host, '--port', String(port), '--data-dir', dataDir]
-      if (this.opts.longPollTimeout !== undefined) {
-        args.push('--long-poll-timeout-ms', String(this.opts.longPollTimeout))
-      }
-      // The Node server's dataDir-omitted mode is non-durable; mirror it where the flag exists.
-      if (ephemeral && process.platform === 'linux') args.push('--durability', 'memory')
+      const port = this.opts.port && this.opts.port !== 0 ? this.opts.port : await freePort(this.host)
       try {
-        this.url_ = await this.spawnOnce(bin, args, host, port)
+        this.url_ = await this.startAt(port)
         return this.url_
       } catch (e) {
         lastErr = e
@@ -153,6 +168,23 @@ export class DurableStreamTestServer {
       }
     }
     throw new Error(`durable-streams-server failed to start: ${String(lastErr)}`)
+  }
+
+  private startAt(port: number): Promise<string> {
+    if (!this.bin || !this.host || !this.dataDir) throw new Error('server start was not initialized')
+    const args = ['--host', this.host, '--port', String(port), '--data-dir', this.dataDir]
+    if (this.opts.longPollTimeout !== undefined) {
+      args.push('--long-poll-timeout-ms', String(this.opts.longPollTimeout))
+    }
+    // Explicit caller intent wins. The historical ephemeral default remains memory-only on Linux;
+    // recovery tests request WAL explicitly so no host silently downgrades their persistence lane.
+    const durability = this.opts.durability ?? (this.tempDir && process.platform === 'linux' ? 'memory' : undefined)
+    if (durability) args.push('--durability', durability)
+    return this.spawnOnce(this.bin, args, this.host, port).then((url) => {
+      this.port = port
+      this.url_ = url
+      return url
+    })
   }
 
   private spawnOnce(bin: string, args: string[], host: string, port: number): Promise<string> {
@@ -178,10 +210,12 @@ export class DurableStreamTestServer {
       proc.stdout?.on('data', onData)
       proc.stderr?.on('data', onData)
       proc.once('exit', (code) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        reject(new Error(`exited early (code ${code})\n${out}`))
+        if (this.proc === proc) this.proc = undefined
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(new Error(`exited early (code ${code})\n${out}`))
+        }
       })
       proc.once('error', (e) => {
         if (settled) return
@@ -192,26 +226,61 @@ export class DurableStreamTestServer {
     })
   }
 
+  private waitForExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
+    if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const onExit = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      const timer = setTimeout(() => {
+        proc.removeListener('exit', onExit)
+        reject(new Error(`durable-streams-server (pid ${proc.pid ?? 'unknown'}) did not exit within ${timeoutMs}ms`))
+      }, timeoutMs)
+      proc.once('exit', onExit)
+    })
+  }
+
+  /**
+   * Simulate an abrupt storage-process failure and restore the same durable store in place.
+   * Resolves only after SIGKILL has reaped and the exact pinned binary reports ready again at the
+   * original host/port/data directory. `stop()` still owns final process and temp-dir cleanup.
+   */
+  async crashAndRestart(): Promise<string> {
+    const proc = this.proc
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) throw new Error('server is not running')
+    proc.kill('SIGKILL')
+    await this.waitForExit(proc, 15000)
+    if (this.proc === proc) this.proc = undefined
+    if (this.port === undefined) throw new Error('server endpoint was not initialized')
+    return this.startAt(this.port)
+  }
+
   /** Terminate the server (SIGTERM, escalating to SIGKILL) and remove an ephemeral data dir. */
   async stop(): Promise<void> {
     const proc = this.proc
     this.proc = undefined
     if (proc && proc.exitCode === null && !proc.killed) {
-      await new Promise<void>((resolve) => {
-        const hardKill = setTimeout(() => {
-          proc.kill('SIGKILL')
-        }, 3_000)
-        proc.once('exit', () => {
-          clearTimeout(hardKill)
-          resolve()
-        })
-        proc.kill('SIGTERM')
-      })
+      proc.kill('SIGTERM')
+      try {
+        await this.waitForExit(proc, 3000)
+      } catch {
+        proc.kill('SIGKILL')
+        await this.waitForExit(proc, 15000)
+      }
     }
     if (this.tempDir) {
       rmSync(this.tempDir, { recursive: true, force: true })
       this.tempDir = undefined
     }
+    // `stop()` ends the public lifecycle. A later `start()` must behave like a fresh server: it
+    // re-resolves the configured host/port/data directory and, when the wrapper owns storage,
+    // creates and owns a new temporary directory. Only crashAndRestart deliberately bypasses this
+    // reset to preserve one exact running store across a simulated process crash.
+    this.bin = undefined
+    this.host = undefined
+    this.port = undefined
+    this.dataDir = undefined
     this.url_ = undefined
   }
 }

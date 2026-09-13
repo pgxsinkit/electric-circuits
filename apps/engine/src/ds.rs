@@ -3,6 +3,9 @@
 //! persist and replay `Stream-Next-Offset`.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
@@ -179,9 +182,9 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
 
 /// Build the error for a non-2xx durable-streams response: typed when the server said it is
 /// unavailable (5xx), an ordinary message otherwise.
-fn status_error(op: &'static str, path: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    if status.is_server_error() {
-        return anyhow::Error::new(DsUnavailable { op, path: path.to_string(), status: status.as_u16() });
+fn status_error(op: &'static str, path: &str, status: u16, body: &str) -> anyhow::Error {
+    if (500..600).contains(&status) {
+        return anyhow::Error::new(DsUnavailable { op, path: path.to_string(), status });
     }
     if body.is_empty() {
         anyhow::anyhow!("{op} {path} -> {status}")
@@ -227,10 +230,178 @@ pub type GoneReconciler = std::sync::Arc<
     dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = GoneVerdict> + Send>> + Send + Sync,
 >;
 
+/// One response from the durable-stream protocol. Private and status-shaped on purpose: it lets
+/// [`DsClient`] keep its exact error/retry behavior while the HTTP mechanics sit below the port. A
+/// closed outcome vocabulary would replace it if a second store implementation ever needs one.
+struct StoreResponse {
+    status: u16,
+    /// The response body is deliberately retained as an outcome rather than normalized to text.
+    /// Successful stream reads must fail if their body cannot be acquired: accepting the advertised
+    /// next offset with an empty page could checkpoint past envelopes that never reached Circuits.
+    /// Write/control operations keep best-effort body handling.
+    body: Option<std::result::Result<String, anyhow::Error>>,
+    next_offset: Option<String>,
+    up_to_date: bool,
+    closed: bool,
+}
+
+impl StoreResponse {
+    /// Best-effort response-body handling for write/control operations.
+    fn body_or_default(self) -> String {
+        self.body.and_then(std::result::Result::ok).unwrap_or_default()
+    }
+
+    /// A successful stream read is not a successful page until its body has been acquired.
+    fn required_body(self) -> Result<String> {
+        self.body.unwrap_or_else(|| Err(anyhow::anyhow!("provider omitted a successful stream response body")))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BodyRead {
+    Never,
+    OnFailure,
+    OnData,
+    Always,
+}
+
+type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send + 'a>>;
+
+/// The engine-owned, provider-neutral single-attempt Durable Streams port.
+///
+/// The contract intentionally accepts and returns opaque offset strings.  It owns no retry,
+/// reconciliation, envelope codec, retirement, or byte-accounting policy: those are Circuits
+/// invariants and remain on [`DsClient`].  It is private because no external crate is entitled to
+/// rely on this status-shaped outcome representation.
+trait DurableStreamStore: Send + Sync {
+    fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a>;
+    fn append<'a>(
+        &'a self,
+        path: &'a str,
+        content_type: &'a str,
+        body: Vec<u8>,
+        response_body: BodyRead,
+    ) -> StoreFuture<'a>;
+    fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a>;
+    fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
+    fn close<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
+    fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
+}
+
+/// The currently pinned pgxsinkit/durable-streams-rust wire adapter.  It performs exactly one
+/// HTTP request per port call; `DsClient` owns the interpretation and retry policy above it.
+struct HttpDurableStreamsStore {
+    base: String,
+    http: reqwest::Client,
+}
+
+impl HttpDurableStreamsStore {
+    fn new(base: String) -> Self {
+        Self { base, http: reqwest::Client::new() }
+    }
+
+    fn stream_url(&self, path: &str) -> String {
+        format!("{}/{}", self.base.trim_end_matches('/'), path.trim_start_matches('/'))
+    }
+
+    async fn response(res: reqwest::Response, body_read: BodyRead) -> StoreResponse {
+        let status = res.status().as_u16();
+        let next_offset = header(&res, "stream-next-offset");
+        let up_to_date = res.headers().get("stream-up-to-date").is_some();
+        let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let should_read = match body_read {
+            BodyRead::Never => false,
+            BodyRead::OnFailure => !(200..300).contains(&status),
+            // Existing read paths return before acquiring a 204 body.
+            BodyRead::OnData => (200..300).contains(&status) && status != 204,
+            BodyRead::Always => true,
+        };
+        // Keep acquisition fallible for the facade to interpret per operation.  In particular,
+        // `read` and `read_json` used `res.text().await?` after a successful GET; turning an
+        // interrupted body into `""` would manufacture an empty page at a real next offset.
+        // Otherwise the selected mode keeps each operation's best-effort behavior.
+        let body = if should_read { Some(res.text().await.map_err(anyhow::Error::new)) } else { None };
+        StoreResponse { status, body, next_offset, up_to_date, closed }
+    }
+}
+
+impl DurableStreamStore for HttpDurableStreamsStore {
+    fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let res = self
+                .http
+                .put(self.stream_url(path))
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .send()
+                .await
+                .with_context(|| format!("PUT {path}"))?;
+            Ok(Self::response(res, BodyRead::Always).await)
+        })
+    }
+
+    fn append<'a>(
+        &'a self,
+        path: &'a str,
+        content_type: &'a str,
+        body: Vec<u8>,
+        response_body: BodyRead,
+    ) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let res = self
+                .http
+                .post(self.stream_url(path))
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .body(body)
+                .send()
+                .await
+                .with_context(|| format!("POST {path}"))?;
+            Ok(Self::response(res, response_body).await)
+        })
+    }
+
+    fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let mut url = format!("{}?offset={}", self.stream_url(path), offset);
+            if live {
+                url.push_str("&live=long-poll");
+            }
+            let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
+            Ok(Self::response(res, BodyRead::OnData).await)
+        })
+    }
+
+    fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
+            Ok(Self::response(res, BodyRead::Never).await)
+        })
+    }
+
+    fn close<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let res = self
+                .http
+                .post(self.stream_url(path))
+                .header("stream-closed", "true")
+                .send()
+                .await
+                .with_context(|| format!("POST {path} (close)"))?;
+            Ok(Self::response(res, BodyRead::Always).await)
+        })
+    }
+
+    fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let res = self.http.delete(self.stream_url(path)).send().await.with_context(|| format!("DELETE {path}"))?;
+            Ok(Self::response(res, BodyRead::Always).await)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct DsClient {
     base: String,
-    http: reqwest::Client,
+    store: Arc<dyn DurableStreamStore>,
     /// Shared across clones (installed after the engine exists, seen by every copy of the client
     /// from then on). See [`Self::set_gone_reconciler`].
     reconcile: std::sync::Arc<std::sync::OnceLock<GoneReconciler>>,
@@ -243,9 +414,17 @@ pub struct DsClient {
 
 impl DsClient {
     pub fn new(base: impl Into<String>) -> Self {
+        let base = base.into();
+        Self::with_store(base.clone(), Arc::new(HttpDurableStreamsStore::new(base)))
+    }
+
+    /// Construct the semantic facade over a supplied single-attempt store.  This is restricted to
+    /// the engine crate so application callers cannot acquire a dependency on a provider or HTTP
+    /// status behavior; deterministic stores belong in `ds.rs` unit tests.
+    fn with_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
         DsClient {
-            base: base.into(),
-            http: reqwest::Client::new(),
+            base,
+            store,
             reconcile: std::sync::Arc::new(std::sync::OnceLock::new()),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -286,18 +465,13 @@ impl DsClient {
 
     /// Idempotently create a JSON stream (PUT). Existing stream with same config -> 200.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
-        let res = self
-            .http
-            .put(self.stream_url(path))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .send()
-            .await
-            .with_context(|| format!("PUT {path}"))?;
-        let status = res.status();
-        // Drain the body so the connection returns to reqwest's pool. Skipping this leaks one socket
-        // per call, which exhausts ephemeral ports when creating many shape streams.
-        let body = res.text().await.unwrap_or_default();
-        if status.is_success() { Ok(()) } else { Err(status_error("PUT", path, status, &body)) }
+        let res = self.store.ensure(path, "application/json").await?;
+        if (200..300).contains(&res.status) {
+            Ok(())
+        } else {
+            let status = res.status;
+            Err(status_error("PUT", path, status, &res.body_or_default()))
+        }
     }
 
     /// Append envelopes as a JSON array (the server flattens one array level into N messages).
@@ -306,36 +480,27 @@ impl DsClient {
         if events.is_empty() {
             return Ok(());
         }
-        let res = self
-            .http
-            .post(self.stream_url(path))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(events)
-            .send()
-            .await
-            .with_context(|| format!("POST {path}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(status_error("POST", path, status, &body));
+        let body = serde_json::to_vec(events).with_context(|| format!("serializing POST {path}"))?;
+        let res = self.store.append(path, "application/json", body, BodyRead::OnFailure).await?;
+        if !(200..300).contains(&res.status) {
+            let status = res.status;
+            return Err(status_error("POST", path, status, &res.body_or_default()));
         }
         Ok(())
     }
 
     /// Read raw JSON events (non-envelope streams). Returns `(events, next_offset, up_to_date)`.
     pub async fn read_json(&self, path: &str, offset: &str) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
-        let url = format!("{}?offset={}", self.stream_url(path), offset);
-        let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
-        let status = res.status();
-        let next_offset = header(&res, "stream-next-offset");
-        let up_to_date = res.headers().get("stream-up-to-date").is_some();
-        if status.as_u16() == 204 || status.as_u16() == 404 {
-            return Ok((Vec::new(), next_offset, true));
+        let res = self.store.read(path, offset, false).await?;
+        if res.status == 204 || res.status == 404 {
+            return Ok((Vec::new(), res.next_offset, true));
         }
-        if !status.is_success() {
-            return Err(status_error("GET", path, status, ""));
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
         }
-        let body = res.text().await?;
+        let next_offset = res.next_offset.clone();
+        let up_to_date = res.up_to_date;
+        let body = res.required_body()?;
         let events: Vec<serde_json::Value> = if body.trim().is_empty() {
             Vec::new()
         } else {
@@ -456,29 +621,19 @@ impl DsClient {
         let payload = serde_json::to_vec(envelopes)
             .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("serializing POST {path}"))))?;
         let payload_len = payload.len() as u64;
-        let res = self
-            .http
-            .post(self.stream_url(path))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload)
-            .send()
-            .await
-            .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("POST {path}"))))?;
-        let status = res.status();
+        let res =
+            self.store.append(path, "application/json", payload, BodyRead::Always).await.map_err(AppendError::Other)?;
         // A retired stream answers 404 (deleted), 410 (soft-deleted) or 409 + `stream-closed: true`
-        // (closed, which retirement does before deleting). Read the header before the body consumes
-        // the response; the body text ("stream is closed") is not the contract.
-        let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
-        let next_offset = header(&res, "stream-next-offset");
-        // Drain the body so the connection can be pooled and reused (avoids a socket leak per append).
-        let body = res.text().await.unwrap_or_default();
-        if status.is_success() {
+        // (closed, which retirement does before deleting).  The provider parses the header before
+        // draining its response; the body text ("stream is closed") is not the contract.
+        if (200..300).contains(&res.status) {
             *self.appended.lock().unwrap().entry(path.to_string()).or_insert(0) += payload_len;
-            Ok(next_offset)
-        } else if status.as_u16() == 404 || status.as_u16() == 410 || (status.as_u16() == 409 && closed) {
-            Err(AppendError::Gone(status.as_u16()))
+            Ok(res.next_offset)
+        } else if res.status == 404 || res.status == 410 || (res.status == 409 && res.closed) {
+            Err(AppendError::Gone(res.status))
         } else {
-            Err(AppendError::Other(status_error("POST", path, status, &body)))
+            let status = res.status;
+            Err(AppendError::Other(status_error("POST", path, status, &res.body_or_default())))
         }
     }
 
@@ -556,20 +711,12 @@ impl DsClient {
     /// the read times out. Idempotent (`204` again for an already-closed stream); an absent (`404`)
     /// or soft-deleted (`410`) stream is a success, there is nothing left to close.
     pub async fn close_stream(&self, path: &str) -> Result<()> {
-        let res = self
-            .http
-            .post(self.stream_url(path))
-            .header("stream-closed", "true")
-            .send()
-            .await
-            .with_context(|| format!("POST {path} (close)"))?;
-        let status = res.status();
-        // Drain the body so the connection returns to reqwest's pool (see `ensure_stream`).
-        let body = res.text().await.unwrap_or_default();
-        if status.is_success() || status.as_u16() == 404 || status.as_u16() == 410 {
+        let res = self.store.close(path).await?;
+        if (200..300).contains(&res.status) || res.status == 404 || res.status == 410 {
             Ok(())
         } else {
-            bail!("POST {path} (close) -> {status}: {body}")
+            let status = res.status;
+            bail!("POST {path} (close) -> {status}: {}", res.body_or_default())
         }
     }
 
@@ -593,14 +740,13 @@ impl DsClient {
     /// success: deletion is idempotent, and a retry loop (the degraded reap) must not spin forever
     /// on a stream storage has already retired.
     pub async fn delete_stream(&self, path: &str) -> Result<()> {
-        let res = self.http.delete(self.stream_url(path)).send().await.with_context(|| format!("DELETE {path}"))?;
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        if status.is_success() || status.as_u16() == 404 || status.as_u16() == 410 {
+        let res = self.store.delete(path).await?;
+        if (200..300).contains(&res.status) || res.status == 404 || res.status == 410 {
             self.appended.lock().unwrap().remove(path);
             Ok(())
         } else {
-            bail!("DELETE {path} -> {status}: {body}")
+            let status = res.status;
+            bail!("DELETE {path} -> {status}: {}", res.body_or_default())
         }
     }
 
@@ -611,47 +757,41 @@ impl DsClient {
     /// (ADR-0006): a closed segment can be a gigabyte, and durable-streams offers no bounded tail
     /// read, so the successor is derived and *verified* rather than read back.
     pub async fn head(&self, path: &str) -> Result<Option<StreamHead>> {
-        let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
-        let status = res.status();
-        if status.as_u16() == 404 || status.as_u16() == 410 {
+        let res = self.store.head(path).await?;
+        if res.status == 404 || res.status == 410 {
             return Ok(None);
         }
-        if !status.is_success() {
-            return Err(status_error("HEAD", path, status, ""));
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("HEAD", path, res.status, ""));
         }
-        Ok(Some(StreamHead {
-            next_offset: header(&res, "stream-next-offset"),
-            closed: header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true")),
-        }))
+        Ok(Some(StreamHead { next_offset: res.next_offset, closed: res.closed }))
     }
 
     /// Read from `offset` (use "-1" for the beginning). `live` enables long-poll tailing.
     pub async fn read(&self, path: &str, offset: &str, live: bool) -> Result<ReadResult> {
-        let mut url = format!("{}?offset={}", self.stream_url(path), offset);
-        if live {
-            url.push_str("&live=long-poll");
-        }
-        let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
-        let status = res.status();
-        let next_offset = header(&res, "stream-next-offset");
-        let up_to_date = res.headers().get("stream-up-to-date").is_some();
-        // The single place `stream-closed` is parsed off a read; every caller works from
-        // `ReadResult::closed`.
-        let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let res = self.store.read(path, offset, live).await?;
 
         // 204 = long-poll timeout / no new data / a close that woke this long-poll.
-        if status.as_u16() == 204 {
-            return Ok(ReadResult { envelopes: Vec::new(), next_offset, up_to_date, closed });
+        if res.status == 204 {
+            return Ok(ReadResult {
+                envelopes: Vec::new(),
+                next_offset: res.next_offset,
+                up_to_date: res.up_to_date,
+                closed: res.closed,
+            });
         }
         // A stream that is not there is a TYPED error (see `StreamGone`), never a generic read
         // failure: on the change log every caller has its own, very different answer to it.
-        if status.as_u16() == 404 || status.as_u16() == 410 {
-            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: status.as_u16() }));
+        if res.status == 404 || res.status == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
         }
-        if !status.is_success() {
-            return Err(status_error("GET", path, status, ""));
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
         }
-        let body = res.text().await?;
+        let next_offset = res.next_offset.clone();
+        let up_to_date = res.up_to_date;
+        let closed = res.closed;
+        let body = res.required_body()?;
         let envelopes: Vec<Envelope> = if body.trim().is_empty() {
             Vec::new()
         } else {
@@ -668,6 +808,119 @@ fn header(res: &reqwest::Response, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct ScriptedStore {
+        appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        fail_read_body: bool,
+    }
+
+    fn response(status: u16) -> StoreResponse {
+        StoreResponse {
+            status,
+            body: Some(Ok(String::new())),
+            next_offset: Some("opaque-provider-token".to_string()),
+            up_to_date: true,
+            closed: false,
+        }
+    }
+
+    impl DurableStreamStore for ScriptedStore {
+        fn ensure<'a>(&'a self, _path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(201)) })
+        }
+
+        fn append<'a>(
+            &'a self,
+            path: &'a str,
+            content_type: &'a str,
+            body: Vec<u8>,
+            _response_body: BodyRead,
+        ) -> StoreFuture<'a> {
+            Box::pin(async move {
+                self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
+                Ok(response(204))
+            })
+        }
+
+        fn read<'a>(&'a self, _path: &'a str, _offset: &'a str, _live: bool) -> StoreFuture<'a> {
+            Box::pin(async move {
+                let mut res = response(200);
+                res.next_offset = Some("tempting-next-offset".to_string());
+                if self.fail_read_body {
+                    res.body = Some(Err(anyhow::anyhow!("scripted stream body failure")));
+                }
+                Ok(res)
+            })
+        }
+
+        fn head<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(200)) })
+        }
+
+        fn close<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(204)) })
+        }
+
+        fn delete<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(204)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn facade_keeps_envelope_codec_and_byte_accounting_above_the_store_port() {
+        let store = Arc::new(ScriptedStore::default());
+        let client = DsClient::with_store("scripted://provider".to_string(), store.clone());
+        let envelope = Envelope {
+            type_: "public.items".to_string(),
+            key: "item-1".to_string(),
+            value: Some(serde_json::json!({ "id": "item-1" })),
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".to_string(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: Some(7),
+                last: Some(true),
+            },
+        };
+        let expected = serde_json::to_vec(&[envelope.clone()]).unwrap();
+
+        let appended = client.append_checked("shape/s1", &[envelope]).await.unwrap();
+
+        assert!(matches!(appended, Appended::Ok { next_offset: Some(ref token) } if token == "opaque-provider-token"));
+        assert_eq!(client.appended_bytes("shape/s1"), expected.len() as u64);
+        assert_eq!(client.stream_url("shape/s1"), "scripted://provider/shape/s1");
+        assert_eq!(
+            *store.appended.lock().unwrap(),
+            vec![("shape/s1".to_string(), "application/json".to_string(), expected)]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_read_body_failure_never_accepts_the_advertised_next_offset() {
+        let store = Arc::new(ScriptedStore { fail_read_body: true, ..Default::default() });
+        let client = DsClient::with_store("scripted://provider".to_string(), store);
+
+        let envelope_err = match client.read("changes/0", "prior-offset", false).await {
+            Ok(_) => panic!("a successful GET with an unreadable body must not produce a page"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{envelope_err:#}").contains("scripted stream body failure"),
+            "the source body failure must survive the facade boundary"
+        );
+
+        let json_err = client
+            .read_json("meta/catalog", "prior-offset")
+            .await
+            .expect_err("a successful GET with an unreadable body must not produce JSON events");
+        assert!(
+            format!("{json_err:#}").contains("scripted stream body failure"),
+            "the source body failure must survive the facade boundary"
+        );
+    }
 
     /// The boot classification of a durable-streams failure. Getting this wrong is expensive in
     /// both directions: forgiving too much hides a malformed catalog behind an infinite retry,
@@ -716,10 +969,10 @@ mod tests {
     /// A 4xx carries its body (the server's own words); a 5xx becomes the typed, retryable error.
     #[test]
     fn status_errors_are_typed_only_for_5xx() {
-        let four = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_REQUEST, "bad config");
+        let four = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_REQUEST.as_u16(), "bad config");
         assert!(!is_unavailable(&four));
         assert!(format!("{four:#}").contains("bad config"));
-        let five = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_GATEWAY, "");
+        let five = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_GATEWAY.as_u16(), "");
         assert!(is_unavailable(&five));
         assert!(format!("{five:#}").contains("502"));
     }
