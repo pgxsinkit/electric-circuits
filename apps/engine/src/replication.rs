@@ -164,6 +164,43 @@ pub trait EpochEvents: Send + Sync {
 pub const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 pub const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The worker spawned by `pgwire-replication` performs TCP, authentication and
+/// `START_REPLICATION` asynchronously.  Its `connect` future only starts that worker, so the
+/// first receive is part of setup and needs the same bounded wait as an ordinary Postgres
+/// connection.  Once one frame/keepalive has arrived, the stream is intentionally long-lived and
+/// uses the worker's idle wakeup behavior instead.
+pub const REPLICATION_SETUP_TIMEOUT: std::time::Duration = crate::pg::CONNECT_TIMEOUT;
+
+/// Outcome of an await which is interruptible by shutdown and bounded by a diagnostic deadline.
+/// Keeping this seam generic makes the timeout and cancellation contract testable without a real
+/// blackholed socket, while callers retain the original error type for classification.
+#[derive(Debug, PartialEq, Eq)]
+enum AwaitOutcome<T, E> {
+    Ready(T),
+    Failed(E),
+    Shutdown,
+    TimedOut,
+}
+
+async fn await_with_shutdown<F, T, E>(
+    future: F,
+    timeout: std::time::Duration,
+    shutdown: &crate::shutdown::ShutdownToken,
+) -> AwaitOutcome<T, E>
+where
+    F: Future<Output = std::result::Result<T, E>> + Send,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => AwaitOutcome::Shutdown,
+        result = tokio::time::timeout(timeout, future) => match result {
+            Ok(Ok(value)) => AwaitOutcome::Ready(value),
+            Ok(Err(error)) => AwaitOutcome::Failed(error),
+            Err(_) => AwaitOutcome::TimedOut,
+        },
+    }
+}
+
 /// Un-jittered backoff for the n-th consecutive failed attempt: 1s, 2s, 4s … capped at
 /// [`RECONNECT_MAX`]. Pure, so the schedule is a unit test rather than a stopwatch. Shared with the
 /// binary's boot connect loop, which retries a retryable Postgres failure on the same schedule.
@@ -394,11 +431,36 @@ async fn stream_loop(
     // first `recv`. Setting it there would peg every one of those at the 1 s floor forever.
     connected: &mut bool,
 ) -> Result<StreamEnd> {
-    let mut client = ReplicationClient::connect(cfg).await.context("replication connect")?;
+    // `ReplicationClient::connect` only spawns its worker; TCP/authentication and
+    // START_REPLICATION happen before the worker can deliver its first frame. Bound both the
+    // spawn call and that first receive, and make shutdown cancel either wait. Once the first
+    // frame/keepalive is received, the ordinary stream loop below is intentionally long-lived.
+    let mut client = match await_with_shutdown(ReplicationClient::connect(cfg), REPLICATION_SETUP_TIMEOUT, shutdown)
+        .await
+    {
+        AwaitOutcome::Ready(client) => client,
+        AwaitOutcome::Failed(e) => return Err(anyhow::Error::new(e)).context("replication connect"),
+        AwaitOutcome::Shutdown => return Ok(StreamEnd::ShuttingDown),
+        AwaitOutcome::TimedOut => anyhow::bail!("replication connect timed out after {:?}", REPLICATION_SETUP_TIMEOUT),
+    };
+    let initial = match await_with_shutdown(client.recv(), REPLICATION_SETUP_TIMEOUT, shutdown).await {
+        AwaitOutcome::Ready(Some(event)) => event,
+        AwaitOutcome::Ready(None) => return Ok(StreamEnd::Ended),
+        AwaitOutcome::Failed(e) => return Err(anyhow::Error::new(e)).context("replication stream setup"),
+        AwaitOutcome::Shutdown => {
+            client.abort();
+            return Ok(StreamEnd::ShuttingDown);
+        }
+        AwaitOutcome::TimedOut => {
+            client.abort();
+            anyhow::bail!("replication setup timed out after {:?}", REPLICATION_SETUP_TIMEOUT);
+        }
+    };
     let mut dec = Decoder::new(tables.clone());
     // Dropped on every exit path (a replaced `Begin`, an error return, the stream ending), which is
     // what removes a spilled transaction's temporary file (ADR-0003).
     let mut txn: Option<TxnBuffer> = None;
+    let mut initial = Some(initial);
     loop {
         // The ONE safe point for a graceful stop: between messages, never inside the `Commit` arm.
         //
@@ -407,18 +469,21 @@ async fn stream_loop(
         // as they would otherwise. Stopping mid-TRANSACTION (buffered changes, no `Commit` yet) is
         // free: nothing was acknowledged, so Postgres re-delivers the whole transaction to the next
         // process, and the spill file goes with the dropped buffer.
-        let ev = tokio::select! {
-            biased;
-            _ = shutdown.wait() => {
-                if txn.is_some() {
-                    tracing::info!(
-                        "replicator: shutdown requested mid-transaction; dropping the buffered changes \
-                         unacknowledged — Postgres re-delivers the whole transaction after the restart"
-                    );
+        let ev = match initial.take() {
+            Some(ev) => Some(ev),
+            None => tokio::select! {
+                biased;
+                _ = shutdown.wait() => {
+                    if txn.is_some() {
+                        tracing::info!(
+                            "replicator: shutdown requested mid-transaction; dropping the buffered changes \
+                             unacknowledged — Postgres re-delivers the whole transaction after the restart"
+                        );
+                    }
+                    return Ok(StreamEnd::ShuttingDown);
                 }
-                return Ok(StreamEnd::ShuttingDown);
-            }
-            ev = client.recv() => ev.context("replication stream")?,
+                ev = client.recv() => ev.context("replication stream")?,
+            },
         };
         *connected = true;
         let Some(ev) = ev else { return Ok(StreamEnd::Ended) };
@@ -1265,6 +1330,47 @@ mod tests {
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+
+    /// The setup wait must turn a worker that is stuck before its first frame (for example, a
+    /// blackholed TCP endpoint) into a retryable timeout instead of pinning the ingestor forever.
+    #[tokio::test]
+    async fn blackholed_replication_setup_times_out() {
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let outcome = await_with_shutdown(
+            std::future::pending::<std::result::Result<Option<u8>, &'static str>>(),
+            std::time::Duration::from_millis(10),
+            &shutdown,
+        )
+        .await;
+        assert!(matches!(outcome, AwaitOutcome::TimedOut));
+    }
+
+    /// Shutdown wins an in-flight setup wait, including when the socket never produces a frame.
+    #[tokio::test]
+    async fn shutdown_interrupts_replication_setup_wait() {
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let waiter = await_with_shutdown(
+            std::future::pending::<std::result::Result<Option<u8>, &'static str>>(),
+            std::time::Duration::from_secs(30),
+            &shutdown,
+        );
+        shutdown.begin();
+        assert!(matches!(waiter.await, AwaitOutcome::Shutdown));
+    }
+
+    /// A healthy setup that completes promptly is returned unchanged; the timeout is only for
+    /// setup, so the normal long-lived idle stream path remains available after this point.
+    #[tokio::test]
+    async fn healthy_replication_setup_completes_before_timeout() {
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let outcome = await_with_shutdown(
+            async { Ok::<_, &'static str>(Some(7u8)) },
+            std::time::Duration::from_secs(1),
+            &shutdown,
+        )
+        .await;
+        assert!(matches!(outcome, AwaitOutcome::Ready(Some(7))));
+    }
 
     /// The reconnect schedule doubles from one second and stops at thirty (ADR-0004). A flat retry
     /// hammers a server that is down; an uncapped one leaves an engine asleep long after the outage
