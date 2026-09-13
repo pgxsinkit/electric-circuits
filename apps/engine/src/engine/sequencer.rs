@@ -52,7 +52,10 @@ pub(crate) enum SequencerCmd {
         agg_seed: Option<AggSeed>,
         /// Snapshot envelopes the creator appended (seeds the shape's emit counter).
         emitted_seed: u64,
-        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        /// The error travels typed, not formatted: the catalog restore hands it to the boot, which
+        /// retries a storage outage and refuses a real refusal (`pg::boot_disposition`), and a
+        /// string cannot say which it was.
+        ready: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// Creation failed after `BeginShape`: drop the pending buffer.
     AbortShape {
@@ -87,7 +90,21 @@ pub(crate) enum SequencerCmd {
         shape_id: String,
         stream_path: String,
         constraints: Vec<Option<std::collections::HashSet<Value>>>,
-        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        /// Typed for the same reason as `ActivateShape`'s.
+        ready: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Start reading the change log. Only a sequencer spawned with `hold_reads` needs it: the
+    /// catalog restore sends it once EVERY restored shape is registered (ADR-0009). Acknowledged
+    /// from the loop, so the sender knows the next thing the sequencer does is read.
+    ReleaseReads {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Stop a sequencer whose reads were never released: the undo of a catalog restore that could
+    /// not complete (ADR-0009). It exits without a checkpoint — it has read nothing, so it has no
+    /// position of its own to record, and the registrations it holds belong to a restore that is
+    /// being rolled back. The retried boot spawns a fresh one from the catalog it re-folds.
+    Discard {
+        done: tokio::sync::oneshot::Sender<()>,
     },
     /// Dump the full internal state of one node (`family:<t>:<cols>` → the routing index
     /// contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX multiset).
@@ -129,6 +146,10 @@ pub(crate) fn spawn_sequencer(
     // and carry no replication old-image, so the sequencer keeps the current row per key itself
     // (see `TableExec::library_rows`).
     library_mode: bool,
+    // Do not read the change log until `ReleaseReads` (see the command). A restore registers its
+    // shapes one at a time, and a sequencer reading while it does would consume — and checkpoint
+    // past — changes that a shape registered a moment later never sees.
+    hold_reads: bool,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -153,6 +174,7 @@ pub(crate) fn spawn_sequencer(
         arr,
         arr_gates,
         library_mode,
+        hold_reads,
         shutdown,
         party,
     ));
@@ -347,11 +369,15 @@ pub(crate) async fn sequencer_loop(
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
     library_mode: bool,
+    hold_reads: bool,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
+    // False until `ReleaseReads` for a held sequencer (see `spawn_sequencer`). Commands are served
+    // either way — registering the restored shapes is exactly what a held sequencer is for.
+    let mut reading = !hold_reads;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -422,7 +448,7 @@ pub(crate) async fn sequencer_loop(
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
                     }
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
+                    let _ = ready.send(res);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::AbortShape { table, shape_id }) => {
@@ -512,8 +538,17 @@ pub(crate) async fn sequencer_loop(
                     if res.is_ok() {
                         emitted.insert(shape_id.clone(), 1);
                     }
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
+                    let _ = ready.send(res);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::ReleaseReads { done }) => {
+                    reading = true;
+                    let _ = done.send(());
+                }
+                Some(SequencerCmd::Discard { done }) => {
+                    tracing::info!("sequencer: discarded before it read anything (a catalog restore was rolled back)");
+                    let _ = done.send(());
+                    break;
                 }
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
                     let val =
@@ -539,7 +574,7 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true) => match res {
+            res = ds.read(&read_path, &read_off, true), if reading => match res {
                 Ok(rr) => {
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
@@ -854,6 +889,14 @@ pub(crate) async fn sequencer_loop(
     // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
+    //
+    // A sequencer that never read has nothing to record: its position is still the one it was
+    // started from, which the catalog already holds, and a restore being rolled back must not
+    // append anything on its way out.
+    if !reading {
+        tracing::info!("sequencer: stopped before reading the change log; no checkpoint to write");
+        return;
+    }
     let ckpt = published(&pos, &held_from);
     catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
     tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
@@ -1039,9 +1082,9 @@ pub(crate) async fn activate_shape(
                 }
             }
             *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
-            // Retried, not propagated on the first failure: at RESTORE this append's error is what
-            // makes `apply_catalog` drop and retire an acknowledged aggregate, so one transient 503
-            // during a boot used to delete a live subscription permanently.
+            // Retried, not propagated on the first failure: at RESTORE this append's error fails the
+            // whole restore (ADR-0009), and one transient 503 must not cost a boot attempt — it once
+            // cost the acknowledged aggregate itself.
             ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await?;
             exec.agg_index.insert(shape_id, &agg.pred);
             exec.aggregates.insert(shape_id.to_string(), agg);
@@ -1166,8 +1209,8 @@ pub(crate) async fn replay_changes_for_shape(
 /// Creator-side half of the two-phase shape creation: await the pending-buffer ack, **stream** the
 /// Postgres backfill on a pooled connection (appending it chunk by chunk for a plain shape, folding
 /// it for an aggregate), then activate. The sequencer keeps processing other work the whole time —
-/// a slow backfill only delays THIS shape. Returns the creation outcome (`Err(reason)` mirrors the
-/// old handshake).
+/// a slow backfill only delays THIS shape. Returns the creation outcome, with its cause kept typed:
+/// the catalog restore hands it to the boot's retry-or-refuse decision (ADR-0009).
 ///
 /// **Nothing here ever holds a whole backfill.** The snapshot arrives in chunks bounded by
 /// `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, and each chunk is appended (or folded) and dropped
@@ -1192,12 +1235,12 @@ pub(crate) async fn backfill_and_activate(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     ack_rx: tokio::sync::oneshot::Receiver<()>,
-) -> std::result::Result<(), String> {
+) -> Result<()> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape { table: table.clone(), shape_id: shape_id.to_string() });
     };
     if ack_rx.await.is_err() {
-        return Err("sequencer dropped the begin-shape ack".to_string());
+        bail!("sequencer dropped the begin-shape ack");
     }
     // Backfill: current matching rows from a REPEATABLE READ snapshot, predicate pushed into the
     // SELECT; `matches()` is the final authority (a safety net if the SQL is ever a looser
@@ -1227,9 +1270,9 @@ pub(crate) async fn backfill_and_activate(
         })
         .is_err()
     {
-        return Err("sequencer is gone".to_string());
+        bail!("sequencer is gone");
     }
-    ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+    ready_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
 }
 
 /// What a create is refused with when a shutdown interrupts it. The client's move is to retry
@@ -1253,15 +1296,14 @@ async fn stream_backfill(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     t0: std::time::Instant,
-) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64), String> {
+) -> Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64)> {
     // Library/no-source mode: the shape simply starts empty (and an aggregate starts at its
     // empty-set value), exactly as the materialising version did.
     let Some(url) = pg_url.as_deref() else {
         return Ok((crate::pg::SnapshotGate::passthrough(), aggregate.map(|_| AggSeed::default()), 0));
     };
-    let client = crate::pg::pool_for(url).get().await.map_err(|e| format!("{e:#}"))?;
-    let mut reader =
-        crate::pg::backfill_reader(&client, ts, Some(pred.as_ref())).await.map_err(|e| format!("{e:#}"))?;
+    let client = crate::pg::pool_for(url).get().await?;
+    let mut reader = crate::pg::backfill_reader(&client, ts, Some(pred.as_ref())).await?;
 
     let mut agg_seed = aggregate.map(|_| AggSeed::default());
     let mut rows_total = 0u64;
@@ -1274,13 +1316,9 @@ async fn stream_backfill(
         // un-raced connect. Aborting costs nothing: the shape is still PENDING, so the caller's
         // rollback removes the partly-appended stream and the client simply creates it again.
         if shutdown.is_shutting_down() {
-            return Err(SHUTTING_DOWN.to_string());
+            bail!(SHUTTING_DOWN);
         }
-        let chunk = match reader.next_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(e) => return Err(format!("{e:#}")),
-        };
+        let Some(chunk) = reader.next_chunk().await? else { break };
         rows_total += chunk.len() as u64;
         match (&mut agg_seed, aggregate) {
             // The sequencer no longer receives rows for an aggregate: the fold happens here, one
@@ -1297,7 +1335,7 @@ async fn stream_backfill(
                 }
                 emitted_seed += envs.len() as u64;
                 if let Err(e) = ds.append(stream_path, &envs).await {
-                    return Err(format!("append snapshot: {e:#}"));
+                    return Err(e.context("append snapshot"));
                 }
                 appends += 1;
             }

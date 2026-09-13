@@ -133,12 +133,19 @@ impl std::error::Error for StreamGone {}
 
 /// Does this error (or anything it was contextualised from) mean "the stream is not there"?
 pub fn is_stream_gone(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<StreamGone>().is_some())
+    stream_gone(e).is_some()
 }
 
-/// The durable-streams server answered, but with a 5xx: it is reachable and not serving. Typed so
-/// callers (the boot, above all) can tell "storage is having a moment" from "this request is
-/// wrong", which a status embedded in a message string cannot express.
+/// The [`StreamGone`] in this error's chain, if any — for a caller that must know WHICH stream is
+/// not there (a change-log segment and a shape's own stream call for different answers).
+pub fn stream_gone(e: &anyhow::Error) -> Option<&StreamGone> {
+    e.chain().find_map(|c| c.downcast_ref::<StreamGone>())
+}
+
+/// The durable-streams server answered, but not with an answer: a 5xx (reachable and not serving) or
+/// a 429 (reachable and asking to be asked later). Typed so callers (the boot, above all) can tell "storage is
+/// having a moment" from "this request is wrong", which a status embedded in a message string cannot
+/// express.
 #[derive(Debug)]
 pub struct DsUnavailable {
     pub op: &'static str,
@@ -154,8 +161,38 @@ impl std::fmt::Display for DsUnavailable {
 
 impl std::error::Error for DsUnavailable {}
 
+/// Storage answered an append to a stream with a terminal status (404, 410, or 409 +
+/// `stream-closed`) while its own `HEAD` finds that stream present and open — usually a proxy or a
+/// router in front of it answering for a stream it does not know about.
+///
+/// Its own type rather than [`DsUnavailable`]: it is just as worth waiting out (the boot retries it,
+/// `pg::boot_disposition`), but "durable-streams is unreachable" would send an operator looking at
+/// the wrong thing when the server is answering perfectly well — inconsistently.
+#[derive(Debug)]
+pub struct DsInconsistent {
+    pub path: String,
+    pub status: u16,
+}
+
+impl std::fmt::Display for DsInconsistent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "POST {} -> {}, but HEAD finds the stream present and open (storage answers this stream inconsistently)",
+            self.path, self.status
+        )
+    }
+}
+
+impl std::error::Error for DsInconsistent {}
+
+/// Does this error (or anything it was contextualised from) carry [`DsInconsistent`]?
+pub fn is_inconsistent(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<DsInconsistent>().is_some())
+}
+
 /// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
-/// connection, a timeout, a connection dropped mid-response, or a 5xx?
+/// connection, a timeout, a connection dropped mid-response, a 5xx, or a 429?
 ///
 /// This is the read the **boot** takes: a storage server that comes up after its engine is the
 /// normal case in a compose/Kubernetes start, so it must back off rather than exit `EX_CONFIG`.
@@ -181,9 +218,13 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
 }
 
 /// Build the error for a non-2xx durable-streams response: typed when the server said it is
-/// unavailable (5xx), an ordinary message otherwise.
+/// unavailable, an ordinary message otherwise.
+///
+/// A 429 is unavailability, not a refusal: "too many requests" is the server saying the request is
+/// fine and the timing is not. Read as a refusal it would exit the process on a catalog append
+/// (`EXIT_CATALOG_REFUSED`) and refuse a boot whose stream checks merely arrived in a burst.
 fn status_error(op: &'static str, path: &str, status: u16, body: &str) -> anyhow::Error {
-    if (500..600).contains(&status) {
+    if (500..600).contains(&status) || status == 429 {
         return anyhow::Error::new(DsUnavailable { op, path: path.to_string(), status });
     }
     if body.is_empty() {
@@ -530,8 +571,9 @@ impl DsClient {
     /// transport, timeout, 5xx) are retried with capped backoff until `budget` runs out or the
     /// shutdown token fires.
     ///
-    /// The plain [`Self::append`] propagates the first error, and these callers turn an error into
-    /// a **retirement** — so one 503 during a boot used to permanently delete an acknowledged
+    /// The plain [`Self::append`] propagates the first error, and an error on these paths is costly
+    /// — a dormant shape's failed replay evicts it, and a restore that fails costs the whole boot
+    /// attempt (ADR-0009); one 503 during a boot once permanently deleted an acknowledged
     /// subscription and its stream. Permanent removal is for records that are genuinely
     /// unrecoverable: a definite refusal (a 4xx, an unserialisable event), a stream storage confirms
     /// is gone (`HEAD` → 404/410/closed), or an exhausted budget. A service that is merely
@@ -556,15 +598,19 @@ impl DsClient {
             let e = match self.append_checked(path, envelopes).await {
                 Ok(Appended::Ok { .. }) => return Ok(()),
                 Ok(Appended::Retired(status)) => match self.head(path).await {
-                    // There and appendable: the terminal status did not come from storage.
-                    Ok(Some(head)) if !head.closed => anyhow::anyhow!(
-                        "POST {path} -> {status}, contradicted by HEAD (the stream is there): treating it as transient"
-                    ),
+                    // There and appendable: the terminal status did not come from storage. Typed as
+                    // its own condition, so a budget that runs out on it is retried at boot and NAMED
+                    // for what it is — something between the engine and storage answering one stream
+                    // two ways — rather than as an unreachable server or an unexplained refusal.
+                    Ok(Some(head)) if !head.closed => {
+                        anyhow::Error::new(DsInconsistent { path: path.to_string(), status })
+                    }
                     // Storage agrees: this one really is terminal, and the caller retires the record.
-                    Ok(_) => bail!("POST {path} -> {status} (stream retired)"),
+                    // Typed, so the caller can tell a vanished stream from a failure.
+                    Ok(_) => return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status })),
                     // Cannot tell. Retrying costs a stale append at worst; retiring on a guess costs
-                    // an acknowledged subscription.
-                    Err(he) => anyhow::anyhow!("POST {path} -> {status}; HEAD could not confirm it ({he:#})"),
+                    // an acknowledged subscription. The HEAD's own error is kept, typed.
+                    Err(he) => he.context(format!("POST {path} -> {status}; HEAD could not confirm it")),
                 },
                 Err(e) => {
                     if !is_unavailable(&e) {
@@ -572,8 +618,12 @@ impl DsClient {
                     }
                     // Storage answering "no such stream" to a HEAD is the one transient-looking case
                     // that is really terminal: stop waiting and let the caller retire the record.
+                    // Typed like the terminal answer above, so the caller can tell the two apart from a
+                    // failure the same way; the transient error that led here is kept as context.
+                    // (`head` does not say whether it was 404 or 410; both mean "not there".)
                     if let Ok(None) = self.head(path).await {
-                        return Err(e.context(format!("stream '{path}' is gone")));
+                        return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: 404 })
+                            .context(format!("POST {path} failed ({e:#}) and HEAD finds no stream")));
                     }
                     e
                 }
@@ -747,6 +797,31 @@ impl DsClient {
         } else {
             let status = res.status;
             bail!("DELETE {path} -> {status}: {}", res.body_or_default())
+        }
+    }
+
+    /// [`Self::head`], retrying a transient failure ([`is_unavailable`]) in place: up to `attempts`
+    /// tries in all, `100 ms × attempt` apart. A definitive answer — there, closed, not there — and a
+    /// non-transient error return at once; only the transport and storage's own unavailability are
+    /// worth asking again.
+    ///
+    /// The callers turn an unanswered `HEAD` into something costly — a refused join, a failed boot
+    /// attempt — so one dropped response must not be enough to do it.
+    pub async fn head_retrying(&self, path: &str, attempts: u32) -> Result<Option<StreamHead>> {
+        let mut attempt = 0u32;
+        loop {
+            match self.head(path).await {
+                Ok(head) => return Ok(head),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= attempts.max(1) || !is_unavailable(&e) {
+                        return Err(e);
+                    }
+                    let backoff = std::time::Duration::from_millis(100 * u64::from(attempt));
+                    tracing::warn!("HEAD {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
+                    tokio::time::sleep(backoff).await;
+                }
+            }
         }
     }
 
@@ -966,14 +1041,18 @@ mod tests {
         assert_eq!(crate::pg::boot_failure_name(&strictness), "not a transient Postgres condition");
     }
 
-    /// A 4xx carries its body (the server's own words); a 5xx becomes the typed, retryable error.
+    /// A 4xx carries its body (the server's own words); a 5xx — and a 429, which asks to be asked
+    /// later — becomes the typed, retryable error.
     #[test]
-    fn status_errors_are_typed_only_for_5xx() {
+    fn status_errors_are_typed_only_for_5xx_and_429() {
         let four = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_REQUEST.as_u16(), "bad config");
         assert!(!is_unavailable(&four));
         assert!(format!("{four:#}").contains("bad config"));
         let five = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_GATEWAY.as_u16(), "");
         assert!(is_unavailable(&five));
         assert!(format!("{five:#}").contains("502"));
+        let slow_down = status_error("HEAD", "shape/1", reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16(), "");
+        assert!(is_unavailable(&slow_down), "a 429 is a timing answer, not a refusal");
+        assert_eq!(crate::pg::boot_disposition(&slow_down), crate::pg::BootFailure::Retryable);
     }
 }

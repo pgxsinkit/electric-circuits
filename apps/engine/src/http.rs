@@ -170,6 +170,9 @@ struct QueryResp {
 }
 
 async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -> Result<Json<QueryResp>, AppError> {
+    // Mutates nothing, but before the boot resolves no table is known yet, and "come back" is the
+    // true answer where "unknown table" would not be (ADR-0009).
+    engine.ensure_booted()?;
     engine.ensure_not_degraded()?;
     let order_by = req.order_by.map(|o| (o.col, o.desc));
     let (rows, lsn) = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
@@ -216,7 +219,7 @@ struct CreateShapeReq {
 /// reserved namespace (see [`validate_new_subscription`]).
 fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError> {
     let Some(sub) = sub else { return Ok(None) };
-    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string() };
+    let bad = |msg: &str| AppError::new(StatusCode::BAD_REQUEST, msg.to_string());
     if sub.is_empty() {
         return Err(bad("subscription must not be empty (omit it to have one minted)"));
     }
@@ -361,6 +364,9 @@ async fn create_aggregate(
 }
 
 async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Result<Json<ShapeResp>, AppError> {
+    // Before the catalog is restored a registered shape is simply not in memory yet: answering 404
+    // would tell its subscriber the shape is gone, when the truth is "not yet" (ADR-0009).
+    engine.ensure_booted()?;
     engine.ensure_not_degraded()?;
     match engine.get_shape(&id).await {
         Some(rec) => {
@@ -368,7 +374,7 @@ async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Resu
             let subscriptions = Some(engine.subscription_count(&rec.id).await);
             Ok(Json(ShapeResp { state, subscriptions, ..ShapeResp::of(&engine, rec) }))
         }
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") }),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, format!("shape {id} not found"))),
     }
 }
 
@@ -430,9 +436,10 @@ async fn get_shape_log(
     Path(id): Path<String>,
     Query(q): Query<ShapeRowsQuery>,
 ) -> Result<Json<ShapeLogResp>, AppError> {
+    engine.ensure_booted()?;
     engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
-        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+        return Err(AppError::new(StatusCode::NOT_FOUND, format!("shape {id} not found")));
     };
     // A touch reactivates: if the shape is dormant, replay it live first so the log is current.
     engine.ensure_active(&id).await?;
@@ -489,9 +496,10 @@ async fn get_shape_rows(
     Path(id): Path<String>,
     Query(q): Query<ShapeRowsQuery>,
 ) -> Result<Json<ShapeRowsResp>, AppError> {
+    engine.ensure_booted()?;
     engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
-        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+        return Err(AppError::new(StatusCode::NOT_FOUND, format!("shape {id} not found")));
     };
     // A touch reactivates: if the shape is dormant, replay it live first so the fold is current.
     engine.ensure_active(&id).await?;
@@ -572,6 +580,10 @@ async fn release_shape(
     Path(id): Path<String>,
     Query(q): Query<ReleaseShapeQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // A release or purge would mutate the registry the restore is still building (ADR-0009). Gated
+    // here rather than inside `purge_shape`: the engine's own purges — an epoch reset at boot above
+    // all — must run before the boot resolves.
+    engine.ensure_booted()?;
     if q.purge {
         engine.purge_shape_durable(&id).await?;
     } else {
@@ -585,8 +597,7 @@ async fn release_shape(
 /// `public.<name>` sugar, `schema.name` is taken as given, anything else is a 400 (never a
 /// mis-resolved lookup).
 fn path_table(raw: &str) -> Result<TableRef, AppError> {
-    TableRef::parse(raw)
-        .map_err(|e| AppError { status: StatusCode::BAD_REQUEST, msg: format!("invalid table '{raw}': {e:#}") })
+    TableRef::parse(raw).map_err(|e| AppError::new(StatusCode::BAD_REQUEST, format!("invalid table '{raw}': {e:#}")))
 }
 
 /// `GET /tables/{name}/offset` — the sequencer's position in the (segmented) change log.
@@ -606,7 +617,7 @@ async fn table_offset(
             "path": pos.path(),
             "offset": pos.offset,
         }))),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, format!("no tailer for table {name}"))),
     }
 }
 
@@ -614,7 +625,7 @@ async fn table_families(State(engine): State<Engine>, Path(name): Path<String>) 
     let name = path_table(&name)?;
     match engine.table_stats(&name).await {
         Some(stats) => Ok(Json(stats)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, format!("no tailer for table {name}"))),
     }
 }
 
@@ -627,7 +638,7 @@ async fn get_table_schema(
     let table = path_table(&table)?;
     match engine.table_schema_info(&table).await {
         Ok(info) => Ok(Json(info)),
-        Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError::new(StatusCode::NOT_FOUND, format!("{e:#}"))),
     }
 }
 
@@ -653,7 +664,7 @@ async fn insert_table_row(
     let values = req.columns.or(req.values).unwrap_or_default();
     match engine.insert_row(&table, &values).await {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError::new(StatusCode::BAD_REQUEST, format!("{e:#}"))),
     }
 }
 
@@ -676,7 +687,7 @@ async fn delete_table_rows(
     let table = path_table(&table)?;
     match engine.delete_rows(&table, &req.keys).await {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError::new(StatusCode::BAD_REQUEST, format!("{e:#}"))),
     }
 }
 
@@ -701,7 +712,7 @@ async fn get_node_index(
 ) -> Result<Json<crate::engine::NodeIndex>, AppError> {
     match engine.node_index(&q.sig, q.cap.unwrap_or(500)).await {
         Some(idx) => Ok(Json(idx)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.sig) }),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, format!("node {} not found", q.sig))),
     }
 }
 
@@ -725,7 +736,7 @@ async fn get_state_node(
 ) -> Result<Json<serde_json::Value>, AppError> {
     match engine.dump_node(&q.id).await {
         Some(v) => Ok(Json(v)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.id) }),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, format!("node {} not found", q.id))),
     }
 }
 
@@ -772,10 +783,7 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
 /// it would drop is the one the ingestor is streaming from.
 async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Value>, AppError> {
     let Some(reason) = engine.epoch_broken() else {
-        return Err(AppError {
-            status: StatusCode::CONFLICT,
-            msg: "the epoch is not broken; nothing to reset".to_string(),
-        });
+        return Err(AppError::new(StatusCode::CONFLICT, "the epoch is not broken; nothing to reset".to_string()));
     };
     engine.reset_epoch(reason).await?;
     Ok(Json(serde_json::json!({ "ok": true, "epoch": engine.epoch_json() })))
@@ -818,10 +826,24 @@ async fn get_prometheus() -> Response {
 struct AppError {
     status: StatusCode,
     msg: String,
+    /// `Retry-After`, in seconds, when the answer is "come back shortly" rather than "you were
+    /// wrong" or "an operator must act".
+    retry_after: Option<u32>,
+}
+
+impl AppError {
+    fn new(status: StatusCode, msg: String) -> Self {
+        AppError { status, msg, retry_after: None }
+    }
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
+        // A boot that has not finished restoring the durable catalog (ADR-0009): the request is fine
+        // and will succeed once the engine is serving, which is what `Retry-After` says.
+        if e.downcast_ref::<crate::engine::Booting>().is_some() {
+            return AppError { status: StatusCode::SERVICE_UNAVAILABLE, msg: format!("{e:#}"), retry_after: Some(1) };
+        }
         // A degradation is the one engine failure that is not a 500: the request was fine, the
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
@@ -837,16 +859,25 @@ impl From<anyhow::Error> for AppError {
         // not a server fault and not something a retry changes (ADR-0008).
         } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some() {
             StatusCode::CONFLICT
+        // A request for the other mode (`POST /schema` to a Postgres-mode engine): 409 like the
+        // epoch reset refused on an intact epoch — valid on its face, in conflict with how this
+        // engine runs, and not something a retry changes.
+        } else if e.downcast_ref::<crate::engine::SchemaIsPostgres>().is_some() {
+            StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        AppError { status, msg: format!("{e:#}") }
+        AppError::new(status, format!("{e:#}"))
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response()
+        let mut resp = (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response();
+        if let Some(secs) = self.retry_after {
+            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(secs));
+        }
+        resp
     }
 }
 

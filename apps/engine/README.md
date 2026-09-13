@@ -198,7 +198,7 @@ unchanged.
 |---|---|
 | `GET /health` | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating") |
 | `GET /ready` | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise |
-| `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
+| `POST /schema` | define the schema (library mode only; Postgres mode self-configures by introspection and answers `409`) |
 | `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions") |
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`, `subscription`) |
 | `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash). Either form answers only once its catalog record is **durable**, so it blocks while storage is down and a timeout means "no answer", never "not done" — retry it (see *Durability of a create, and of a retirement*) |
@@ -401,14 +401,13 @@ false one leaves a registered shape permanently missing a committed change, with
 remembers it. The engine answers instead: still registered and `HEAD` finds the stream ⇒ the status
 was false, keep retrying; storage really has lost it ⇒ retire the shape (`Dropped`, close-then-delete,
 deregister) so subscribers re-subscribe, and only then discard. Symmetrically, an append whose
-*failure* would retire an acknowledged shape — activation's aggregate re-seed, the circuit-aggregate
-seed, a dormant shape's replay — uses `append_retrying` (transient retried with backoff, joined to
-the shutdown token), so one 503 during a boot no longer deletes a live subscription. Its budget is
-**30 s** (`DsClient::RESTORE_APPEND_BUDGET`): long enough to ride out a storage restart or a
-failover, short enough that a boot does not hang on a dependency that is not coming back. Note that
-restores are sequential, so N aggregates whose appends are all failing wait up to N × 30 s before the
-boot finishes — the budget is per append, not per boot, and a storage outage that long is an outage
-an operator should be seeing anyway.
+*failure* is costly — activation's aggregate re-seed and the circuit-aggregate seed at restore, a
+dormant shape's replay — uses `append_retrying` (transient retried with backoff, joined to the
+shutdown token), so one 503 during a boot costs neither a live subscription nor a boot attempt. Its
+budget is **30 s** (`DsClient::RESTORE_APPEND_BUDGET`): long enough to ride out a storage restart or
+a failover, short enough that a boot does not hang on a dependency that is not coming back. At
+restore an exhausted budget fails the whole restore and the boot backs off and retries it (see
+*Boot: catalog restore* below) — the aggregate is kept, not retired.
 
 ### Boot: fatal vs retryable
 
@@ -436,14 +435,52 @@ classes `08` (connection),
 `40` (serialization), `53` (resources, e.g. `53300` too many connections), `55` (`55006`, the slot is
 in use) and `57` (operator intervention, incl. `57P03` "the database system is starting up").
 `GET /ready` reports `503 waiting` throughout and each attempt is logged. **Durable-streams** is
-treated the same way: a refused connection, a timeout or a 5xx while folding the catalog or opening
+treated the same way: a refused connection, a timeout, a 5xx or a 429 while folding the catalog or opening
 the change log backs off with `durable-streams is unreachable` rather than exiting — storage that
-comes up after its engine is as ordinary as a database that does. (A *malformed* catalog, a stream
-that is gone and an unusable `ELECTRIC_CIRCUITS_DS_URL` stay fatal: none of them is a transport
-problem.) There is no restart in any of these cases: an orchestrator gates traffic on readiness, and
+comes up after its engine is as ordinary as a database that does. (A *malformed* catalog, a
+change-log segment that is gone and an unusable `ELECTRIC_CIRCUITS_DS_URL` stay fatal: none of them
+is a transport problem. A *shape* stream that is gone is not a boot failure at all — see below.)
+There is no restart in any of these cases: an orchestrator gates traffic on readiness, and
 a dependency that comes up after its engine is the normal case, not a failure. A `SIGTERM` while
 still waiting exits `0` — the whole boot is raced against the shutdown token, so it stops in
 milliseconds even mid-connect.
+
+### Boot: catalog restore
+
+The restore (`docs/adr/0009-boot-restore-fails-closed-and-retires-gone-shapes.md`) never serves an
+empty or partial registry over a catalog that names more. It runs in a fixed order:
+
+1. **Classify** every record against boot introspection. A shape whose table is no longer in the
+   compiled set, whose schema moved while the engine was down, or which is a subquery shape is
+   condemned — per shape, never the whole engine.
+2. **`HEAD`** every remaining record's stream, 16 at a time, each retried in place through a
+   transient failure (5 tries, 100 → 400 ms apart). 404/410 or `stream-closed` condemns that shape
+   too; a missing stream is an ordinary state (a plain or subquery create's `Created` can land
+   before its stream `PUT` does, and a kill in between leaves exactly that). Anything else that
+   outlasts its retries — a refused connection, a timeout, a 5xx or 429 — is not an answer: the
+   restore stops with nothing installed.
+3. **Retire** the condemned, in id order: `Dropped`, then close-then-delete, then `Retired`. A
+   missing stream is never recreated.
+4. **Install and resume** the rest as one unit, into a sequencer that reads no change until every
+   shape has resumed. If any resume fails — Postgres refusing an aggregate's re-seed, storage
+   exhausting a re-seed append's budget, a stream that vanished after its check — everything
+   installed is undone (including that sequencer, which has read and checkpointed nothing) and the
+   boot fails.
+
+A failed restore goes through the classification above: a transient cause (and a stream that
+vanished mid-restore, which the retried attempt's check then retires) retries with `/ready`
+reporting `waiting`; a real refusal (a record this build cannot resume at all) exits `78` by name.
+Every retirement is logged with the shape, table and reason, and counted (see *Metrics*).
+
+**Nothing else touches shapes until the boot resolves.** In Postgres mode, for as long as the boot
+phase is `waiting` or `starting`, `POST /shapes`, `POST /aggregate`, `POST /query`, `GET /shapes/{id}` (and
+`/rows`, `/log`), `DELETE /shapes/{id}` and `GET /v1/shape` answer `503` with `Retry-After: 1` and
+`engine is still booting …`. A create during the restore — or during a retry's backoff — would
+otherwise spawn a sequencer that reads the backlog with nothing registered and checkpoints past it,
+or mint a shape id a catalog record's stream still owns; and a 404 for a shape that is merely not
+restored yet would tell its subscriber it is gone. `POST /schema` is refused in Postgres mode at any
+phase (`409`): the schema there is introspected, and the endpoint would otherwise install tables and
+start a sequencer the boot does not own. Library mode has no boot and no gate.
 
 ### Metrics
 
@@ -463,6 +500,7 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
+| `catalog_restore_retired_<reason>_total` | counter | shape records the boot's catalog restore retired instead of resuming (ADR-0009), one per reason: `schema`, `subquery`, `table_gone`, `stream_missing`, `stream_closed`. Prometheus exports one `engine_catalog_restore_retired_total` with a `reason` attribute. `schema`/`subquery` after a boot are expected; the other three mean something outside the engine moved |
 
 The three replication-slot gauges are sampled every ~10 s by an **engine-owned** sampler on a
 **pooled** connection (never a dedicated one), and the same sample feeds StatsD — so the numbers are
@@ -596,7 +634,12 @@ pipeline would otherwise keep its pre-truncate groups).
 **Migrations applied while the engine is down** are seen by nothing on the live path. Each shape
 record carries the fingerprint its table had when the shape was created, and the catalog restore
 retires any shape whose table no longer matches — its retained stream holds rows shaped by the old
-schema and can never be brought up to date.
+schema and can never be brought up to date. A table that **leaves the compiled set** retires its
+shapes the same way, and only its shapes: one dropped while the engine was down under a wildcard
+selector (`schema.*`, including the default `public.*`), or one removed from
+`ELECTRIC_CIRCUITS_PG_TABLES`. A table dropped while an explicit `ELECTRIC_CIRCUITS_PG_TABLES` entry
+still names it is different: the boot refuses (exit `78`) while preparing that table, before the
+restore runs — the setting names something that does not exist, which is an operator's to fix.
 
 **Unresolved tables.** If the drift cannot be settled — Postgres unreachable, a catalog read that
 errored, or an `ALTER … REPLICA IDENTITY FULL` that could not get its `ACCESS EXCLUSIVE` lock within
@@ -672,6 +715,9 @@ maintained:
   log from the captured resume position (`(segment, offset)`, following rotation pointers across
   segments) — no Postgres backfill. A dormant shape **pins** its resume segment against deletion;
   one that would pin it for longer than `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted instead.
+  A reactivation that finds a stream it needs gone does not park the shape again: a gone resume
+  segment evicts it, and a gone **shape stream** (storage lost it while the shape slept) retires it
+  outright — subscribers or not — like any shape whose stream storage confirms gone.
 - **Evicted** — record deleted and the stream **retired**: closed, then deleted (see
   `docs/adr/0007-retirement-closes-before-delete.md`), so a client tailing it is released at once
   with `stream-closed` rather than blocking to the long-poll timeout. `/v1/shape` clients get

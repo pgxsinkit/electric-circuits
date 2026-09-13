@@ -267,6 +267,27 @@ describe('schema drift retires every dependent of the affected table (ADR-0005)'
     expect((await foldStream(fresh.streamUrl)).get('2')).toMatchObject({ extra: 'x' })
   }, 120000)
 
+  it('a table no longer selected at restart retires only its shapes; the other table restores', async () => {
+    // The harness reads `engineEnv` at every start, so changing it here changes the restarted engine.
+    const engineEnv: Record<string, string> = { ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS: '3600' }
+    h = await bootHarness(schema, { engineEnv })
+    await pg('INSERT INTO items (id, n, label) VALUES (1, 10, $1)', ['a'])
+    await pg('INSERT INTO other (id, n) VALUES (1, 1)')
+    await drainEngine(h!)
+    const items = await createShape(h!, { table: 'items', where: matchAll })
+    const other = await createShape(h!, { table: 'other', where: matchAll })
+
+    // `items` leaves the compiled set, exactly as if it had been dropped while the engine was down.
+    // Its shapes cannot resume on a table the engine no longer has; that retires them — per table
+    // (ADR-0005, ADR-0009) — and must never fail the restore, which would take `other` down too.
+    engineEnv.ELECTRIC_CIRCUITS_PG_TABLES = 'other'
+    await h!.restartEngine()
+
+    await waitRetired(items.shapeId, items.streamUrl)
+    expect(await shapeStatus(other.shapeId)).toBe(200)
+    await expectOtherStillLive(other.streamUrl, 2)
+  }, 120000)
+
   it('DROP COLUMN retires the shapes; the new shape works without the column', async () => {
     await boot()
     await pg('INSERT INTO items (id, n, label) VALUES (1, 10, $1)', ['a'])

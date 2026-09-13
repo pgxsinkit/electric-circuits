@@ -56,10 +56,10 @@ pub(crate) async fn create_circuit_agg(
     let groups = arr.count_groups(table).context("counts pipeline not ready")?;
     agg.value = groups.iter().filter(|(g, _)| agg.group_matches(g)).map(|(_, c)| c).sum();
     let env = agg.envelope(&exec.ts.table, None, None);
-    // Retried: this runs at RESTORE too, where an error retires the acknowledged aggregate.
+    // Retried: this runs at RESTORE too, where an error fails the whole restore (ADR-0009).
     ds.append_retrying(stream_path, &[env], DsClient::RESTORE_APPEND_BUDGET, shutdown)
         .await
-        .map_err(|e| anyhow::anyhow!("append initial aggregate: {e:#}"))?;
+        .map_err(|e| e.context("append initial aggregate"))?;
     tracing::info!(
         "circuit aggregate {shape_id}: serving COUNT('{table}') from the counts pipeline (initial {})",
         agg.value

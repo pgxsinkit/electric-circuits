@@ -48,6 +48,7 @@ use planning::*;
 use retirement::*;
 use sequencer::*;
 
+pub use catalog::RestoreStreamVanished;
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
@@ -79,6 +80,40 @@ impl std::fmt::Display for Degraded {
 }
 
 impl std::error::Error for Degraded {}
+
+/// The Postgres boot has not finished: the durable catalog is not restored yet, so there is no
+/// registry to create into, join, reactivate or release against (ADR-0009). Typed, like
+/// [`Degraded`], so both HTTP surfaces answer 503 with `Retry-After` by downcast.
+#[derive(Debug)]
+pub struct Booting;
+
+impl std::fmt::Display for Booting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("engine is still booting (the durable shape catalog is not restored yet); retry")
+    }
+}
+
+impl std::error::Error for Booting {}
+
+/// `POST /schema` against a Postgres-mode engine. The schema there IS Postgres's — introspected at
+/// boot and kept current by drift detection (ADR-0005) — so a caller-supplied one has no meaning,
+/// and honouring it would do real damage: it creates the change-log segment and records a rotation
+/// before the boot has folded the catalog, replaces the compiled tables under the restore, and
+/// spawns an ordinary reading sequencer the restore does not own. Typed, so the HTTP layer answers
+/// 409 (the request conflicts with how this engine runs) by downcast.
+#[derive(Debug)]
+pub struct SchemaIsPostgres;
+
+impl std::fmt::Display for SchemaIsPostgres {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this engine runs in Postgres mode: its schema is introspected from Postgres, and POST /schema \
+             is for library mode only",
+        )
+    }
+}
+
+impl std::error::Error for SchemaIsPostgres {}
 
 /// A create or join finished its **catalog durability wait** only to find that the shape it was
 /// about to acknowledge is no longer the shape it made: retired by a schema drift / `TRUNCATE` /
@@ -172,7 +207,9 @@ pub struct Engine {
     /// bumps the sentinel and waits for this to catch up — robust under a shared multi-database
     /// Postgres (per-database, no dependence on server-global WAL LSNs).
     repl_sync: Arc<std::sync::atomic::AtomicI64>,
-    /// Set once the replication ingestor has been spawned, so `setup_postgres` stays idempotent.
+    /// Set once `setup_postgres` has succeeded — its last fallible step is behind it and the
+    /// replication ingestor has been spawned. A second call is refused against it (see
+    /// `setup_postgres`).
     replicator_started: Arc<std::sync::atomic::AtomicBool>,
     /// Boot readiness phase driving `GET /v1/health`: 0 = `waiting` (Postgres not connected), 1 =
     /// `starting` (connected; introspecting / creating slot / spawning ingest), 2 = `active` (ingest
@@ -1064,6 +1101,36 @@ impl Engine {
         Ok(())
     }
 
+    /// The boot gate (ADR-0009): in Postgres mode, refuse every client shape mutation — create, join,
+    /// reactivation, release, purge — until `setup_postgres` has finished. Library mode has no boot
+    /// to wait for and is always past it. Creates, joins and reactivations take it inside the engine
+    /// (`create_shape_as`, `create_aggregate_as`, `ensure_active`); release and purge take it at their
+    /// HTTP route, because the engine's own purges — an epoch reset during boot above all — must run
+    /// before the boot resolves.
+    ///
+    /// The catalog restore depends on it. Before the restore runs, `next_shape_id` has not been
+    /// moved past the catalog's ids, so a create could mint a stream a restored record still owns.
+    /// While it runs, a create would spawn an ordinary, reading sequencer and a retention sweeper —
+    /// and after a rolled-back attempt, with no sequencer at all, that sequencer would read the
+    /// backlog with no shape registered and checkpoint past it, and the sweeper would advance the
+    /// durable checkpoint on its own: either way the retried restore would resume its shapes after
+    /// changes they never saw. With every such entry point closed — and `define_schema`, the other
+    /// way to spawn a sequencer or replace the tables, refused outright in Postgres mode
+    /// ([`SchemaIsPostgres`]) — the boot is the only thing that touches the registry, the tables or
+    /// the sequencer until it resolves.
+    ///
+    /// Checked against the raw boot phase, not [`Self::health_status`]: a broken epoch reports
+    /// `degraded` but has booted, and its refusals are [`Self::ensure_not_degraded`]'s.
+    /// `setup_postgres` is retried only after a failure and refuses a second call after a success,
+    /// so once the phase is `HEALTH_ACTIVE` nothing moves it back, and a request that passed the gate
+    /// stays past it.
+    pub fn ensure_booted(&self) -> Result<()> {
+        if self.pg_url.is_some() && self.health.load(std::sync::atomic::Ordering::Relaxed) != HEALTH_ACTIVE {
+            return Err(anyhow::Error::new(Booting));
+        }
+        Ok(())
+    }
+
     /// Latch the engine degraded. Exposed for tests that drive the refusal surface without a lost
     /// flip to cause it; the engine itself degrades only from the propagator's abandonment path.
     #[doc(hidden)]
@@ -1133,23 +1200,31 @@ impl Engine {
     /// Get (or spawn) the single sequencer task consuming the global change log.
     fn ensure_sequencer<'a>(&self, st: &'a mut EngineState) -> &'a SequencerHandle {
         if st.sequencer.is_none() {
-            let start = self.seq_start.lock().unwrap().clone();
-            let highwater = *self.seq_highwater.lock().unwrap();
-            st.sequencer = Some(spawn_sequencer(
-                self.ds.clone(),
-                self.tables_shared.clone(),
-                start,
-                highwater,
-                self.catalog_tx.clone(),
-                self.subquery_handle(),
-                self.trace_tx.clone(),
-                self.arrangements.lock().unwrap().clone(),
-                self.arr_gates.read().unwrap().clone(),
-                self.pg_url.is_none(),
-                self.shutdown.clone(),
-            ));
+            st.sequencer = Some(self.spawn_sequencer_task(false));
         }
         st.sequencer.as_ref().expect("sequencer just spawned")
+    }
+
+    /// Spawn a sequencer from the restored start position and the current arrangement layer.
+    /// `hold_reads` is the catalog restore's: register every shape before a single change is read
+    /// (see `SequencerCmd::ReleaseReads`).
+    fn spawn_sequencer_task(&self, hold_reads: bool) -> SequencerHandle {
+        let start = self.seq_start.lock().unwrap().clone();
+        let highwater = *self.seq_highwater.lock().unwrap();
+        spawn_sequencer(
+            self.ds.clone(),
+            self.tables_shared.clone(),
+            start,
+            highwater,
+            self.catalog_tx.clone(),
+            self.subquery_handle(),
+            self.trace_tx.clone(),
+            self.arrangements.lock().unwrap().clone(),
+            self.arr_gates.read().unwrap().clone(),
+            self.pg_url.is_none(),
+            hold_reads,
+            self.shutdown.clone(),
+        )
     }
 
     /// Number of tables with a known schema (tables being tailed) — for the boot `consumers_ready` metric.
@@ -1210,9 +1285,18 @@ impl Engine {
     }
 
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
-    /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
-    /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
+    /// replication slot, register the schema, restore the durable catalog and start the replication
+    /// ingestor.
+    ///
+    /// Retryable after a FAILURE — the binary's connect loop calls it again, and a failed attempt
+    /// leaves nothing installed (the restore undoes itself, ADR-0009). Not callable again after a
+    /// SUCCESS: that would put the boot phase back to `waiting` (closing the boot gate on a serving
+    /// engine), restore the catalog over the shapes it already restored, and fight the running
+    /// ingestor for the slot. So a second call after success is refused before it touches anything.
     pub async fn setup_postgres(&self, selectors: &[TableSelector], slot: &str) -> Result<()> {
+        if self.replicator_started.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("setup_postgres has already completed on this engine; it runs once to success");
+        }
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         // A retryable failure below brings the boot back here (see the binary's connect loop), so
         // the phase is reset rather than left wherever the last attempt stopped: `/ready` must say
@@ -1341,21 +1425,25 @@ impl Engine {
         // Replay the durable shape catalog (restores shapes + the change-log replay offset), then
         // start the sequencer from the restored position. Runs before the ingestor so the restored
         // routing sees every replayed change.
-        if let Some(fold) = restored
-            && let Err(e) = self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume).await
-        {
-            tracing::error!("catalog restore failed (continuing empty): {e:#}");
+        //
+        // A restore that cannot complete fails the boot (ADR-0009). Serving on would be serving an
+        // empty or partial registry over a catalog that still names every shape: their subscribers
+        // would read streams nothing maintains, and the next checkpoint would move the replay start
+        // past changes those shapes never saw. `apply_catalog` has already undone what it
+        // installed, so the binary's loop either retries this whole setup (storage or Postgres
+        // having a moment) or refuses by name (`pg::boot_disposition`).
+        if let Some(fold) = restored {
+            self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume)
+                .await
+                .context("restoring the durable shape catalog")?;
         }
         {
             let mut st = self.state.lock().await;
             self.ensure_sequencer(&mut st);
         }
-        // Spawn the ingestor at most once, even if setup_postgres is called again.
-        if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
-            self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
-            return Ok(());
-        }
+        // The boot's last fallible step is behind it: from here it succeeds, and a later call is
+        // refused up front (see the doc comment).
+        self.replicator_started.store(true, std::sync::atomic::Ordering::SeqCst);
         // The ingestor reads the LIVE schema view (not a boot-time copy) and reports schema drift
         // / TRUNCATE back through `SchemaEvents`, which `Engine` implements (see `engine::drift`).
         // It is spawned even when the epoch is broken and the policy is refuse: `EpochEvents`
@@ -1474,7 +1562,13 @@ impl Engine {
         self.ds.stream_url(path)
     }
 
+    /// Library mode's schema definition. Refused outright in Postgres mode ([`SchemaIsPostgres`]):
+    /// there the schema is Postgres's, and everything below — the change-log init, the table swap,
+    /// the sequencer spawn — belongs to `setup_postgres` alone.
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
+        if self.pg_url.is_some() {
+            return Err(anyhow::Error::new(SchemaIsPostgres));
+        }
         let compiled = compile_schema(schema)?;
         // Library mode has no durable catalog to fold, so the current segment is whatever this
         // process already resolved (0 on a fresh engine) and nothing rotates it — there is no

@@ -173,9 +173,23 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
     // The boot also talks to durable-streams (the catalog fold, the change log). A storage server
     // that is not up yet is the same kind of "not yet" as a database that is not up yet — and in a
     // compose/Kubernetes start it is the NORMAL one — so it backs off rather than exiting 78. Only
-    // the transport is forgiven: a malformed catalog, a stream that is gone, an unusable
-    // ELECTRIC_CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`).
+    // the transport is forgiven: a malformed catalog, a change-log segment that is gone, an unusable
+    // ELECTRIC_CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`). A SHAPE stream that is gone is
+    // not a boot failure at all: the catalog restore retires that one shape (ADR-0009). The restore
+    // itself is the other place both halves meet — a Postgres blip during an aggregate re-seed, or
+    // storage failing a stream `HEAD`, reaches here typed and retries like any other.
     if crate::ds::is_unavailable(e) {
+        return BootFailure::Retryable;
+    }
+    // Storage answering one stream two ways (an append says gone, a HEAD says there) is as worth
+    // waiting out as storage being down, and is named separately below so the log says which.
+    if crate::ds::is_inconsistent(e) {
+        return BootFailure::Retryable;
+    }
+    // A shape stream that vanished between the restore's check and its resume: the retry's check
+    // retires it, so waiting is exactly right (ADR-0009). Its `StreamGone` is otherwise an answer the
+    // line above deliberately does not forgive.
+    if e.downcast_ref::<crate::engine::RestoreStreamVanished>().is_some() {
         return BootFailure::Retryable;
     }
     BootFailure::Fatal
@@ -191,6 +205,12 @@ pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
     }
     if crate::ds::is_unavailable(e) {
         return "durable-streams is unreachable";
+    }
+    if crate::ds::is_inconsistent(e) {
+        return "durable-streams answers a stream inconsistently";
+    }
+    if e.downcast_ref::<crate::engine::RestoreStreamVanished>().is_some() {
+        return "a restored shape's stream vanished during the restore";
     }
     "not a transient Postgres condition"
 }

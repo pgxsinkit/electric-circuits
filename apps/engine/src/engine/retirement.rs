@@ -28,14 +28,21 @@ pub(crate) fn retire_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500u64.saturating_mul(1u64 << step)).min(std::time::Duration::from_secs(5))
 }
 
-/// One outstanding retirement.
+/// One outstanding retirement, as the worker's queue holds it. What it completes lives in the
+/// queue's shared [`Outstanding`] entry for the path, not here, so a repeat enqueue of the same path
+/// can add to it without a second copy of the work.
 struct Retirement {
     stream_path: String,
-    /// The shape whose `Dropped` this completes, if any — a change-log segment or a rolled-back
-    /// create's stream has no record to close out.
-    shape_id: Option<String>,
     attempt: u32,
-    completion: Option<Arc<RetirementCompletion>>,
+}
+
+/// What a pending retirement of one stream path owes when it lands.
+#[derive(Default)]
+struct Outstanding {
+    /// The shape whose `Dropped` this completes, if any — a change-log segment or a rolled-back
+    /// create's stream has no record to close out. A repeat enqueue that names one fills it in.
+    shape_id: Option<String>,
+    completions: Vec<Arc<RetirementCompletion>>,
 }
 
 pub(crate) struct RetirementCompletion {
@@ -65,11 +72,16 @@ impl RetirementCompletion {
 }
 
 /// The engine's background retirement queue (see the module docs). Cheap to clone: a sender plus the
-/// gauge.
+/// shared set of outstanding paths.
 #[derive(Clone)]
 pub(crate) struct RetirementQueue {
     tx: mpsc::UnboundedSender<Retirement>,
-    pending: Arc<std::sync::atomic::AtomicU64>,
+    /// Every stream path queued or in flight, and what its completion owes. One entry per PATH: the
+    /// same stream enqueued again while it is still outstanding — every boot attempt re-enqueues
+    /// the catalog's unmatched `Dropped` records, and a boot that retries through a storage outage
+    /// makes many attempts — joins the entry instead of queueing the work twice, so the gauge
+    /// counts streams rather than attempts and `Retired` is written once. Its size IS the gauge.
+    outstanding: Arc<std::sync::Mutex<HashMap<String, Outstanding>>>,
 }
 
 impl RetirementQueue {
@@ -86,25 +98,25 @@ impl RetirementQueue {
         shape_id: Option<&str>,
         completion: Option<Arc<RetirementCompletion>>,
     ) {
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
-        let item = Retirement {
-            stream_path: stream_path.to_string(),
-            shape_id: shape_id.map(str::to_string),
-            attempt: 0,
-            completion,
-        };
-        if self.tx.send(item).is_err() {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
-            // Republish: the gauge is written from the counter, so an un-mirrored decrement would
-            // leave it reading one retirement too many for the rest of the process.
-            crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
+        let mut outstanding = self.outstanding.lock().unwrap();
+        let fresh = !outstanding.contains_key(stream_path);
+        let entry = outstanding.entry(stream_path.to_string()).or_default();
+        if entry.shape_id.is_none() {
+            entry.shape_id = shape_id.map(str::to_string);
         }
+        entry.completions.extend(completion);
+        if fresh && self.tx.send(Retirement { stream_path: stream_path.to_string(), attempt: 0 }).is_err() {
+            outstanding.remove(stream_path);
+        }
+        if !fresh {
+            tracing::debug!("retirement of {stream_path} is already outstanding; joined it");
+        }
+        crate::metrics::metrics().retirements_pending.store(outstanding.len() as u64, Ordering::Relaxed);
     }
 
-    /// Retirements enqueued and not yet completed (the `retirements_pending` gauge).
+    /// Retirements enqueued and not yet completed, one per stream (the `retirements_pending` gauge).
     pub(crate) fn pending(&self) -> u64 {
-        self.pending.load(Ordering::SeqCst)
+        self.outstanding.lock().unwrap().len() as u64
     }
 }
 
@@ -119,8 +131,8 @@ pub(crate) fn spawn_retirement_queue(
     shutdown: crate::shutdown::ShutdownToken,
 ) -> RetirementQueue {
     let (tx, mut rx) = mpsc::unbounded_channel::<Retirement>();
-    let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = pending.clone();
+    let outstanding: Arc<std::sync::Mutex<HashMap<String, Outstanding>>> = Arc::default();
+    let owed = outstanding.clone();
     tokio::spawn(async move {
         let mut queue: std::collections::VecDeque<Retirement> = std::collections::VecDeque::new();
         loop {
@@ -147,19 +159,26 @@ pub(crate) fn spawn_retirement_queue(
             let mut item = queue.pop_front().expect("non-empty above");
             match ds.retire_stream(&item.stream_path).await {
                 Ok(()) => {
-                    // Only now: `Retired` means "storage accepted the delete", and the whole point
-                    // of the record is that it can be trusted at the next boot.
-                    if let Some(id) = &item.shape_id {
-                        catalog_tx.send(CatalogEvent::Retired { id: id.clone() });
-                    }
+                    // Taken out of the shared set and settled under the same lock, so an enqueue of
+                    // this path either joined the entry before it was taken (and is settled with it)
+                    // or finds it gone and queues a retirement of its own.
+                    let done = {
+                        let mut outstanding = owed.lock().unwrap();
+                        let done = outstanding.remove(&item.stream_path).unwrap_or_default();
+                        crate::metrics::metrics()
+                            .retirements_pending
+                            .store(outstanding.len() as u64, Ordering::Relaxed);
+                        // Only now: `Retired` means "storage accepted the delete", and the whole
+                        // point of the record is that it can be trusted at the next boot.
+                        if let Some(id) = &done.shape_id {
+                            catalog_tx.send(CatalogEvent::Retired { id: id.clone() });
+                        }
+                        done
+                    };
                     if item.attempt > 0 {
                         tracing::info!("retired stream {} after {} retr(ies)", item.stream_path, item.attempt);
                     }
-                    counter.fetch_sub(1, Ordering::SeqCst);
-                    crate::metrics::metrics()
-                        .retirements_pending
-                        .store(counter.load(Ordering::SeqCst), Ordering::Relaxed);
-                    if let Some(completion) = item.completion {
+                    for completion in done.completions {
                         completion.complete();
                     }
                 }
@@ -185,7 +204,7 @@ pub(crate) fn spawn_retirement_queue(
             }
         }
     });
-    RetirementQueue { tx, pending }
+    RetirementQueue { tx, outstanding }
 }
 
 impl Engine {
@@ -274,6 +293,37 @@ mod tests {
             server.catalog_kinds(),
             vec!["retired".to_string()],
             "the completion is recorded once, and only after storage accepted the delete"
+        );
+    }
+
+    /// Every boot attempt re-enqueues the catalog's unmatched `Dropped` records, and a boot that
+    /// retries through a storage outage makes many attempts. The same stream enqueued again while
+    /// it is still outstanding is ONE retirement: one gauge entry, one delete that lands, one
+    /// `Retired` — and a completion attached by the repeat is still settled when it lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_already_outstanding_is_joined_not_queued_twice() {
+        let server = FakeDs::start().await;
+        server.fail_deletes(3);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let ds = DsClient::new(server.url());
+        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let q = spawn_retirement_queue(ds, catalog.clone(), shutdown);
+        q.enqueue("shape/s1", None);
+        let completion = RetirementCompletion::new();
+        q.enqueue_with_completion("shape/s1", Some("s1"), Some(completion.clone()));
+        q.enqueue("shape/s1", Some("s1"));
+        assert_eq!(q.pending(), 1, "one stream outstanding, however many times it was enqueued");
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), completion.wait())
+            .await
+            .expect("the joined completion is settled when the retirement lands");
+        assert_eq!(q.pending(), 0);
+        assert_eq!(server.deletes(), 4, "three refusals, then the one delete that landed — no second copy");
+        assert!(catalog.drain(std::time::Duration::from_secs(5)).await);
+        assert_eq!(
+            server.catalog_kinds(),
+            vec!["retired".to_string()],
+            "the shape id a repeat supplied is recorded, once"
         );
     }
 

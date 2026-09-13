@@ -204,7 +204,9 @@ async fn main() -> Result<()> {
 ///
 /// Retrying the WHOLE setup (rather than only the connect) is deliberate and safe: `setup_postgres`
 /// is idempotent — it re-introspects, re-adopts the epoch, and spawns the ingestor at most once —
-/// so a connection lost half-way through introspection resumes from the top with no residue.
+/// so a connection lost half-way through introspection resumes from the top with no residue. A
+/// catalog restore that fails part-way undoes everything it installed before returning (ADR-0009),
+/// so the retry re-folds the catalog into a clean registry rather than on top of a partial one.
 async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
     let shutdown = engine.shutdown_token();
     // Named so a forced exit can say the boot was what it was waiting for (the ingestor and the

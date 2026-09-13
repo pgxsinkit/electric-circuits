@@ -361,6 +361,20 @@ pub fn init_otel() -> SdkMeterProvider {
         ""
     );
     engine_counter!("engine_changes_segments_deleted", "Rotated-out segments retired", changes_segments_deleted, "");
+    // One counter, one `reason` attribute per `RestoreRetireReason` (ADR-0009): the reasons are a
+    // closed set, so the series count is fixed.
+    meter
+        .u64_observable_counter("engine_catalog_restore_retired")
+        .with_description("Shape records the catalog restore retired instead of resuming (ADR-0009)")
+        .with_callback(|obs| {
+            for reason in crate::metrics::RestoreRetireReason::ALL {
+                obs.observe(
+                    crate::metrics::metrics().catalog_restore_retired[reason as usize].load(Ordering::Relaxed),
+                    &[KeyValue::new("reason", reason.label())],
+                );
+            }
+        })
+        .build();
     engine_counter!("engine_txn_spills", "Transactions whose buffer outgrew the memory cap (ADR-0003)", txn_spills, "");
     engine_counter!("engine_txn_spill", "Bytes ever written to transaction spill files", txn_spill_bytes, "By");
     engine_counter!(

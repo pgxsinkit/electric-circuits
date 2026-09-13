@@ -268,3 +268,59 @@ async fn degraded_refuses_the_membership_routes_and_keeps_observability_up() {
         assert_eq!(call("GET", uri, "").await.status(), StatusCode::OK, "{uri} must stay up");
     }
 }
+
+/// Postgres mode before the boot resolves (ADR-0009): every route that would create, join,
+/// reactivate, release or purge a shape — or report on one the catalog restore has not installed
+/// yet — answers 503 with `Retry-After`, never the 404/400/500 a not-yet-restored registry would
+/// otherwise produce. A create here would spawn a sequencer that reads and checkpoints past the
+/// backlog before the restore registers its shapes, or mint an id a catalog record still owns.
+/// Library mode has no boot and is unaffected.
+#[tokio::test]
+async fn a_booting_engine_refuses_shape_mutations_with_retry_after() {
+    let engine = Engine::new_pg(DsClient::new("http://127.0.0.1:1"), "postgres://x/y".into());
+    let call = async |engine: &Engine, method: &str, uri: &str, body: &'static str| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        router(engine.clone()).oneshot(req).await.unwrap()
+    };
+
+    for (method, uri, body) in [
+        ("POST", "/shapes", r#"{"table":"items"}"#),
+        ("POST", "/aggregate", r#"{"table":"items","fn":"count"}"#),
+        ("POST", "/query", r#"{"table":"items"}"#),
+        ("GET", "/shapes/s1", ""),
+        ("GET", "/shapes/s1/rows", ""),
+        ("GET", "/shapes/s1/log", ""),
+        ("DELETE", "/shapes/s1", ""),
+        ("DELETE", "/shapes/s1?purge=true", ""),
+        ("GET", "/v1/shape?table=items&offset=-1", ""),
+    ] {
+        let res = call(&engine, method, uri, body).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} {uri} must wait for the boot");
+        assert_eq!(res.headers().get("retry-after").map(|v| v.to_str().unwrap()), Some("1"), "{method} {uri}");
+        assert!(body_string(res).await.contains("still booting"), "{method} {uri} names the reason");
+    }
+    assert!(engine.ensure_booted().is_err());
+
+    // `POST /schema` is not a boot-time question at all in Postgres mode: the schema is Postgres's.
+    // Refused with 409 whatever the boot phase, and without touching anything.
+    let res = call(
+        &engine,
+        "POST",
+        "/schema",
+        r#"{"schema":{"tables":{"items":{"columns":{"id":{"type":"int"}},"primaryKey":"id"}}}}"#,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert!(body_string(res).await.contains("Postgres mode"));
+
+    // Library mode: no boot to wait for, so the same create gets past the gate (and fails on its own
+    // terms — no such table — rather than being told to come back).
+    let res = call(&library_engine(), "POST", "/shapes", r#"{"table":"items"}"#).await;
+    assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(library_engine().ensure_booted().is_ok());
+}

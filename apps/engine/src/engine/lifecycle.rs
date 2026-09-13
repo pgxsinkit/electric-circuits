@@ -9,6 +9,10 @@ use super::*;
 /// retiring this table continuously — at which point the honest answer is the retryable error.
 pub(crate) const CREATE_RACE_ATTEMPTS: u32 = 3;
 
+/// Tries a join's stream check gets before an unanswered `HEAD` refuses the join
+/// (`DsClient::head_retrying`): a client is waiting on it, so the budget is short.
+const JOIN_HEAD_ATTEMPTS: u32 = 3;
+
 /// A short, JITTERED pause between redo attempts.
 ///
 /// The race that caused the redo is an external retirement landing inside the durability wait, and
@@ -93,6 +97,9 @@ impl Engine {
         share: bool,
         subscription: Option<String>,
     ) -> Result<(ShapeRecord, String)> {
+        // Before anything, including minting an id: no create or join until the boot has restored
+        // the catalog (see `Engine::ensure_booted`).
+        self.ensure_booted()?;
         // Minted ONCE, outside the redo loop: a redone attempt must be the same subscription, or
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
@@ -465,7 +472,7 @@ impl Engine {
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
-            Err(e) => Err(format!("creating shape stream: {e:#}")),
+            Err(e) => Err(e.context("creating shape stream")),
             Ok(()) => {
                 backfill_and_activate(
                     &self.ds,
@@ -529,7 +536,7 @@ impl Engine {
                 // (no zombie shape a later identical create would join) and surface the error.
                 let _ = share_tx.send(ShareOutcome::Failed);
                 creating.rollback().await;
-                bail!("shape '{id}' creation failed: {e}")
+                bail!("shape '{id}' creation failed: {e:#}")
             }
         }
     }
@@ -557,6 +564,8 @@ impl Engine {
         col: Option<String>,
         subscription: Option<String>,
     ) -> Result<(ShapeRecord, String)> {
+        // The boot gate, exactly as `create_shape_as` takes it.
+        self.ensure_booted()?;
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
             let res = self.create_aggregate_once(table, where_.clone(), func, col.clone(), &sub).await;
@@ -711,7 +720,7 @@ impl Engine {
                             CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
                         return match ready_rx2
                             .await
-                            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
                         {
                             Ok(()) => {
                                 // The create's work is done, but it may have overlapped a degradation — its stream is
@@ -756,7 +765,7 @@ impl Engine {
                                 }
                                 let _ = share_tx.send(ShareOutcome::Failed);
                                 creating.rollback().await;
-                                bail!("aggregate '{id}' creation failed: {e}")
+                                bail!("aggregate '{id}' creation failed: {e:#}")
                             }
                         };
                     }
@@ -867,7 +876,7 @@ impl Engine {
                 }
                 let _ = share_tx.send(ShareOutcome::Failed);
                 creating.rollback().await;
-                bail!("aggregate '{id}' creation failed: {e}")
+                bail!("aggregate '{id}' creation failed: {e:#}")
             }
         }
     }
@@ -1135,6 +1144,9 @@ impl Engine {
     /// Concurrent touches coalesce onto one replay; a touch during deactivation waits for the
     /// transition to settle first. Also refreshes `last_read`.
     pub async fn ensure_active(&self, id: &str) -> Result<()> {
+        // A reactivation registers with the sequencer (and spawns one if there is none): not before
+        // the boot has restored the catalog (see `Engine::ensure_booted`).
+        self.ensure_booted()?;
         loop {
             enum Step {
                 Done,
@@ -1181,32 +1193,62 @@ impl Engine {
                                         }
                                         Err(e) => e,
                                     };
-                                    // The replay's resume SEGMENT is gone (ADR-0006). Nothing can
-                                    // bring this shape up to date — the changes it is missing are
-                                    // not anywhere any more — so it is evicted rather than parked
-                                    // back as dormant with a resume position that will 404 on every
-                                    // future touch. Subscribers get 404 / `stream-closed` and
-                                    // recreate, which backfills them from Postgres.
-                                    if crate::ds::is_stream_gone(&err) {
-                                        tracing::error!(
-                                            "reactivating shape {id}: its change-log resume segment {} is gone \
-                                             ({err:#}); evicting the shape — it can never be brought up to date",
-                                            crate::changelog::segment_path(resume.segment)
-                                        );
-                                        // Put it back as dormant first: `evict_shape` only evicts a
-                                        // settled shape, and this one is still `Reactivating`.
-                                        if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
-                                            life.state = LifeState::Dormant {
-                                                since: std::time::Instant::now(),
-                                                resume: resume.clone(),
-                                                gate: gate.clone(),
-                                            };
+                                    // A stream the replay needs is GONE, and which one decides the
+                                    // answer. Either way nothing can bring this shape up to date, so
+                                    // it is not parked back as dormant to fail the same way on every
+                                    // future touch; subscribers get 404 / `stream-closed` and recreate,
+                                    // which backfills them from Postgres.
+                                    let gone = crate::ds::stream_gone(&err).map(|g| g.path.clone());
+                                    match gone {
+                                        // The change-log resume SEGMENT (ADR-0006): the changes the
+                                        // shape is missing are not anywhere any more. Evicted through
+                                        // the retention path, like any shape pinning a deleted segment.
+                                        Some(path)
+                                            if path.split('/').next() == Some(crate::changelog::CHANGES_PREFIX) =>
+                                        {
+                                            tracing::error!(
+                                                "reactivating shape {id}: its change-log resume segment {path} is \
+                                                 gone ({err:#}); evicting the shape — it can never be brought up to \
+                                                 date"
+                                            );
+                                            // Put it back as dormant first: `evict_shape` only evicts a
+                                            // settled shape, and this one is still `Reactivating`.
+                                            if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                                life.state = LifeState::Dormant {
+                                                    since: std::time::Instant::now(),
+                                                    resume: resume.clone(),
+                                                    gate: gate.clone(),
+                                                };
+                                            }
+                                            if let Err(e) =
+                                                engine.evict_shape(&id, EvictReason::ChangeLogRetention).await
+                                            {
+                                                tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
+                                            }
+                                            let _ = tx.send(Some(false));
+                                            return;
                                         }
-                                        if let Err(e) = engine.evict_shape(&id, EvictReason::ChangeLogRetention).await {
-                                            tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
+                                        // The shape's OWN retained stream: storage lost it while the
+                                        // shape was dormant — the runtime form of the boot's
+                                        // `stream_missing` (ADR-0009). Retired outright (`Dropped`,
+                                        // close-then-delete, deregister), exactly as a join or a live
+                                        // append retires a shape whose stream storage confirms gone:
+                                        // eviction would skip a shape that still has subscribers, and
+                                        // they are holding a handle whose every read is 404.
+                                        Some(path) => {
+                                            tracing::error!(
+                                                "reactivating shape {id}: its retained stream {path} is gone from \
+                                                 storage ({err:#}); retiring the shape so its subscribers re-subscribe"
+                                            );
+                                            if let Err(e) = engine.purge_shape(&id).await {
+                                                tracing::warn!(
+                                                    "retiring shape {id} after losing its stream failed: {e:#}"
+                                                );
+                                            }
+                                            let _ = tx.send(Some(false));
+                                            return;
                                         }
-                                        let _ = tx.send(Some(false));
-                                        return;
+                                        None => {}
                                     }
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
                                     // Restore the dormant resume state so a later touch retries.
@@ -1323,8 +1365,8 @@ impl Engine {
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
         ready_rx
             .await
-            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
-            .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e}"))?;
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
+            .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e:#}"))?;
         // The replay read the change log through the schema captured above; if the table drifted
         // meanwhile the shape has been retired underneath us and must not be reported live.
         if let Err(e) = self.ensure_schema_unchanged(&gens).await {
@@ -2246,22 +2288,11 @@ impl Engine {
             st.shapes.get(&id).map(|r| (id, r.stream_path.clone()))
         };
         let Some((id, path)) = candidate else { return Ok(()) };
-        let mut attempt = 0u32;
-        let lost = loop {
-            match self.ds.head(&path).await {
-                Ok(Some(head)) => break head.closed,
-                Ok(None) => break true,
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= 3 || !crate::ds::is_unavailable(&e) {
-                        return Err(e.context(format!(
-                            "cannot verify retained shape {id}'s stream '{path}' before joining it"
-                        )));
-                    }
-                    let backoff = std::time::Duration::from_millis(100 * u64::from(attempt));
-                    tracing::warn!("join: HEAD {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
-                    tokio::time::sleep(backoff).await;
-                }
+        let lost = match self.ds.head_retrying(&path, JOIN_HEAD_ATTEMPTS).await {
+            Ok(Some(head)) => head.closed,
+            Ok(None) => true,
+            Err(e) => {
+                return Err(e.context(format!("cannot verify retained shape {id}'s stream '{path}' before joining it")));
             }
         };
         if lost {

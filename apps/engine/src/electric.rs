@@ -375,6 +375,15 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // An engine still restoring its catalog (ADR-0009). Never a 400: Electric's client treats
+        // that as fatal, and nothing about the request is wrong — it will succeed shortly.
+        if e.downcast_ref::<crate::engine::Booting>().is_some() {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("{e:#}"),
+                retry_after: Some(1),
+            };
+        }
         // Matched by TYPE, exactly as the native surface does (`http.rs`): a create that kept losing
         // the same race is not a server fault — the request is valid and the engine is busy retiring
         // things underneath it — so an Electric client is told to come back rather than to treat the
@@ -833,6 +842,10 @@ pub async fn shape(
 
     let resp = if !crate::config::secret_ok(crate::config::secret(), p.secret.as_deref(), p.api_secret.as_deref()) {
         unauthorized()
+    } else if let Err(e) = engine.ensure_booted() {
+        // Checked before the table lookup: until the boot resolves no table is known, and "unknown
+        // table" is a 400 — which an Electric client treats as fatal (ADR-0009).
+        ApiError::from(e).into_response()
     } else if let Err(e) = engine.ensure_not_degraded() {
         degraded(&e)
     } else {

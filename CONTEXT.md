@@ -27,8 +27,8 @@ The retention lifecycle of a shape — maintained live; parked with its stream r
 state; removed entirely.
 
 **Retirement**:
-The engine's own removal of a shape stream (eviction, purge, schema drift, epoch reset), always
-closing the stream before deleting it.
+The engine's own removal of a shape stream (eviction, purge, schema drift, epoch reset, or a boot
+restore that finds the shape definitively gone), always closing the stream before deleting it.
 _Avoid_: invalidation, drop (for streams)
 
 **Epoch**:

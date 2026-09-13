@@ -129,9 +129,9 @@ async fn a_false_404_on_a_live_shape_retries_until_the_batch_lands() {
     assert!(ds.deleted.lock().unwrap().is_empty(), "nothing may be retired over a false 404");
 }
 
-/// The restore-path append reconciles a terminal answer the same way. Its ERROR is what makes the
-/// catalog restore drop and retire an acknowledged aggregate, so a false `404` there is the same
-/// permanent loss a transient `503` was — one HEAD tells them apart.
+/// The restore-path append reconciles a terminal answer the same way. Its ERROR fails the catalog
+/// restore (ADR-0009), so a false `404` there would cost a whole boot attempt — one HEAD tells it
+/// apart from a real one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_false_404_during_a_restore_append_does_not_cost_the_shape() {
     let (engine, client, ds) = engine_with_one_shape().await;
@@ -147,7 +147,8 @@ async fn a_false_404_during_a_restore_append_does_not_cost_the_shape() {
     assert!(engine.get_shape("s1").await.is_some(), "the shape must survive");
 }
 
-/// ...and a real one still fails, so a genuinely missing stream is retired rather than waited out.
+/// ...and a real one still fails, typed as the stream being gone, so the restore can tell it from a
+/// failure: the boot retries, and the retried restore's stream check retires the shape.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_real_404_during_a_restore_append_fails_so_the_caller_retires() {
     let (engine, client, ds) = engine_with_one_shape().await;
@@ -157,10 +158,9 @@ async fn a_real_404_during_a_restore_append_fails_so_the_caller_retires() {
     let err = client
         .append_retrying("shape/s1", &[envelope()], Duration::from_secs(5), &shutdown)
         .await
-        .expect_err("a stream storage does not have cannot be appended to")
-        .to_string();
+        .expect_err("a stream storage does not have cannot be appended to");
 
-    assert!(err.contains("stream retired"), "unexpected error: {err}");
+    assert!(electric_circuits_engine::ds::is_stream_gone(&err), "unexpected error: {err:#}");
     assert_eq!(ds.shape_appends.load(Ordering::SeqCst), 0);
 }
 

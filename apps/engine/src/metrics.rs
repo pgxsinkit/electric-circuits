@@ -120,6 +120,11 @@ pub struct Metrics {
     pub catalog_append_retries: AtomicU64,
     /// ADR-0007: retirement attempts that failed and were re-queued.
     pub retirement_retries: AtomicU64,
+    /// ADR-0009: shape records the boot's catalog restore retired instead of resuming, one counter
+    /// per [`RestoreRetireReason`] (indexed by it). Non-zero after a boot is expected for `schema`
+    /// (a migration the engine slept through) and `subquery` (never restorable); `table_gone`,
+    /// `stream_missing` and `stream_closed` say something outside the engine moved.
+    pub catalog_restore_retired: [AtomicU64; RestoreRetireReason::ALL.len()],
     pub txn_spills: AtomicU64, // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
     /// COUNTER (cumulative), not a gauge: bytes ever written to transaction spill files. A gauge
     /// would be meaningless — a spill file exists only between one `Begin` and its `Commit`, so any
@@ -192,6 +197,7 @@ pub fn metrics() -> &'static Metrics {
         changes_segments_retained: AtomicU64::new(0),
         catalog_append_retries: AtomicU64::new(0),
         retirement_retries: AtomicU64::new(0),
+        catalog_restore_retired: std::array::from_fn(|_| AtomicU64::new(0)),
         retirements_pending: AtomicU64::new(0),
         backfill_chunked_appends: AtomicU64::new(0),
         sequencer_orphan_fragments: AtomicU64::new(0),
@@ -209,9 +215,54 @@ pub fn metrics() -> &'static Metrics {
     })
 }
 
+/// Why the boot's catalog restore retired a shape record rather than resuming it (ADR-0009). Every
+/// one of them is a **definitive** answer about that one shape; a transient failure is never a
+/// reason — it fails the restore and the boot retries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreRetireReason {
+    /// The table's schema moved while the engine was down (ADR-0005).
+    Schema,
+    /// A subquery shape: its inner-node state is not persisted, so it is never restorable.
+    Subquery,
+    /// The table is no longer in the compiled set — dropped while the engine was down under a
+    /// wildcard selector, or no longer selected by `ELECTRIC_CIRCUITS_PG_TABLES`. (A table an explicit
+    /// entry still names refuses the boot before the restore runs.)
+    TableGone,
+    /// Storage answered the stream's `HEAD` with 404/410.
+    StreamMissing,
+    /// Storage answered the stream's `HEAD` with `stream-closed`: it can never be appended to again.
+    StreamClosed,
+}
+
+impl RestoreRetireReason {
+    pub const ALL: [RestoreRetireReason; 5] = [
+        RestoreRetireReason::Schema,
+        RestoreRetireReason::Subquery,
+        RestoreRetireReason::TableGone,
+        RestoreRetireReason::StreamMissing,
+        RestoreRetireReason::StreamClosed,
+    ];
+
+    /// The label an operator sees: the `reason` attribute on Prometheus, the key suffix in JSON.
+    pub fn label(self) -> &'static str {
+        match self {
+            RestoreRetireReason::Schema => "schema",
+            RestoreRetireReason::Subquery => "subquery",
+            RestoreRetireReason::TableGone => "table_gone",
+            RestoreRetireReason::StreamMissing => "stream_missing",
+            RestoreRetireReason::StreamClosed => "stream_closed",
+        }
+    }
+}
+
 impl Metrics {
+    /// Count one record the catalog restore retired (ADR-0009).
+    pub fn restore_retired(&self, reason: RestoreRetireReason) {
+        self.catalog_restore_retired[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "counters": {
                 "envelopes_processed": self.envelopes.load(Ordering::Relaxed),
                 "shape_appends": self.shape_appends.load(Ordering::Relaxed),
@@ -248,7 +299,13 @@ impl Metrics {
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
             "append_us": self.append.snapshot(),
-        })
+        });
+        // Flat keys, one per reason, so `counters` stays a map of numbers like every other entry.
+        for reason in RestoreRetireReason::ALL {
+            value["counters"][format!("catalog_restore_retired_{}_total", reason.label())] =
+                self.catalog_restore_retired[reason as usize].load(Ordering::Relaxed).into();
+        }
+        value
     }
 
     /// Zero all counters and histograms — the benchmark calls this after shape registration so the
@@ -270,6 +327,9 @@ impl Metrics {
         self.changes_segments_deleted.store(0, Ordering::Relaxed);
         self.catalog_append_retries.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);
+        for counter in &self.catalog_restore_retired {
+            counter.store(0, Ordering::Relaxed);
+        }
         self.txn_spills.store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
         self.txn_chunked_appends.store(0, Ordering::Relaxed);

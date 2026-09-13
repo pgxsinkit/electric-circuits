@@ -11,6 +11,11 @@ use super::*;
 /// replayed history). Subquery shapes are NOT restorable without persisted inner-node state (a
 /// fresh-seeded node cannot detect downtime flips, which would leave stale move-outs forever) —
 /// they are dropped loudly at restore for clients to recreate.
+///
+/// The restore is all-or-nothing for anything that may clear by itself (ADR-0009): a storage or
+/// Postgres failure part-way undoes what was installed and fails the boot, which retries. Only a
+/// DEFINITIVE answer about one shape — its table moved or is gone, its stream is missing or closed,
+/// it is a subquery shape — retires that shape, and the rest restore around it.
 pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 
 /// One catalog event. `Offset` checkpoints the sequencer's processed change-log position (the
@@ -169,7 +174,7 @@ impl Drop for WriterExit {
 /// "exit the process" branch is unit-testable without exiting anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppendVerdict {
-    /// Transport, timeout or 5xx: storage is having a moment. Retry THIS event, in place, forever —
+    /// Transport, timeout, 5xx or 429: storage is having a moment. Retry THIS event, in place, forever —
     /// the queue is ordered and single-consumer, so everything behind it waits, which is exactly
     /// right (a later event must never reach the log before an earlier one).
     Retry,
@@ -179,7 +184,7 @@ pub(crate) enum AppendVerdict {
 }
 
 /// Classify a failed catalog append. `is_unavailable` is deliberately the ONLY forgiving side (see
-/// [`crate::ds::is_unavailable`]): it forgives the transport and 5xx, and nothing else.
+/// [`crate::ds::is_unavailable`]): it forgives the transport, 5xx and 429, and nothing else.
 pub(crate) fn classify_append(e: &anyhow::Error) -> AppendVerdict {
     if crate::ds::is_unavailable(e) { AppendVerdict::Retry } else { AppendVerdict::Refused }
 }
@@ -497,9 +502,8 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
 
 /// The durable catalog holds a record written **before** ADR-0002 (a bare `rec.table`).
 ///
-/// A typed error because the boot path treats it differently from every other restore failure: an
-/// ordinary failure is logged and the engine continues with an empty registry (the clients recreate
-/// their shapes), but this one **refuses to boot**. Half-restoring a pre-qualification catalog is
+/// A typed error so the boot can name it, and refuse outright rather than retry: nothing about
+/// waiting changes it. Half-restoring a pre-qualification catalog is
 /// the one outcome worse than not booting: the record's `sig` still carries the bare spelling, so an
 /// identical post-cutover create would not share with it and the engine would quietly maintain two
 /// streams for one table, forever. Recovery is a deliberate human act (reset the storage), not
@@ -562,6 +566,25 @@ impl std::fmt::Display for CatalogPredatesSubscriptions {
 
 impl std::error::Error for CatalogPredatesSubscriptions {}
 
+/// A restored shape's stream passed the restore's check and was gone by the time the resume wrote to
+/// it: storage lost it (or something outside the engine deleted it) in between.
+///
+/// Typed because the boot retries it rather than refusing (`pg::boot_disposition`). The resume
+/// cannot retire the shape itself — by then its neighbours are installed, and the restore is all or
+/// nothing — but the shape is not beyond the restore either: the retried attempt's check finds the
+/// stream missing and retires it the ordinary way (ADR-0009). Carried as `anyhow` context, so it is
+/// found with `anyhow::Error::downcast_ref` rather than by walking `chain()`.
+#[derive(Debug)]
+pub struct RestoreStreamVanished {
+    pub shape: String,
+}
+
+impl std::fmt::Display for RestoreStreamVanished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape {}'s stream vanished after the restore checked it; a retried restore retires it", self.shape)
+    }
+}
+
 /// Is this raw catalog event missing what ADR-0008 requires of it? `Some(detail)` names it.
 ///
 /// Positive-checking the raw JSON rather than trusting the deserializer, exactly like
@@ -621,6 +644,55 @@ fn schema_moved_while_down(rec: &ShapeRecord, compiled: &HashMap<TableRef, Table
         Some(then) => Some(crate::schema::describe_drift(then, now).join("; ")),
         None => Some("the record predates schema fingerprinting".to_string()),
     }
+}
+
+/// A restored record the boot will retire rather than resume, and why (ADR-0009).
+struct Unrestorable {
+    id: String,
+    table: TableRef,
+    stream_path: String,
+    reason: crate::metrics::RestoreRetireReason,
+    detail: String,
+}
+
+/// Is this record beyond resuming on facts the boot already holds? `Some((reason, detail))` if so.
+///
+/// Pure and decided before any IO, because none of these answers can change by waiting. The table
+/// check comes FIRST: [`schema_moved_while_down`] has nothing to compare a missing table against and
+/// answers `None`, and a resume would then fail on the absent schema — deterministically, on every
+/// boot, taking the whole restore down with it. A table leaving the compiled set is ADR-0005's
+/// per-table retirement seen from the boot side, never a reason to refuse the engine.
+///
+/// A projected (or predicate, or aggregate) column that no longer exists needs no check of its own:
+/// the fingerprint lists every column, so dropping one is drift, and a Postgres-mode table always
+/// carries a fingerprint (`pg::introspect_opt`).
+fn unrestorable(
+    rec: &ShapeRecord,
+    compiled: &HashMap<TableRef, TableSchema>,
+) -> Option<(crate::metrics::RestoreRetireReason, String)> {
+    use crate::metrics::RestoreRetireReason as Reason;
+    if !compiled.contains_key(&rec.table) {
+        return Some((
+            Reason::TableGone,
+            "its table is no longer in the compiled set (dropped under a wildcard selector, or no longer selected by \
+             ELECTRIC_CIRCUITS_PG_TABLES)"
+                .to_string(),
+        ));
+    }
+    // DDL while the engine was DOWN is seen by nothing on the live path: no `Relation` message, no
+    // reconciler tick. The record's own fingerprint is the only witness — if it no longer matches
+    // what boot introspected, the retained stream holds rows shaped by the old schema and can never
+    // be brought up to date (ADR-0005).
+    if let Some(what) = schema_moved_while_down(rec, compiled) {
+        return Some((Reason::Schema, format!("its schema changed while the engine was down ({what})")));
+    }
+    // Subquery shapes are registry-served and their inner-node contributor state is not persisted:
+    // a fresh-seeded node cannot detect flips that happened during downtime (stale move-outs would
+    // persist forever), so they are dropped loudly and clients recreate them.
+    if rec.is_subquery {
+        return Some((Reason::Subquery, "subquery inner-node state is not persisted".to_string()));
+    }
+    None
 }
 
 /// Idempotently create the catalog stream, logging a failure only the FIRST time through an outage
@@ -835,6 +907,15 @@ impl CatalogFold {
     }
 }
 
+/// How many restored streams the boot checks at once. Enough that a large catalog is not one round
+/// trip after another, few enough not to be a burst against storage that may itself be coming up.
+const RESTORE_HEAD_CONCURRENCY: usize = 16;
+
+/// Tries each restored stream's `HEAD` gets before a transient failure fails the restore
+/// (`DsClient::head_retrying`: 100, 200, 300, 400 ms apart). More than a join's: nobody is waiting on
+/// a boot the way a client waits on a join, and giving up costs the whole attempt.
+const RESTORE_HEAD_ATTEMPTS: u32 = 5;
+
 /// How much of a folded catalog a boot actually installs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RestoreMode {
@@ -898,12 +979,35 @@ impl Engine {
     /// Install a folded catalog: re-register every restorable shape with the (not yet spawned)
     /// sequencer — see [`CATALOG_STREAM`] for the restore semantics per shape kind — or, in
     /// [`RestoreMode::Park`], record them and stop there.
+    ///
+    /// Resume runs in one order, and the order is the contract (ADR-0009): classify what the boot
+    /// already knows (table gone, schema moved, subquery), `HEAD` every remaining stream, retire
+    /// every record either step condemned, install the rest, resume them into a sequencer that reads
+    /// nothing until all have resumed, then release it. An `Err` means nothing was installed, or
+    /// everything installed was undone — never a partial registry.
     pub(crate) async fn apply_catalog(
         &self,
         fold: CatalogFold,
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        // Resume starts from an engine that holds nothing. The boot gate (`Engine::ensure_booted`)
+        // keeps every create, join and reactivation out until the boot resolves, and a failed attempt
+        // rolls back everything it installed — so a registered shape or a running sequencer here is
+        // not a state to work around: whatever put it there could have consumed or checkpointed
+        // changes the restored shapes need, and resuming over it would hide that. Refused, loudly.
+        if mode == RestoreMode::Resume {
+            let st = self.state.lock().await;
+            if st.sequencer.is_some() || !st.shapes.is_empty() {
+                bail!(
+                    "catalog restore found the engine already holding {} shape(s){} before it installed \
+                     anything; nothing may register a shape or start the sequencer before the restore \
+                     completes, so this is an engine bug — refusing to resume over it",
+                    st.shapes.len(),
+                    if st.sequencer.is_some() { " and a running sequencer" } else { "" }
+                );
+            }
+        }
         // BEFORE anything else, and in both modes: a `Dropped` with no `Retired` is a shape stream a
         // previous process promised to remove and did not (its retirement was refused by storage,
         // or the process died between the two). The engine has already forgotten the shape, so
@@ -952,41 +1056,93 @@ impl Engine {
             return Ok(());
         }
 
-        // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
+        // 2. Decide, before anything is installed, which records are definitively beyond resuming.
+        // Sorted by id, so the log lines, the retirement order and the resume order are the same on
+        // every boot over the same catalog.
+        let mut recs: Vec<(String, Restored)> = recs.into_iter().collect();
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut retire: Vec<Unrestorable> = Vec::new();
+        let mut candidates: Vec<(String, Restored)> = Vec::with_capacity(recs.len());
+        for (id, restored) in recs {
+            // (`next_shape_id` was moved past every id the log ever minted, above.)
+            match unrestorable(&restored.0, compiled) {
+                Some((reason, detail)) => retire.push(Unrestorable {
+                    table: restored.0.table.clone(),
+                    stream_path: restored.0.stream_path.clone(),
+                    id,
+                    reason,
+                    detail,
+                }),
+                None => candidates.push((id, restored)),
+            }
+        }
+
+        // 3. Preflight: vouch for every remaining record's stream, still before installing anything.
+        // A missing stream is an ordinary state rather than an impossible one — a plain or subquery
+        // create enqueues its `Created` before it PUTs the stream (`lifecycle.rs`), so a process
+        // killed between the two leaves a durable record with no stream behind it — and a closed
+        // stream can never be appended to again. Both are definitive answers about THAT shape.
+        // Anything else (transport, 5xx, 429, an unexpected status) that outlasts its retries is no
+        // answer at all: the restore stops here with nothing installed, and the boot retries it or
+        // refuses by name. A missing stream is never recreated — a fresh stream under the old id
+        // would present a new projection as the continuation of the one its subscribers were reading.
+        let heads = self.check_restored_streams(&candidates).await?;
+        let mut install: Vec<(String, Restored)> = Vec::with_capacity(candidates.len());
+        for ((id, restored), head) in candidates.into_iter().zip(heads) {
+            let rec = &restored.0;
+            let gone = match head {
+                None => {
+                    Some((crate::metrics::RestoreRetireReason::StreamMissing, "its stream is missing from storage"))
+                }
+                Some(h) if h.closed => {
+                    Some((crate::metrics::RestoreRetireReason::StreamClosed, "its stream is closed to appends"))
+                }
+                Some(_) => None,
+            };
+            match gone {
+                Some((reason, detail)) => retire.push(Unrestorable {
+                    table: rec.table.clone(),
+                    stream_path: rec.stream_path.clone(),
+                    id,
+                    reason,
+                    detail: detail.to_string(),
+                }),
+                None => install.push((id, restored)),
+            }
+        }
+
+        // 4. Retire the definitively dead, per shape and never whole-engine (ADR-0005): `Dropped`
+        // first, then close-then-delete (ADR-0007) — clients may still be tailing these streams from
+        // before the restart, and the close releases their long-poll at once with `stream-closed`.
+        // None of it waits on the rest of the restore, because none of it depends on it: a shape
+        // whose table is gone stays gone whether or not its neighbours resume. A storage failure
+        // here is not "lost" either — `Dropped` is ordered ahead of the retirement on the writer, a
+        // failed retirement goes to the background queue, and a crash before either lands leaves
+        // the record for the next boot to classify again. Both steps above appended in id order,
+        // but one after the other; one sort makes the whole retirement id-ordered.
+        retire.sort_by(|a, b| a.id.cmp(&b.id));
+        for dead in &retire {
+            tracing::warn!(
+                "restore: retiring shape {} on {} ({}) — {}; subscribers observe the closed stream and recreate",
+                dead.id,
+                dead.table,
+                dead.reason.label(),
+                dead.detail
+            );
+            self.catalog_tx.send(CatalogEvent::Dropped { id: dead.id.clone() });
+            metrics().restore_retired(dead.reason);
+        }
+        for dead in retire {
+            self.retire_shape_stream(&dead.id, &dead.stream_path).await;
+        }
+
+        // 5. Install records + shares + lifecycles. From here to the end it is all or nothing: a
+        // shape that fails to resume undoes every one of these (`roll_back_restore`).
+        let installed: Vec<String> = install.iter().map(|(id, _)| id.clone()).collect();
         let mut resume: Vec<ShapeRecord> = Vec::new();
-        // `(shape id, stream path)`: the id travels with the path because completing a retirement
-        // writes `Retired { id }`.
-        let mut dead_streams: Vec<(String, String)> = Vec::new();
-        {
+        let cmd_tx = {
             let mut st = self.state.lock().await;
-            for (id, (rec, sig, subs, dormant)) in recs {
-                // (`next_shape_id` was moved past every id the log ever minted, above.)
-                // DDL while the engine was DOWN is seen by nothing on the live path: no `Relation`
-                // message, no reconciler tick. The record's own fingerprint is the only witness —
-                // if it no longer matches what boot introspected, the retained stream holds rows
-                // shaped by the old schema and can never be brought up to date (ADR-0005).
-                if let Some(what) = schema_moved_while_down(&rec, compiled) {
-                    tracing::warn!(
-                        "restore: retiring shape {id} on {} — its schema changed while the engine was \
-                         down ({what}); subscribers observe the closed stream and recreate",
-                        rec.table
-                    );
-                    self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    dead_streams.push((id.clone(), rec.stream_path.clone()));
-                    continue;
-                }
-                if rec.is_subquery {
-                    // Subquery shapes are registry-served and their inner-node contributor
-                    // state is not persisted: a fresh-seeded node cannot detect flips that
-                    // happened during downtime (stale move-outs would persist forever), so
-                    // they are dropped loudly and clients recreate them.
-                    tracing::warn!(
-                        "restore: dropping subquery shape {id} (inner-node state is not persisted); subscribers observe the deleted stream and recreate"
-                    );
-                    self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    dead_streams.push((id.clone(), rec.stream_path.clone()));
-                    continue;
-                }
+            for (id, (rec, sig, subs, dormant)) in install {
                 st.shapes.insert(id.clone(), rec.clone());
                 if let Some(sig) = sig {
                     // Restored feeds are live immediately (their streams already hold data).
@@ -1021,49 +1177,135 @@ impl Engine {
                     }
                 }
             }
-            self.ensure_sequencer(&mut st);
-        }
-        // Restored dormant shapes still need the TTL/eviction layers running.
-        self.ensure_retention_sweeper();
-        // Retirement: clients may still be tailing these streams from before the restart, so close
-        // before deleting — their long-poll is released at once with `stream-closed`. A storage
-        // failure here is not "lost": the `Dropped` above is the durable intent, and the retirement
-        // is finished in the background (or by the next boot).
-        for (id, path) in dead_streams {
-            self.retire_shape_stream(&id, &path).await;
-        }
+            // The sequencer is spawned HELD: it serves the registrations below but reads nothing
+            // until every one of them is in. Reading while shapes are still arriving would consume
+            // — and checkpoint past — changes that a shape registered a moment later never sees, and
+            // a restore that then failed could no longer be retried from where it started. There is
+            // no other sequencer to reuse: the check at the top refused one, and the boot gate keeps
+            // anything from spawning one while this runs.
+            let seq = self.spawn_sequencer_task(true);
+            let cmd_tx = seq.cmd_tx.clone();
+            st.sequencer = Some(seq);
+            cmd_tx
+        };
 
-        // 3. Re-register with the sequencer. Plain/routed shapes resume without a backfill and
+        // 6. Re-register with the sequencer. Plain/routed shapes resume without a backfill and
         // with a passthrough gate (`changes_only = true` path): everything after the restored
         // offset replays, and re-emission across the crash window is idempotent. Aggregates
         // re-seed their fold from a fresh snapshot (fresh gate skips the replayed history).
-        let cmd_tx = {
-            let st = self.state.lock().await;
-            st.sequencer.as_ref().expect("sequencer spawned above").cmd_tx.clone()
-        };
-        for rec in resume {
-            let outcome = self.resume_shape(&cmd_tx, &rec, compiled).await;
-            if let Err(e) = outcome {
-                tracing::error!("restore: shape {} failed to resume ({e:#}); dropping it", rec.id);
-                let mut st = self.state.lock().await;
-                st.shapes.remove(&rec.id);
-                self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
-                // The restored subscriptions go with it: an id still claimed by a shape that no
-                // longer exists would refuse its own client's next create with a 409.
-                st.forget_subscriptions(&rec.id);
-                if let Some(share) = st.feed_shares.remove(&rec.id) {
-                    st.feed_by_sig.remove(&share.sig);
-                }
-                drop(st);
-                // Engine-initiated removal, so retire the stream (close, then delete): the shape is
-                // gone, and a client still tailing it from before the restart must learn that rather
-                // than sit on a stream nothing will ever append to again. Never fatal — a storage
-                // hiccup must not abort the restore of the other shapes — and never forgotten: a
-                // failure goes to the retirement queue, which retries it to completion.
-                self.retire_shape_stream(&rec.id, &rec.stream_path).await;
+        //
+        // A failure here is never a reason to drop the shape: every definitive reason was settled
+        // above, so what is left is Postgres or storage having a moment (or a record the engine
+        // cannot compile, which no amount of dropping would explain). The whole restore is undone
+        // and the error goes to the boot, typed, for its retry-or-refuse decision.
+        for rec in &resume {
+            if let Err(e) = self.resume_shape(&cmd_tx, rec, compiled).await {
+                tracing::error!("restore: shape {} failed to resume ({e:#}); undoing the whole restore", rec.id);
+                self.roll_back_restore(&installed, &cmd_tx).await;
+                // Storage confirming the stream gone is not a failure of THIS shape's resume to wait
+                // out, and not a refusal either: the retried attempt's check will retire it.
+                let e = if crate::ds::is_stream_gone(&e) {
+                    e.context(RestoreStreamVanished { shape: rec.id.clone() })
+                } else {
+                    e
+                };
+                return Err(e.context(format!("resuming shape {} on {}", rec.id, rec.table)));
             }
         }
+        // 7. Every shape is in: the sequencer may read.
+        let (done, released) = tokio::sync::oneshot::channel();
+        if cmd_tx.send(SequencerCmd::ReleaseReads { done }).is_err() || released.await.is_err() {
+            self.roll_back_restore(&installed, &cmd_tx).await;
+            bail!("the sequencer stopped before the restored shapes could be released to it");
+        }
+        // Restored dormant shapes need the TTL/eviction layers running. Only now, on success: with
+        // no sequencer the sweep advances the durable checkpoint to the current segment, and between
+        // a rolled-back attempt and its retry there IS no sequencer — a sweeper started earlier could
+        // move the replay start past changes the retried shapes still need.
+        self.ensure_retention_sweeper();
         Ok(())
+    }
+
+    /// `HEAD` every candidate's stream, [`RESTORE_HEAD_CONCURRENCY`] at a time, each retried in place
+    /// through a transient failure ([`RESTORE_HEAD_ATTEMPTS`] tries). The answers come back in
+    /// `candidates` order, so what the caller decides from them — and the order it retires in — does
+    /// not depend on which response happened to arrive first.
+    ///
+    /// Retried in place because the alternative is expensive out of all proportion: a restore that
+    /// fails is a whole boot attempt thrown away (introspection, the fold, the change log, the counts
+    /// re-seed, every other check), and over a large catalog one dropped response per attempt would
+    /// be enough to make no attempt succeed. After the first check that fails for good no new one is
+    /// started; the ones in flight finish, and the error reported is the lowest-ordered failure — the
+    /// same record however the in-flight checks interleave.
+    async fn check_restored_streams(
+        &self,
+        candidates: &[(String, Restored)],
+    ) -> Result<Vec<Option<crate::ds::StreamHead>>> {
+        let mut answers: Vec<Option<Option<crate::ds::StreamHead>>> = vec![None; candidates.len()];
+        let mut failed: Option<(usize, anyhow::Error)> = None;
+        let mut checks = tokio::task::JoinSet::new();
+        let mut next = 0usize;
+        loop {
+            while failed.is_none() && next < candidates.len() && checks.len() < RESTORE_HEAD_CONCURRENCY {
+                let (i, ds, path) = (next, self.ds.clone(), candidates[next].1.0.stream_path.clone());
+                checks.spawn(async move { (i, ds.head_retrying(&path, RESTORE_HEAD_ATTEMPTS).await) });
+                next += 1;
+            }
+            let Some(joined) = checks.join_next().await else { break };
+            let (i, answer) = joined.context("a restore stream check panicked")?;
+            match answer {
+                Ok(head) => answers[i] = Some(head),
+                Err(e) => {
+                    if failed.as_ref().is_none_or(|(first, _)| i < *first) {
+                        failed = Some((i, e));
+                    }
+                }
+            }
+        }
+        if let Some((i, e)) = failed {
+            let (id, (rec, ..)) = &candidates[i];
+            return Err(e.context(format!("checking shape {id}'s stream {} before restoring it", rec.stream_path)));
+        }
+        Ok(answers.into_iter().map(|a| a.expect("every stream check completed")).collect())
+    }
+
+    /// Undo everything one Resume attempt installed (ADR-0009): records, shares and the
+    /// subscriptions they hold, lifecycles, circuit placements, and the sequencer's registrations.
+    /// The retried boot then re-folds the catalog into an engine that holds none of it. The catalog
+    /// needs no undo — installing wrote nothing to it.
+    ///
+    /// The held sequencer is discarded whole, with every registration in it: it never read, so it
+    /// has no position worth keeping, and it captured this attempt's arrangement layer, which the
+    /// retried boot replaces.
+    async fn roll_back_restore(&self, ids: &[String], cmd_tx: &mpsc::UnboundedSender<SequencerCmd>) {
+        let discarded = {
+            let mut st = self.state.lock().await;
+            for id in ids {
+                if st.shapes.remove(id).is_none() {
+                    continue;
+                }
+                // Subscriptions first: `forget_subscriptions` finds them through the share entry.
+                st.forget_subscriptions(id);
+                if let Some(share) = st.feed_shares.remove(id)
+                    && st.feed_by_sig.get(&share.sig) == Some(id)
+                {
+                    st.feed_by_sig.remove(&share.sig);
+                }
+                st.circuit_placement.remove(id);
+            }
+            let mut lives = self.lives.lock().unwrap();
+            for id in ids {
+                lives.remove(id);
+            }
+            drop(lives);
+            st.sequencer.take()
+        };
+        if discarded.is_some() {
+            let (done, stopped) = tokio::sync::oneshot::channel();
+            if cmd_tx.send(SequencerCmd::Discard { done }).is_ok() {
+                let _ = stopped.await;
+            }
+        }
     }
 
     /// Re-register one restored shape with the sequencer (the resume half of `apply_catalog`).
@@ -1102,10 +1344,7 @@ impl Engine {
                                     ready: ready_tx,
                                 })
                                 .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                            ready_rx
-                                .await
-                                .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
-                                .map_err(|e| anyhow::anyhow!(e))?;
+                            ready_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped")))?;
                             self.state.lock().await.circuit_placement.insert(
                                 rec.id.clone(),
                                 CircuitPlacement { label: "counts".into(), col: None, counts: true },
@@ -1156,7 +1395,6 @@ impl Engine {
             ack_rx,
         )
         .await
-        .map_err(|e| anyhow::anyhow!(e))
     }
 }
 
@@ -1167,6 +1405,7 @@ impl Engine {
 /// intent), and a double that returns pre-classified errors would test the test.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1212,6 +1451,23 @@ pub(crate) mod testing {
         retired_release_generation: AtomicU64,
         retired_started: tokio::sync::Notify,
         release_retired: tokio::sync::Notify,
+        /// Remaining `HEAD` calls to answer 503 (transient).
+        fail_heads: AtomicU32,
+        heads: AtomicU64,
+        /// Stream reads. Answered 405 — which the sequencer treats as an error to back off from —
+        /// except a catch-up read of a stream given a page with [`FakeDs::serve_page`].
+        reads: AtomicU64,
+        /// `path -> body`: answered to a non-live read from the start (`offset=-1`) as one page that
+        /// is up to date. Live reads still get 405, so a sequencer never spins on it.
+        pages: Mutex<std::collections::HashMap<String, String>>,
+        /// Answer appends to a stream path with 404 while `HEAD` keeps reporting it present: storage
+        /// (or something in front of it) answering one stream two ways.
+        false_gone: Mutex<HashSet<String>>,
+        /// Streams this storage does not have: `HEAD` answers 404, and so do close and delete (which
+        /// the client counts as done, exactly as against the real server).
+        missing: Mutex<HashSet<String>>,
+        /// Streams that exist but are closed: `HEAD` answers `stream-closed: true`.
+        closed: Mutex<HashSet<String>>,
         events: Mutex<Vec<serde_json::Value>>,
     }
 
@@ -1223,17 +1479,60 @@ pub(crate) mod testing {
     impl FakeDs {
         pub(crate) async fn start() -> FakeDs {
             use axum::extract::State;
+            use axum::response::IntoResponse;
             let state = Arc::new(FakeDsState::default());
             let app = axum::Router::new()
                 .route(
                     "/{*path}",
                     axum::routing::put(|| async { axum::http::StatusCode::OK })
+                        .get(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>,
+                             axum::extract::RawQuery(query): axum::extract::RawQuery| async move {
+                                st.reads.fetch_add(1, Ordering::SeqCst);
+                                let query = query.unwrap_or_default();
+                                let catch_up = query.contains("offset=-1") && !query.contains("live=");
+                                match st.pages.lock().unwrap().get(&path) {
+                                    Some(body) if catch_up => (
+                                        axum::http::StatusCode::OK,
+                                        [("stream-next-offset", "1"), ("stream-up-to-date", "true")],
+                                        body.clone(),
+                                    )
+                                        .into_response(),
+                                    _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                                }
+                            },
+                        )
+                        .head(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>| async move {
+                                st.heads.fetch_add(1, Ordering::SeqCst);
+                                if st
+                                    .fail_heads
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                                }
+                                if st.missing.lock().unwrap().contains(&path) {
+                                    return axum::http::StatusCode::NOT_FOUND.into_response();
+                                }
+                                let closed = if st.closed.lock().unwrap().contains(&path) { "true" } else { "false" };
+                                (axum::http::StatusCode::OK, [("stream-next-offset", "0"), ("stream-closed", closed)])
+                                    .into_response()
+                            },
+                        )
                         .post(
                             |State(st): State<Arc<FakeDsState>>,
                              axum::extract::Path(path): axum::extract::Path<String>,
                              body: String| async move {
                                 if path != "meta/catalog" {
                                     st.closes.fetch_add(1, Ordering::SeqCst);
+                                    if st.missing.lock().unwrap().contains(&path)
+                                        || st.false_gone.lock().unwrap().contains(&path)
+                                    {
+                                        return axum::http::StatusCode::NOT_FOUND;
+                                    }
                                     return axum::http::StatusCode::NO_CONTENT;
                                 }
                                 if st
@@ -1274,33 +1573,39 @@ pub(crate) mod testing {
                                 axum::http::StatusCode::NO_CONTENT
                             },
                         )
-                        .delete(|State(st): State<Arc<FakeDsState>>| async move {
-                            let release_generation = st.delete_release_generation.load(Ordering::SeqCst);
-                            st.deletes.fetch_add(1, Ordering::SeqCst);
-                            st.delete_started.notify_one();
-                            if st.pause_delete_after_start.load(Ordering::SeqCst) {
-                                st.delete_after_start_paused.notify_one();
-                                st.continue_delete_after_start.notified().await;
-                            }
-                            if st.block_deletes.load(Ordering::SeqCst) {
-                                st.delete_blocked.notify_one();
-                                wait_while_blocked(
-                                    &st.block_deletes,
-                                    &st.delete_release_generation,
-                                    release_generation,
-                                    &st.release_delete,
-                                )
-                                .await;
-                            }
-                            if st
-                                .fail_deletes
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                                .is_ok()
-                            {
-                                return axum::http::StatusCode::SERVICE_UNAVAILABLE;
-                            }
-                            axum::http::StatusCode::NO_CONTENT
-                        }),
+                        .delete(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>| async move {
+                                let release_generation = st.delete_release_generation.load(Ordering::SeqCst);
+                                st.deletes.fetch_add(1, Ordering::SeqCst);
+                                if st.missing.lock().unwrap().contains(&path) {
+                                    return axum::http::StatusCode::NOT_FOUND;
+                                }
+                                st.delete_started.notify_one();
+                                if st.pause_delete_after_start.load(Ordering::SeqCst) {
+                                    st.delete_after_start_paused.notify_one();
+                                    st.continue_delete_after_start.notified().await;
+                                }
+                                if st.block_deletes.load(Ordering::SeqCst) {
+                                    st.delete_blocked.notify_one();
+                                    wait_while_blocked(
+                                        &st.block_deletes,
+                                        &st.delete_release_generation,
+                                        release_generation,
+                                        &st.release_delete,
+                                    )
+                                    .await;
+                                }
+                                if st
+                                    .fail_deletes
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                }
+                                axum::http::StatusCode::NO_CONTENT
+                            },
+                        ),
                 )
                 .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1328,6 +1633,39 @@ pub(crate) mod testing {
         /// Answer the next `n` stream deletes with 503.
         pub(crate) fn fail_deletes(&self, n: u32) {
             self.state.fail_deletes.store(n, Ordering::SeqCst);
+        }
+
+        /// Answer the next `n` stream `HEAD`s with 503.
+        pub(crate) fn fail_heads(&self, n: u32) {
+            self.state.fail_heads.store(n, Ordering::SeqCst);
+        }
+
+        /// This storage does not have `path` (404 to `HEAD`, close and delete).
+        pub(crate) fn mark_stream_missing(&self, path: &str) {
+            self.state.missing.lock().unwrap().insert(path.to_string());
+        }
+
+        /// `path` exists but is closed (`HEAD` reports `stream-closed: true`).
+        pub(crate) fn mark_stream_closed(&self, path: &str) {
+            self.state.closed.lock().unwrap().insert(path.to_string());
+        }
+
+        /// Serve `envelopes` as the one catch-up page of `path` (see `FakeDsState::pages`).
+        pub(crate) fn serve_page(&self, path: &str, envelopes: serde_json::Value) {
+            self.state.pages.lock().unwrap().insert(path.to_string(), envelopes.to_string());
+        }
+
+        /// Answer appends to `path` with 404 while `HEAD` still reports it present and open.
+        pub(crate) fn answer_appends_gone(&self, path: &str) {
+            self.state.false_gone.lock().unwrap().insert(path.to_string());
+        }
+
+        pub(crate) fn heads(&self) -> u64 {
+            self.state.heads.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn reads(&self) -> u64 {
+            self.state.reads.load(Ordering::SeqCst)
         }
 
         pub(crate) fn block_deletes(&self, block: bool) {
@@ -2020,14 +2358,507 @@ mod tests {
             },
             CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
         ]);
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
-        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        // A storage server behind it: the restore vouches for the stream before installing it.
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
+        engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.unwrap();
         let st = engine.state.lock().await;
         let share = st.feed_shares.get("s1").expect("the restored share entry");
         assert_eq!(share.subs.get("sub-a"), Some(&1000), "the creator's lease age survives the restart");
         assert_eq!(share.subs.get("sub-b"), Some(&2000));
         assert_eq!(share.refcount(), 2);
         assert_eq!(st.subscription_owner("sub-b"), Some(&"s1".to_string()), "the id index is restored too");
+    }
+
+    // --- restore: fail closed, retire only the definitively gone (ADR-0009) ----------------------
+
+    /// `public.users`, compiled the way library mode compiles it — no fingerprint, so these tests
+    /// exercise the table, stream and resume halves of the restore rather than the schema check.
+    fn users_compiled() -> HashMap<TableRef, TableSchema> {
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "tables": { "users": { "columns": { "id": {"type":"int"}, "name": {"type":"text"} }, "primaryKey": "id" } }
+        }))
+        .unwrap();
+        compile_schema(&schema).unwrap()
+    }
+
+    fn users() -> TableRef {
+        TableRef::parse("public.users").unwrap()
+    }
+
+    /// An engine whose schema holders both carry `public.users`, as `setup_postgres` leaves them
+    /// before the restore — the sequencer resolves a restored shape's table through them.
+    async fn restoring(engine: Engine) -> Engine {
+        *engine.tables_shared.write().unwrap() = users_compiled();
+        engine.state.lock().await.tables = users_compiled();
+        engine
+    }
+
+    /// A plain shape `id` on `table` with its own sharing signature, created by `sub-<id>`.
+    fn shape(id: &str, table: &str) -> CatalogEvent {
+        let mut ev = created_event(table);
+        ev["rec"]["id"] = serde_json::json!(id);
+        ev["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
+        ev["sig"] = serde_json::json!(format!("sig-{id}"));
+        ev["subscription"] = serde_json::json!(format!("sub-{id}"));
+        serde_json::from_value(ev).unwrap()
+    }
+
+    /// A `COUNT(*)` aggregate `id` on `table` — the shape kind whose resume re-seeds from Postgres.
+    fn count_of(id: &str, table: &str) -> CatalogEvent {
+        let mut ev = serde_json::to_value(shape(id, table)).unwrap();
+        ev["rec"]["aggregate"] = serde_json::json!({ "func": "count", "col": null });
+        serde_json::from_value(ev).unwrap()
+    }
+
+    fn dormant(id: &str) -> CatalogEvent {
+        CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate: crate::pg::SnapshotGate::passthrough() }
+    }
+
+    /// A catalog over `events` that has also checkpointed, so it has something to install.
+    fn catalog(mut events: Vec<CatalogEvent>) -> CatalogFold {
+        events.push(CatalogEvent::Offset { pos: pos(0, "10"), highwater: None });
+        fold_of(events)
+    }
+
+    /// The catalog events that landed for one shape, by kind, in order.
+    fn kinds_for(server: &FakeDs, id: &str) -> Vec<String> {
+        server
+            .catalog_events()
+            .iter()
+            .filter(|e| e["id"] == id || e["rec"]["id"] == id)
+            .map(|e| e["t"].as_str().unwrap_or("?").to_string())
+            .collect()
+    }
+
+    fn shape_ids(st: &EngineState) -> Vec<String> {
+        let mut ids: Vec<String> = st.shapes.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// What a rolled-back (or never-started) restore must leave: no trace of any record.
+    async fn assert_nothing_installed(engine: &Engine) {
+        let st = engine.state.lock().await;
+        assert!(st.shapes.is_empty(), "records: {:?}", shape_ids(&st));
+        assert!(st.feed_shares.is_empty() && st.feed_by_sig.is_empty(), "shares survived the rollback");
+        assert!(st.subs_by_id.is_empty(), "subscriptions survived the rollback: {:?}", st.subs_by_id);
+        assert!(st.circuit_placement.is_empty(), "circuit placements survived the rollback");
+        assert!(st.sequencer.is_none(), "the restore's sequencer survived the rollback");
+        drop(st);
+        assert!(engine.lives.lock().unwrap().is_empty(), "lifecycles survived the rollback");
+    }
+
+    /// A stream storage no longer has is a definitive answer about THAT shape: it is retired —
+    /// `Dropped`, close-then-delete, `Retired` — and every other record restores around it, with its
+    /// share, its subscriptions and its routing. Nothing recreates the missing stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_a_shape_whose_stream_is_missing_and_restores_the_others() {
+        use crate::metrics::RestoreRetireReason;
+        let server = FakeDs::start().await;
+        server.mark_stream_missing("shape/s2");
+        let counter = &metrics().catalog_restore_retired[RestoreRetireReason::StreamMissing as usize];
+        let before = counter.load(Ordering::SeqCst);
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let fold = catalog(vec![
+            shape("s1", "public.users"),
+            shape("s2", "public.users"),
+            shape("s3", "public.users"),
+            dormant("s3"),
+        ]);
+        engine
+            .apply_catalog(fold, &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect("a missing stream retires its shape; it does not fail the restore");
+
+        let st = engine.state.lock().await;
+        assert_eq!(shape_ids(&st), ["s1", "s3"]);
+        assert!(st.feed_shares.contains_key("s1") && st.feed_shares.contains_key("s3"));
+        assert_eq!(st.subscription_owner("sub-s1"), Some(&"s1".to_string()));
+        assert_eq!(st.subscription_owner("sub-s2"), None, "the retired shape's subscription is not restored");
+        drop(st);
+        assert!(engine.table_stats(&users()).await.is_some(), "the active survivor is registered with the sequencer");
+
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(kinds_for(&server, "s2"), ["dropped", "retired"], "intent, then completion");
+        assert!(kinds_for(&server, "s1").is_empty() && kinds_for(&server, "s3").is_empty());
+        assert_eq!(server.deletes(), 1, "exactly the missing stream takes the (404-tolerant) delete");
+        assert!(counter.load(Ordering::SeqCst) > before, "the retirement is counted by reason");
+    }
+
+    /// A CLOSED stream is the same definitive answer: nothing can ever be appended to it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_a_shape_whose_stream_is_closed_and_restores_the_others() {
+        let server = FakeDs::start().await;
+        server.mark_stream_closed("shape/s2");
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let fold = catalog(vec![shape("s1", "public.users"), shape("s2", "public.users")]);
+        engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.expect("the closed one is retired");
+
+        assert_eq!(shape_ids(&*engine.state.lock().await), ["s1"]);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(kinds_for(&server, "s2"), ["dropped", "retired"]);
+        assert_eq!(server.deletes(), 1);
+    }
+
+    /// A record whose TABLE left the compiled set — dropped while the engine was down, or no longer
+    /// selected — is ADR-0005's per-table retirement seen from the boot. Left to the resume it would
+    /// fail on the missing schema on every boot and take every healthy shape down with it, so it is
+    /// decided first, before its stream is even asked about.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_a_shape_whose_table_is_gone_and_restores_the_others() {
+        let server = FakeDs::start().await;
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let fold = catalog(vec![shape("s1", "public.users"), shape("s2", "public.gone")]);
+        engine
+            .apply_catalog(fold, &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect("a gone table retires its shapes, never the whole restore");
+
+        assert_eq!(shape_ids(&*engine.state.lock().await), ["s1"]);
+        assert!(engine.table_stats(&users()).await.is_some(), "the other table's shape resumed");
+        assert_eq!(server.heads(), 1, "only the resumable record's stream is checked");
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(kinds_for(&server, "s2"), ["dropped", "retired"]);
+        assert_eq!(server.deletes(), 1);
+    }
+
+    /// A `HEAD` storage cannot answer for its whole retry budget is no answer: the restore stops
+    /// before installing anything — not even the retirement the gone table already earned is
+    /// recorded — and the error reaches the boot as the retryable thing it is. The retry, over the
+    /// same catalog, starts clean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_head_that_stays_unanswered_fails_the_restore_with_nothing_installed() {
+        let server = FakeDs::start().await;
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let events = || {
+            catalog(vec![
+                shape("s1", "public.users"),
+                shape("s2", "public.users"),
+                dormant("s2"),
+                shape("s3", "public.gone"),
+            ])
+        };
+        server.fail_heads(u32::MAX);
+        let err = engine
+            .apply_catalog(events(), &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect_err("an unanswered HEAD must fail the restore, not be read as 'missing'");
+        // Both checks fail; the lowest-ordered one is reported, however the two interleaved.
+        assert!(format!("{err:#}").contains("shape s1's stream"), "the error names the first shape: {err:#}");
+        assert!(crate::ds::is_unavailable(&err), "{err:#}");
+        assert_eq!(crate::pg::boot_disposition(&err), crate::pg::BootFailure::Retryable);
+        assert_nothing_installed(&engine).await;
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert!(server.catalog_events().is_empty(), "nothing reached the catalog: {:?}", server.catalog_kinds());
+        assert_eq!(server.deletes(), 0);
+
+        server.fail_heads(0);
+        engine.apply_catalog(events(), &users_compiled(), RestoreMode::Resume).await.expect("the retry restores");
+        let st = engine.state.lock().await;
+        assert_eq!(shape_ids(&st), ["s1", "s2"]);
+        assert_eq!(st.subscription_owner("sub-s2"), Some(&"s2".to_string()));
+        assert!(st.sequencer.is_some());
+        drop(st);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(kinds_for(&server, "s3"), ["dropped", "retired"]);
+    }
+
+    /// ...but ONE dropped response is not that: a transient `HEAD` failure is retried in place, so it
+    /// costs a moment rather than the whole boot attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transient_head_failure_is_retried_in_place() {
+        let server = FakeDs::start().await;
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        server.fail_heads(2);
+        let fold = catalog(vec![shape("s1", "public.users"), shape("s2", "public.users")]);
+        engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.expect("the retries land");
+        assert_eq!(shape_ids(&*engine.state.lock().await), ["s1", "s2"]);
+        assert_eq!(server.heads(), 4, "two checks, two of their attempts answered 503");
+    }
+
+    /// The checks run concurrently, but nothing decided from them depends on which answer arrived
+    /// first: over a catalog wider than the concurrency bound, the retirements are recorded in id
+    /// order and exactly the shapes whose streams are there are installed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_stream_checks_retire_in_id_order() {
+        let server = FakeDs::start().await;
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let ids: Vec<String> = (100..140).map(|n| format!("s{n}")).collect();
+        // Streams missing on ...3 and ...7, and one record whose TABLE is gone in between: the
+        // classification step condemns that one before any stream is checked, and it must still
+        // land in id order among the others.
+        let table_gone = "s125".to_string();
+        let mut gone: Vec<String> = ids.iter().filter(|id| id.ends_with('3') || id.ends_with('7')).cloned().collect();
+        for id in &gone {
+            server.mark_stream_missing(&format!("shape/{id}"));
+        }
+        gone.push(table_gone.clone());
+        gone.sort();
+        let fold = catalog(
+            ids.iter()
+                .flat_map(|id| {
+                    let table = if *id == table_gone { "public.gone" } else { "public.users" };
+                    [shape(id, table), dormant(id)]
+                })
+                .collect(),
+        );
+        engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.unwrap();
+
+        let kept: Vec<String> = ids.iter().filter(|id| !gone.contains(id)).cloned().collect();
+        assert_eq!(shape_ids(&*engine.state.lock().await), kept);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        let dropped: Vec<String> = server
+            .catalog_events()
+            .iter()
+            .filter(|e| e["t"] == "dropped")
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(dropped, gone, "retirement intents are recorded in id order, whichever step condemned them");
+        assert_eq!(server.heads(), ids.len() as u64 - 1, "the gone table's record is never checked");
+    }
+
+    /// Resume starts from an engine that holds nothing — the boot gate keeps every create, join and
+    /// reactivation out until the boot resolves, and a failed attempt undoes what it installed. A
+    /// running sequencer, or a registered shape, is refused as the engine bug it is, before a single
+    /// stream is checked: resuming over it would hide whatever it consumed or checkpointed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resuming_over_an_engine_that_already_holds_state_is_refused() {
+        let server = FakeDs::start().await;
+        let running = restoring(Engine::new(DsClient::new(server.url()))).await;
+        running.ensure_sequencer(&mut *running.state.lock().await);
+        let err = running
+            .apply_catalog(catalog(vec![shape("s1", "public.users")]), &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect_err("a sequencer already running is not something to restore into");
+        assert!(format!("{err:#}").contains("running sequencer"), "{err:#}");
+        assert_eq!(crate::pg::boot_disposition(&err), crate::pg::BootFailure::Fatal);
+
+        let registered = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let CatalogEvent::Created { rec, .. } = shape("s9", "public.users") else { unreachable!() };
+        registered.state.lock().await.shapes.insert(rec.id.clone(), rec);
+        let err = registered
+            .apply_catalog(catalog(vec![shape("s1", "public.users")]), &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect_err("a shape already registered is not something to restore over");
+        assert!(format!("{err:#}").contains("1 shape(s)"), "{err:#}");
+        assert_eq!(server.heads(), 0, "refused before any stream is checked");
+    }
+
+    /// A stream that passed the check and is gone by the time the resume writes to it: storage's
+    /// answer is definitive, but the restore is past the point of retiring one shape, so it fails —
+    /// and the boot retries rather than refusing, because the retry's check retires the shape. The
+    /// same gone stream anywhere else in the boot stays the answer it is.
+    #[test]
+    fn a_stream_that_vanishes_mid_restore_is_retried_at_boot() {
+        let gone = || anyhow::Error::new(crate::ds::StreamGone { path: "shape/s1".into(), status: 404 });
+        let vanished = gone()
+            .context("append initial aggregate")
+            .context(RestoreStreamVanished { shape: "s1".into() })
+            .context("resuming shape s1 on public.users")
+            .context("restoring the durable shape catalog");
+        assert_eq!(crate::pg::boot_disposition(&vanished), crate::pg::BootFailure::Retryable);
+        assert!(format!("{vanished:#}").contains("vanished after the restore checked it"), "{vanished:#}");
+        assert_eq!(crate::pg::boot_disposition(&gone().context("reading meta/catalog")), crate::pg::BootFailure::Fatal);
+    }
+
+    /// `append_retrying`'s errors stay typed: a stream storage confirms gone is a `StreamGone` the
+    /// restore can recognise, and a terminal answer its `HEAD` could not confirm keeps the `HEAD`'s
+    /// own unavailability, so an exhausted budget during a re-seed retries the boot instead of
+    /// refusing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_retrying_keeps_its_errors_typed() {
+        let envs: Vec<crate::ds::Envelope> = vec![
+            serde_json::from_value(
+                serde_json::json!({ "type": "public.users", "key": "1", "headers": { "operation": "insert" } }),
+            )
+            .unwrap(),
+        ];
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let budget = std::time::Duration::from_millis(300);
+
+        let server = FakeDs::start().await;
+        server.mark_stream_missing("shape/s1");
+        let ds = DsClient::new(server.url());
+        let err = ds.append_retrying("shape/s1", &envs, budget, &shutdown).await.expect_err("the stream is gone");
+        assert!(crate::ds::is_stream_gone(&err), "{err:#}");
+
+        server.fail_heads(u32::MAX);
+        let err = ds.append_retrying("shape/s1", &envs, budget, &shutdown).await.expect_err("storage never confirms");
+        assert!(crate::ds::is_unavailable(&err), "the HEAD's unavailability survives the budget: {err:#}");
+        assert_eq!(crate::pg::boot_disposition(&err), crate::pg::BootFailure::Retryable);
+
+        // An append answered "gone" for a stream its HEAD keeps finding: retried, retryable at boot,
+        // and named for what it is rather than as an unreachable server.
+        let inconsistent = FakeDs::start().await;
+        inconsistent.answer_appends_gone("shape/s2");
+        let err = DsClient::new(inconsistent.url())
+            .append_retrying("shape/s2", &envs, budget, &shutdown)
+            .await
+            .expect_err("the contradiction never resolves");
+        assert!(crate::ds::is_inconsistent(&err), "{err:#}");
+        assert!(!crate::ds::is_unavailable(&err), "the server is answering, just not consistently: {err:#}");
+        assert_eq!(crate::pg::boot_disposition(&err), crate::pg::BootFailure::Retryable);
+        assert_eq!(crate::pg::boot_failure_name(&err), "durable-streams answers a stream inconsistently");
+    }
+
+    /// A dormant shape whose OWN stream storage lost while it slept: the touch that reactivates it
+    /// finds nothing to append its replay to, and the shape is retired — `Dropped`, close-then-delete
+    /// — rather than parked back to fail the same way on every touch. The runtime form of the boot's
+    /// `stream_missing`, told apart from a gone change-log segment by the stream that is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reactivating_a_shape_whose_own_stream_is_gone_retires_it() {
+        let server = FakeDs::start().await;
+        let engine = restoring(Engine::new(DsClient::new(server.url()))).await;
+        let parked = CatalogEvent::Dormant {
+            id: "s1".to_string(),
+            resume: LogPosition::start(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+        };
+        engine
+            .apply_catalog(catalog(vec![shape("s1", "public.users"), parked]), &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect("the stream is there at boot");
+        assert_eq!(engine.shape_lifecycle("s1").await, Some("dormant"));
+
+        // While it is dormant, storage loses the stream; the change log holds a change to replay.
+        server.mark_stream_missing("shape/s1");
+        server.serve_page(
+            &crate::changelog::segment_path(0),
+            serde_json::json!([{ "type": "public.users", "key": "1", "value": { "id": 1, "name": "a" }, "headers": { "operation": "insert" } }]),
+        );
+        let err = engine.ensure_active("s1").await.expect_err("there is nothing to reactivate onto");
+        assert!(format!("{err:#}").contains("reactivation failed"), "{err:#}");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while engine.get_shape("s1").await.is_some() {
+            assert!(std::time::Instant::now() < deadline, "the shape was never retired");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(kinds_for(&server, "s1"), ["dropped", "retired"], "retired, intent then completion");
+    }
+
+    /// `setup_postgres` runs once to success. A second call after one would put the boot phase back
+    /// to `waiting` — closing the boot gate on a serving engine — and restore the catalog over the
+    /// shapes it already restored; it is refused before it touches anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_setup_postgres_after_success_is_refused_untouched() {
+        let engine = Engine::new_pg(DsClient::new("http://127.0.0.1:1"), "postgres://u@127.0.0.1:1/db".to_string());
+        engine.health.store(HEALTH_ACTIVE, Ordering::Relaxed);
+        engine.replicator_started.store(true, Ordering::SeqCst);
+        let err = engine.setup_postgres(&[], "slot").await.expect_err("a completed boot is not re-run");
+        assert!(format!("{err:#}").contains("already completed"), "{err:#}");
+        assert!(engine.ensure_booted().is_ok(), "the refusal left the boot phase alone");
+    }
+
+    /// `POST /schema`'s engine half refuses a Postgres-mode engine outright — before it creates a
+    /// segment, records a rotation, replaces the tables or spawns a sequencer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn define_schema_is_refused_in_postgres_mode() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new_pg(DsClient::new(server.url()), "postgres://u@127.0.0.1:1/db".to_string());
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "tables": { "users": { "columns": { "id": {"type":"int"} }, "primaryKey": "id" } }
+        }))
+        .unwrap();
+        let err = engine.define_schema(&schema).await.expect_err("Postgres owns this engine's schema");
+        assert!(err.downcast_ref::<crate::engine::SchemaIsPostgres>().is_some(), "{err:#}");
+        let st = engine.state.lock().await;
+        assert!(st.tables.is_empty() && st.sequencer.is_none(), "nothing was installed");
+        drop(st);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(5)).await);
+        assert!(server.catalog_kinds().is_empty(), "no rotation was recorded: {:?}", server.catalog_kinds());
+        assert_eq!(server.reads() + server.heads(), 0, "storage was not touched");
+    }
+
+    /// A resume that fails on something that may clear by itself — here Postgres refusing the
+    /// connection an aggregate re-seeds through — used to drop that shape and retire its stream,
+    /// throwing an acknowledged subscription away over a blip. Now the whole restore is undone: the
+    /// shape that had already resumed leaves with its sequencer, nothing reaches the catalog (not
+    /// even a checkpoint — the held sequencer never read), and the error reaches the boot typed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transient_resume_failure_undoes_the_whole_restore() {
+        let server = FakeDs::start().await;
+        // Nothing listens on port 1: the aggregate's re-seed is refused at connect.
+        let engine =
+            restoring(Engine::new_pg(DsClient::new(server.url()), "postgres://u@127.0.0.1:1/db".to_string())).await;
+        let fold = catalog(vec![
+            shape("s1", "public.users"),
+            shape("s2", "public.users"),
+            dormant("s2"),
+            count_of("s3", "public.users"),
+        ]);
+        let err = engine
+            .apply_catalog(fold, &users_compiled(), RestoreMode::Resume)
+            .await
+            .expect_err("a resume failure fails the restore");
+        assert!(format!("{err:#}").contains("s3"), "the error names the shape: {err:#}");
+        assert_eq!(
+            crate::pg::boot_disposition(&err),
+            crate::pg::BootFailure::Retryable,
+            "a refused Postgres connection must reach the boot typed, not as a string: {err:#}"
+        );
+        assert_nothing_installed(&engine).await;
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert!(server.catalog_events().is_empty(), "nothing reached the catalog: {:?}", server.catalog_kinds());
+        assert_eq!(server.deletes(), 0, "no healthy shape's stream was retired over a transient failure");
+
+        // The retried boot restores into a clean engine (Postgres is still away, so without the
+        // aggregate): a fresh sequencer, and the survivors registered with it.
+        let fold = catalog(vec![shape("s1", "public.users"), shape("s2", "public.users"), dormant("s2")]);
+        engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.expect("the retry restores");
+        assert_eq!(shape_ids(&*engine.state.lock().await), ["s1", "s2"]);
+        assert!(engine.table_stats(&users()).await.is_some());
+    }
+
+    /// Park (a broken epoch) installs records only for the reset to retire, so it asks storage
+    /// nothing — not even about a stream storage no longer has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parking_a_broken_epoch_checks_no_streams() {
+        let server = FakeDs::start().await;
+        server.mark_stream_missing("shape/s1");
+        let engine = Engine::new(DsClient::new(server.url()));
+        engine
+            .apply_catalog(catalog(vec![shape("s1", "public.users")]), &HashMap::new(), RestoreMode::Park)
+            .await
+            .unwrap();
+        assert_eq!(server.heads(), 0);
+        assert_eq!(shape_ids(&*engine.state.lock().await), ["s1"], "parked, missing stream or not");
+    }
+
+    /// The hold the restore relies on: a sequencer spawned held reads nothing until released, and
+    /// one discarded while still held exits without leaving a checkpoint behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_sequencer_reads_nothing_until_released_and_a_discarded_one_writes_no_checkpoint() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
+
+        let held = engine.spawn_sequencer_task(true);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(server.reads(), 0, "a held sequencer must not touch the change log");
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        held.cmd_tx.send(SequencerCmd::Discard { done }).unwrap_or_else(|_| panic!("the sequencer is running"));
+        stopped.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), held.cmd_tx.closed())
+            .await
+            .expect("the discarded sequencer exits");
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(5)).await);
+        assert!(server.catalog_kinds().is_empty(), "no checkpoint: {:?}", server.catalog_kinds());
+        assert_eq!(server.reads(), 0);
+
+        let released = engine.spawn_sequencer_task(true);
+        let (done, acked) = tokio::sync::oneshot::channel();
+        released
+            .cmd_tx
+            .send(SequencerCmd::ReleaseReads { done })
+            .unwrap_or_else(|_| panic!("the sequencer is running"));
+        acked.await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while server.reads() == 0 {
+            assert!(std::time::Instant::now() < deadline, "a released sequencer never read the change log");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[test]

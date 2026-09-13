@@ -31,6 +31,8 @@ interface AppendFault {
   headArmed?: boolean
   headStatus?: number
   headHits?: number
+  /** Answer this many further `HEAD`s on `/shape/*` with `headStatus`, one after another. */
+  headFailures?: number
 }
 
 function oneShotShapeAppendProxy(fault: AppendFault) {
@@ -38,8 +40,10 @@ function oneShotShapeAppendProxy(fault: AppendFault) {
     const upstream = new URL(upstreamUrl)
     const server = createServer((incoming, outgoing) => {
       const target = new URL(incoming.url ?? '/', upstream)
-      if (fault.headArmed && incoming.method === 'HEAD' && target.pathname.startsWith('/shape/')) {
-        fault.headArmed = false
+      const failHead = fault.headArmed || (fault.headFailures ?? 0) > 0
+      if (failHead && incoming.method === 'HEAD' && target.pathname.startsWith('/shape/')) {
+        if (fault.headArmed) fault.headArmed = false
+        else fault.headFailures = (fault.headFailures ?? 0) - 1
         fault.headHits = (fault.headHits ?? 0) + 1
         incoming.resume()
         outgoing.writeHead(fault.headStatus ?? 503, { 'content-type': 'text/plain' })
@@ -130,6 +134,55 @@ describe('native shape storage loss', () => {
     expect(fault.headHits).toBe(1)
     expect(replacement.shapeId).not.toBe(first.shapeId)
     expect((await fetch(replacement.streamUrl)).status).toBe(200)
+  })
+
+  it('retries the boot when storage cannot answer for a restored stream, instead of serving without the shape', async () => {
+    const fault: AppendFault = { armed: false, status: 503, hits: 0 }
+    h = await bootHarness(schema, { wrapEngineDs: oneShotShapeAppendProxy(fault) })
+    const shape = await createShape(h, { table: 'items' })
+
+    // The restore vouches for every retained stream before installing anything (ADR-0009). Each check
+    // is retried in place (5 tries), so it takes storage failing all of them to fail the attempt. An
+    // unanswered HEAD is not "missing" — reading it that way would retire a healthy shape — and it
+    // is not something to boot past either, which would serve a registry without the shape while
+    // its subscribers read a stream nothing maintains. The attempt is undone and the boot retries.
+    fault.headFailures = 5
+    fault.headStatus = 503
+    await h.restartEngine()
+    expect(fault.headHits, 'every in-place retry of the one check was spent').toBe(5)
+    const log = h.engineStderr()
+    expect(log).toContain('restoring the durable shape catalog')
+    expect(log).toContain('retrying in')
+    expect(log).not.toContain('boot refused')
+
+    expect((await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status).toBe(200)
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (1, $1)', ['after'])
+    await drainEngine(h)
+    expect((await foldStream(shape.streamUrl)).has('1'), 'the shape restored by the retry is maintained').toBe(true)
+  })
+
+  it('retires a restored shape whose stream vanished while the engine was down, and restores the others', async () => {
+    h = await bootHarness(schema)
+    const lost = await createShape(h, { table: 'items' })
+    const kept = await createShape(h, { table: 'items', where: { col: 'id', op: 'gte', value: 0 } })
+    expect(kept.shapeId).not.toBe(lost.shapeId)
+
+    // Storage loses one stream while no engine runs. That is a definitive answer about that one
+    // shape (ADR-0009): the boot retires it, rather than refusing the whole engine or resuming a
+    // shape whose every append would be answered 404.
+    await h.restartEngine(async () => {
+      expect((await fetch(lost.streamUrl, { method: 'DELETE' })).ok).toBe(true)
+    })
+
+    expect((await fetch(`${h.engineUrl}/shapes/${lost.shapeId}`)).status).toBe(404)
+    expect((await fetch(lost.streamUrl)).status, 'a missing stream is never recreated').toBe(404)
+    expect((await fetch(`${h.engineUrl}/shapes/${kept.shapeId}`)).status).toBe(200)
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (2, $1)', ['after'])
+    await drainEngine(h)
+    expect((await foldStream(kept.streamUrl)).has('2'), 'the other shape restored and is maintained').toBe(true)
+
+    const metrics = (await (await fetch(`${h.engineUrl}/metrics`)).json()) as { counters: Record<string, number> }
+    expect(metrics.counters.catalog_restore_retired_stream_missing_total).toBe(1)
   })
 
   it('does not retire an acknowledged aggregate after one transient append failure during restore', async () => {
