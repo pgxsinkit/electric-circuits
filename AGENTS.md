@@ -255,8 +255,10 @@ canvas update, screenshot.
   lower — a reconnect re-delivers complete commits ahead of the interrupted one), and a page that
   completes one held run and starts another must **re-pin to its own page**, or the checkpoint
   freezes for the whole catch-up. If you add a producer, stamp the marker; if you add a change-log
-  reader that cares about transactions, hold like the sequencer does. The ingest-side ack (`update_applied_lsn`), `last_lsn` and the drain-barrier sentinel come
-  **only after the last chunk landed** — never from inside the chunk loop.
+  reader that cares about transactions, hold like the sequencer does. A transaction's ingest-side
+  ack (`update_applied_lsn`), `last_lsn` and the drain-barrier sentinel come **only after the last
+  chunk landed** — never from inside the chunk loop. Between decoded transactions, a server
+  keepalive may advance only `update_applied_lsn`; it never publishes `last_lsn` or the sentinel.
 - **The sequencer's de-dup highwater is checkpointed with its position** (`Offset { pos, highwater }`),
   and written whenever **either** moves — while a hold pins the position, the highwater still advances
   on the transactions completed before it. A crash can leave a prefix of a chunked commit applied and

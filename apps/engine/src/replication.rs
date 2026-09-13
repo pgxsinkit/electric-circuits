@@ -10,11 +10,14 @@
 //!
 //! Delivery is append-then-acknowledge: a transaction's changes are buffered between `Begin` and
 //! `Commit`, appended to durable-streams, and only then acknowledged to Postgres
-//! (`update_applied_lsn` → the slot's `confirmed_flush_lsn`). A failed append tears the
-//! replication connection down instead of acknowledging; on reconnect the server resends from the
-//! confirmed position, so nothing is lost. (Acknowledgements are flushed on an interval, so a
-//! crash can re-deliver whole transactions. Delivery is therefore at-least-once; the sequencer
-//! restores exactly-once effect by de-duplicating on the stamped `(lsn, seq)`.)
+//! (`update_applied_lsn` → the slot's `confirmed_flush_lsn`). Between transactions, a server
+//! keepalive is also safe to acknowledge: its WAL end cannot cover buffered changes, and advancing
+//! it prevents an otherwise-idle database from retaining WAL forever. A keepalive received while a
+//! transaction is buffered is deliberately not acknowledged. A failed append tears the replication
+//! connection down instead of acknowledging; on reconnect the server resends from the confirmed
+//! position, so nothing is lost. (Acknowledgements are flushed on an interval, so a crash can
+//! re-deliver whole transactions. Delivery is therefore at-least-once; the sequencer restores
+//! exactly-once effect by de-duplicating on the stamped `(lsn, seq)`.)
 //!
 //! **Large transactions do not have to fit in memory** (ADR-0003). The buffer between `Begin` and
 //! `Commit` is a [`TxnBuffer`]: past `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` it spills to a local
@@ -356,6 +359,13 @@ enum StreamEnd {
     ShuttingDown,
 }
 
+/// A keepalive may advance the slot only at the same safe point where shutdown may stop ingest:
+/// between transactions. During a transaction, its WAL end could move past changes which have not
+/// reached durable-streams yet, so the commit path remains their only acknowledgement.
+fn keepalive_ack_lsn(transaction_open: bool, wal_end: pgwire_replication::Lsn) -> Option<pgwire_replication::Lsn> {
+    (!transaction_open).then_some(wal_end)
+}
+
 /// Build the walsender connection config from a `postgres://` URL. TLS is disabled — parity with
 /// the engine's other connections (`pg::connect` uses `NoTls`).
 fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<ReplicationConfig> {
@@ -554,9 +564,12 @@ async fn stream_loop(
                 // the run stays ordered and complete.
                 log.maybe_rotate().await;
             }
-            ReplicationEvent::KeepAlive { .. }
-            | ReplicationEvent::Message { .. }
-            | ReplicationEvent::StoppedAt { .. } => {}
+            ReplicationEvent::KeepAlive { wal_end, .. } => {
+                if let Some(ack_lsn) = keepalive_ack_lsn(txn.is_some(), wal_end) {
+                    client.update_applied_lsn(ack_lsn);
+                }
+            }
+            ReplicationEvent::Message { .. } | ReplicationEvent::StoppedAt { .. } => {}
         }
     }
 }
@@ -1324,6 +1337,23 @@ mod tests {
         // A truncate that hits ONLY untracked relations reports nothing at all.
         d.on_truncate(&[2, 9], ev.as_ref(), None).await;
         assert_eq!(ev.truncates.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod replication_progress_tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_advances_the_slot_between_transactions() {
+        let wal_end = pgwire_replication::Lsn::from_u64(42);
+        assert_eq!(keepalive_ack_lsn(false, wal_end), Some(wal_end));
+    }
+
+    #[test]
+    fn keepalive_does_not_acknowledge_a_buffered_transaction() {
+        let wal_end = pgwire_replication::Lsn::from_u64(42);
+        assert_eq!(keepalive_ack_lsn(true, wal_end), None);
     }
 }
 

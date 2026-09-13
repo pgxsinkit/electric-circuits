@@ -467,6 +467,11 @@ The three replication-slot gauges are sampled every ~10 s by an **engine-owned**
 **pooled** connection (never a dedicated one), and the same sample feeds StatsD — so the numbers are
 there with or without `ELECTRIC_STATSD_HOST`.
 
+The replication client acknowledges a server keepalive's WAL end only while it is between
+transactions. This releases forced/archived WAL during otherwise-idle periods without weakening the
+append-before-ack rule: a keepalive observed while a transaction is buffered cannot advance the
+slot, and the commit is still acknowledged only after its final durable-streams chunk lands.
+
 ## The change log
 
 Every committed change to every tracked table rides one ordered log, which the ingestor appends to

@@ -138,6 +138,14 @@ Each transaction's changes are buffered between `Begin` and `Commit`, stamped wi
 acknowledged to Postgres (`confirmed_flush_lsn`) — a failed append tears the connection down
 unacknowledged, and the server resends from the confirmed position.
 
+When there is no open transaction, the ingestor also acknowledges the WAL end carried by a server
+keepalive. Postgres decides whether a transaction must be replayed from its commit record, so this
+position may pass WAL written by a still-uncommitted transaction without skipping that transaction
+if it commits later. A keepalive received after the decoder emits `Begin` and before it emits
+`Commit` is not acknowledged — the commit's last durable chunk remains the only path that may
+advance the slot past that decoded transaction. This lets Postgres recycle forced/archived WAL even
+when no tracked table is changing without weakening append-before-ack durability.
+
 **The buffer is bounded; large transactions spill and are appended in chunks** (ADR-0003). A
 transaction cannot be appended before its commit frame (the commit LSN is unknown and it may still
 abort), so it must be held — and a million-row `UPDATE` under `REPLICA IDENTITY FULL` carries old and
@@ -744,7 +752,7 @@ absolute membership emission makes them unnecessary for convergence).
 | seam | mechanism | guarantee |
 |---|---|---|
 | backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
-| ingestor → change log | append (chunked past `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`; contiguous on one segment, last envelope marked `headers.last`) → acknowledge **after the last chunk**; reader holds an unterminated run + `(lsn,seq)` de-dup, checkpointed together — ADR-0003 | at-least-once delivery, exactly-once effect; a commit of any size at bounded INGESTOR memory, still one unit of visibility |
+| ingestor → change log | append (chunked past `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`; contiguous on one segment, last envelope marked `headers.last`) → acknowledge **after the last chunk**; between transactions, acknowledge server keepalive WAL ends so idle WAL is recyclable; reader holds an unterminated run + `(lsn,seq)` de-dup, checkpointed together — ADR-0003 | at-least-once delivery, exactly-once effect; no transaction is acknowledged before durability, a commit of any size stays one unit of visibility, and an idle slot does not retain forced WAL indefinitely |
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
