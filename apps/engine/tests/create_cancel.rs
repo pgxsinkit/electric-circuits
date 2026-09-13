@@ -160,13 +160,14 @@ async fn cancelled_subquery_create_does_not_poison_the_next_one() {
 }
 
 /// A create that registered, then had its table's schema swapped underneath it while it was out at
-/// Postgres, must be refused and rolled back — not installed against a schema that is already gone.
+/// Postgres, must roll that attempt back and retry — not install against a schema that is already
+/// gone.
 ///
 /// The drift is driven by bumping the table's schema generation alone (`force_schema_generation_bump`),
 /// which is precisely what `retire_dependents` does in its enumeration critical section: it isolates
 /// the closing check from the retirement that normally accompanies it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_create_overtaken_by_a_schema_drift_is_refused_and_rolled_back() {
+async fn a_create_overtaken_by_a_schema_drift_retries_after_rolling_back() {
     let (engine, ds) = engine_on_fake_ds().await;
     let where_: PredicateJson =
         serde_json::from_value(serde_json::json!({"col":"parent_id","op":"eq","value":1})).unwrap();
@@ -188,32 +189,26 @@ async fn a_create_overtaken_by_a_schema_drift_is_refused_and_rolled_back() {
     engine.force_schema_generation_bump(&tref("child")).await;
     ds.park_puts.store(false, Ordering::SeqCst);
 
-    let err = creating.await.unwrap().expect_err("the create must be refused, not installed").to_string();
-    assert!(err.contains("changed during creation"), "unexpected failure: {err}");
+    let rec = creating.await.unwrap().expect("a valid create whose first attempt raced drift must retry");
+    assert_ne!(rec.id, "s1", "a rolled-back shape id is never re-minted");
 
-    // Nothing survives: no record, no stream, no registry entry.
+    // The raced attempt leaves nothing behind; only its replacement survives.
     let deleted = || ds.deleted.lock().unwrap().iter().any(|path| path.ends_with("shape/s1"));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.get_shape("s1").await.is_some() || !deleted() {
-        assert!(std::time::Instant::now() < deadline, "the refused create was never rolled back");
+        assert!(std::time::Instant::now() < deadline, "the raced create was never rolled back");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(engine.graph().await.shapes.is_empty(), "no shape may survive the rollback");
+    assert_eq!(engine.graph().await.shapes.len(), 1, "only the retried shape may survive");
     assert!(engine.subquery_stats().await.is_empty(), "no registry node may survive");
-
-    // ...and the same create works again once the drift has settled.
-    let rec = engine
-        .create_shape(&tref("child"), Some(where_), None, false, true)
-        .await
-        .expect("the identical create must succeed after the drift settles");
-    assert_ne!(rec.id, "s1");
 }
 
 /// The other half of the same guarantee, driven by a REAL retirement rather than a bare generation
 /// bump: a create parked mid-flight when the drift enumerates its table is purged by that
-/// enumeration and then refuses itself, leaving nothing behind.
+/// enumeration and then retries itself with a fresh shape, leaving nothing from the raced attempt
+/// behind.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_real_retirement_over_a_parked_create_leaves_nothing_installed() {
+async fn a_real_retirement_over_a_parked_create_retries_without_leaking_the_raced_attempt() {
     let (engine, ds) = engine_on_fake_ds().await;
     let where_: PredicateJson =
         serde_json::from_value(serde_json::json!({"col":"parent_id","op":"eq","value":1})).unwrap();
@@ -234,14 +229,15 @@ async fn a_real_retirement_over_a_parked_create_leaves_nothing_installed() {
     engine.force_retire_dependents(&tref("child")).await;
     ds.park_puts.store(false, Ordering::SeqCst);
 
-    assert!(creating.await.unwrap().is_err(), "the create must not report success");
+    let rec = creating.await.unwrap().expect("a valid create whose first attempt was retired must retry");
+    assert_ne!(rec.id, "s1", "the retired id must not be re-minted");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.get_shape("s1").await.is_some() {
         assert!(std::time::Instant::now() < deadline, "the shape record outlived the retirement");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(ds.deleted.lock().unwrap().iter().any(|p| p.ends_with("shape/s1")), "the stream must be gone");
-    assert!(engine.graph().await.shapes.is_empty(), "no shape may survive");
+    assert_eq!(engine.graph().await.shapes.len(), 1, "only the retry may survive");
 }
 
 /// A create that arrives WHILE a resolution holds the table's lock is refused outright — it would
@@ -326,9 +322,9 @@ async fn a_drift_inside_the_join_head_window_is_not_installed_against_the_stale_
     let err = creating
         .await
         .unwrap()
-        .expect_err("a create whose table drifted mid-flight must not be installed against the old schema")
+        .expect_err("the retry must validate against the current schema, not install against the old one")
         .to_string();
-    assert!(err.contains("changed during creation"), "unexpected refusal: {err}");
+    assert!(err.contains("parent_id"), "unexpected refusal: {err}");
 
     // Nothing survives: the stale join target was retired by the HEAD, and the refused create rolled
     // itself back rather than leaving a shape behind.

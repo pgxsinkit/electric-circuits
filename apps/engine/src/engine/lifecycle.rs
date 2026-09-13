@@ -243,7 +243,7 @@ impl Engine {
                         joining.rollback().await;
                         return Err(e);
                     }
-                    if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+                    if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
                         joining.rollback().await;
                         return Err(e);
                     }
@@ -358,8 +358,8 @@ impl Engine {
                     // ...or a schema drift on the outer table or ANY table its subquery reads. This
                     // is also what unwinds a create the drift handler purged mid-phase-B: the
                     // registry install would otherwise land on a deleted stream.
-                    if let Err(e) = self.ensure_schema_unchanged(&gens).await {
-                        let _ = ready_tx.send(ShareOutcome::Failed);
+                    if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                        let _ = ready_tx.send(ShareOutcome::Raced);
                         creating.rollback().await;
                         return Err(e);
                     }
@@ -387,6 +387,11 @@ impl Engine {
                     return Ok(rec);
                 }
                 Err(e) => {
+                    if let Some(raced) = self.create_race_after_work_failure(&id, &stream_path, &gens).await {
+                        let _ = ready_tx.send(ShareOutcome::Raced);
+                        creating.rollback().await;
+                        return Err(raced);
+                    }
                     // Registration failed: wake any joiners with the failure, then undo everything
                     // this create registered so later identical creates don't join a dead stream.
                     let _ = ready_tx.send(ShareOutcome::Failed);
@@ -491,8 +496,8 @@ impl Engine {
                     return Err(e);
                 }
                 // ...and the table must still have the schema this backfill was read through.
-                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
-                    let _ = share_tx.send(ShareOutcome::Failed);
+                if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                    let _ = share_tx.send(ShareOutcome::Raced);
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -515,6 +520,11 @@ impl Engine {
                 Ok(rec)
             }
             Err(e) => {
+                if let Some(raced) = self.create_race_after_work_failure(&id, &rec.stream_path, &gens).await {
+                    let _ = share_tx.send(ShareOutcome::Raced);
+                    creating.rollback().await;
+                    return Err(raced);
+                }
                 // Backfill/registration failed: wake any joiners, then undo the whole registration
                 // (no zombie shape a later identical create would join) and surface the error.
                 let _ = share_tx.send(ShareOutcome::Failed);
@@ -618,7 +628,7 @@ impl Engine {
                     joining.rollback().await;
                     return Err(e);
                 }
-                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+                if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
                     joining.rollback().await;
                     return Err(e);
                 }
@@ -712,8 +722,8 @@ impl Engine {
                                     creating.rollback().await;
                                     return Err(e);
                                 }
-                                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
-                                    let _ = share_tx.send(ShareOutcome::Failed);
+                                if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                                    let _ = share_tx.send(ShareOutcome::Raced);
                                     creating.rollback().await;
                                     return Err(e);
                                 }
@@ -737,6 +747,13 @@ impl Engine {
                                 Ok(rec)
                             }
                             Err(e) => {
+                                if let Some(raced) =
+                                    self.create_race_after_work_failure(&id, &rec.stream_path, &gens).await
+                                {
+                                    let _ = share_tx.send(ShareOutcome::Raced);
+                                    creating.rollback().await;
+                                    return Err(raced);
+                                }
                                 let _ = share_tx.send(ShareOutcome::Failed);
                                 creating.rollback().await;
                                 bail!("aggregate '{id}' creation failed: {e}")
@@ -821,8 +838,8 @@ impl Engine {
                     creating.rollback().await;
                     return Err(e);
                 }
-                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
-                    let _ = share_tx.send(ShareOutcome::Failed);
+                if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                    let _ = share_tx.send(ShareOutcome::Raced);
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -843,6 +860,11 @@ impl Engine {
                 Ok(rec)
             }
             Err(e) => {
+                if let Some(raced) = self.create_race_after_work_failure(&id, &rec.stream_path, &gens).await {
+                    let _ = share_tx.send(ShareOutcome::Raced);
+                    creating.rollback().await;
+                    return Err(raced);
+                }
                 let _ = share_tx.send(ShareOutcome::Failed);
                 creating.rollback().await;
                 bail!("aggregate '{id}' creation failed: {e}")
@@ -963,8 +985,32 @@ impl Engine {
                     seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             }
         }
+        let owned_barrier = if removed.is_some() {
+            let barrier = Arc::new(crate::engine::PurgeBarrier::new());
+            self.purge_barriers.lock().unwrap().insert(id.to_string(), barrier.clone());
+            Some(barrier)
+        } else {
+            None
+        };
         drop(st);
+        #[cfg(test)]
+        if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
+            self.purge_test_hook.removed.notify_one();
+            self.purge_test_hook.release.notified().await;
+        }
         if durable {
+            let (barrier, owner) = if let Some(barrier) = owned_barrier {
+                (barrier, true)
+            } else if let Some(barrier) = self.purge_barriers.lock().unwrap().get(id).cloned() {
+                (barrier, false)
+            } else {
+                self.catalog_tx.wait_durable().await;
+                return Ok(());
+            };
+            if !owner {
+                self.catalog_tx.wait_durable().await;
+                return Ok(());
+            }
             // The teardown this purge promised must NOT depend on the request that asked for it.
             // Giving up on a `DELETE` while storage is down is exactly what a client does during an
             // outage, and that drops this handler future — but the `Dropped` still lands, because
@@ -972,20 +1018,48 @@ impl Engine {
             // would simply never run in this process: the stream would linger alive until the next
             // boot's GC and a subquery shape would stay registered and maintained as a zombie. So
             // the work after the durability wait is owned by the PROCESS, not by the request.
+            let task_barrier = barrier.clone();
             let (engine, owned) = (self.clone(), id.to_string());
             tokio::spawn(async move {
                 // ADR-0007 order is preserved inside the task: `Dropped` durable, then close/delete.
                 if let Some(wait) = wait {
                     wait.await;
                 }
-                engine.finish_purge(&owned, removed).await;
+                task_barrier.mark_dropped_durable();
+                // A native purge promises a durable `Dropped` intent before it answers. Retirement
+                // itself remains process-owned and eventually retried by `RetirementQueue`; making
+                // the HTTP request wait for that external recovery turns a durable-stream outage
+                // into an unnecessary, unbounded acknowledgment delay.
+                engine.finish_purge(&owned, removed, None).await;
+                task_barrier.complete();
+                engine.purge_barriers.lock().unwrap().remove(&owned);
             });
-            // The request waits only for the durability BARRIER — everything enqueued up to and
-            // including that `Dropped` is in the restart contract when this returns. A concurrent
-            // retry finds `removed == None`, enqueues nothing, and waits on the same barrier.
-            self.catalog_tx.wait_durable().await;
+            // The request waits only for the restart contract: `Dropped` must be durable before a
+            // successful response. A concurrent retry finds `removed == None`, enqueues nothing,
+            // and waits for that same catalog barrier; the owned task completes retirement.
+            barrier.wait_dropped_durable().await;
         } else {
-            self.finish_purge(id, removed).await;
+            if let Some(barrier) = owned_barrier {
+                self.finish_purge(id, removed, Some(barrier.clone())).await;
+                let barrier_done = barrier.is_done();
+                if barrier_done {
+                    self.purge_barriers.lock().unwrap().remove(id);
+                } else {
+                    let barriers = self.purge_barriers.clone();
+                    let owned = id.to_string();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        barriers.lock().unwrap().remove(&owned);
+                    });
+                }
+            } else {
+                let existing = self.purge_barriers.lock().unwrap().get(id).cloned();
+                if let Some(barrier) = existing {
+                    barrier.wait().await;
+                } else {
+                    self.finish_purge(id, removed, None).await;
+                }
+            }
         }
         Ok(())
     }
@@ -993,13 +1067,28 @@ impl Engine {
     /// The half of a purge that must outlive the request that asked for it: registry cleanup, the
     /// stream retirement, the trace. Ordered strictly AFTER the `Dropped` intent (ADR-0007) — a
     /// crash between the two leaves a record the boot can act on, the other order leaves an orphan.
-    async fn finish_purge(&self, id: &str, removed: Option<ShapeRecord>) {
+    async fn finish_purge(
+        &self,
+        id: &str,
+        removed: Option<ShapeRecord>,
+        completion_barrier: Option<Arc<crate::engine::PurgeBarrier>>,
+    ) {
         // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
             // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete,
             // and record the completion. A storage failure is queued, never forgotten.
-            self.retire_shape_stream(id, &rec.stream_path).await;
+            if let Some(barrier) = completion_barrier {
+                let completion = crate::engine::retirement::RetirementCompletion::new();
+                let completion_wait = completion.clone();
+                tokio::spawn(async move {
+                    completion_wait.wait().await;
+                    barrier.complete();
+                });
+                self.retire_shape_stream_with_completion(id, &rec.stream_path, completion).await;
+            } else {
+                self.retire_shape_stream(id, &rec.stream_path).await;
+            }
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("purged shape {id} (forced)");
         }
@@ -2009,6 +2098,30 @@ impl Engine {
         }
     }
 
+    /// The schema-generation check for a create or join that has already taken provisional state.
+    /// A changed generation means this attempt raced retirement and can be safely redone; callers
+    /// outside creation (for example dormant reactivation) retain the ordinary error classification.
+    async fn ensure_create_schema_unchanged(&self, gens: &SchemaGens) -> Result<()> {
+        self.ensure_schema_unchanged(gens)
+            .await
+            .map_err(|e| anyhow::Error::new(CreateRaced(format!("{e:#}").trim_end_matches("; retry").to_string())))
+    }
+
+    /// A retirement may reset a pending executor or subquery registration before its work reports
+    /// an error. Preserve real work failures, but translate only an independently re-checked
+    /// schema/epoch/registration loss into the bounded create-race retry.
+    async fn create_race_after_work_failure(
+        &self,
+        id: &str,
+        stream_path: &str,
+        gens: &SchemaGens,
+    ) -> Option<anyhow::Error> {
+        match self.recheck_after_durability(id, stream_path, gens).await {
+            Err(e) if e.downcast_ref::<CreateRaced>().is_some() => Some(e),
+            _ => None,
+        }
+    }
+
     /// Reconcile a terminal-looking shape-stream append answer against engine state
     /// (`DsClient::append_reliable` → [`crate::ds::GoneVerdict`]).
     ///
@@ -2608,6 +2721,7 @@ mod cancellation_tests {
 #[cfg(test)]
 mod subscription_tests {
     use super::*;
+    use crate::engine::catalog::testing::FakeDs;
 
     /// An engine with one shared shape and the given live subscriptions
     /// (`subscription id -> lease timestamp`). No durable-streams behind it: every catalog record
@@ -2839,5 +2953,364 @@ mod subscription_tests {
         let engine = engine_with_share("s1", &[("mine", 10)]).await;
         engine.purge_shape("s1").await.unwrap();
         assert_eq!(engine.state.lock().await.subscription_owner("mine"), None);
+    }
+
+    /// Native purge acknowledgement promises a durable `Dropped` intent. Stream retirement is
+    /// process-owned work that continues after the client-facing request returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_returns_after_dropped_without_waiting_for_stream_retirement() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), purging)
+            .await
+            .expect("purge did not return after Dropped was durable")
+            .unwrap()
+            .unwrap();
+
+        server.release_delete();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_durable_purge_retries_join_the_original_teardown() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        engine.purge_test_hook.pause_after_remove.store(true, std::sync::atomic::Ordering::Release);
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.purge_test_hook.removed.notified())
+            .await
+            .expect("purge did not publish its barrier after removing the shape");
+        engine.purge_test_hook.pause_after_remove.store(false, std::sync::atomic::Ordering::Release);
+        let mut second = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second)
+            .await
+            .expect("a concurrent retry did not return after Dropped was durable")
+            .unwrap()
+            .unwrap();
+
+        engine.purge_test_hook.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        server.release_delete();
+        first.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_returns_after_dropped_while_retirement_retries() {
+        let server = FakeDs::start().await;
+        server.fail_deletes(1);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), purging)
+            .await
+            .expect("purge did not return after Dropped was durable")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.deletes() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queued retirement did not retry after the transient failure");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_does_not_wait_for_retired_catalog_event() {
+        let server = FakeDs::start().await;
+        server.block_retired(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_retired_started())
+            .await
+            .expect("Retired catalog append did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), purging)
+            .await
+            .expect("purge did not return after Dropped was durable")
+            .unwrap()
+            .unwrap();
+        server.release_retired();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_purge_waits_for_stream_retirement_before_returning() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        server.pause_delete_after_start(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let mut purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_after_start_paused())
+            .await
+            .expect("stream delete did not pause after publishing its arrival");
+        assert!(!purging.is_finished(), "internal purge returned while stream deletion was blocked");
+        // Deliberately release before the handler has registered its release waiter. The fake
+        // durable-stream seam must remember the release, otherwise this exact interleaving leaves
+        // the internal purge waiting for a DELETE response that can never arrive.
+        server.release_delete();
+        server.continue_delete_after_start();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(1), &mut purging).await;
+        if completed.is_err() {
+            purging.abort();
+        }
+        completed.expect("internal purge did not return after the stream-delete release").unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_joining_internal_retry_does_not_wait_for_terminal_retirement() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        server.fail_deletes(1);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let internal = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("initial stream delete did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), server.wait_delete_blocked())
+            .await
+            .expect("initial stream delete did not remain blocked");
+        server.release_delete();
+        internal.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("queued retirement retry did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), server.wait_delete_blocked())
+            .await
+            .expect("queued retirement retry did not remain blocked before the native retry");
+
+        let mut durable = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut durable)
+            .await
+            .expect("durable purge did not return after the existing Dropped intent landed")
+            .unwrap()
+            .unwrap();
+        server.release_delete();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_joining_internal_waits_for_retired_durability() {
+        let server = FakeDs::start().await;
+        server.block_retired(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        engine.purge_shape("s1").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_retired_started())
+            .await
+            .expect("internal purge did not enqueue Retired");
+        let mut durable = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut durable).await.is_err(),
+            "durable purge returned before the internal Retired append was durable"
+        );
+        server.release_retired();
+        durable.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_purge_during_durable_purge_joins_existing_barrier() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+        engine.purge_test_hook.pause_after_remove.store(true, std::sync::atomic::Ordering::Release);
+        let durable = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.purge_test_hook.removed.notified())
+            .await
+            .expect("purge did not publish its barrier after removing the shape");
+        engine.purge_test_hook.pause_after_remove.store(false, std::sync::atomic::Ordering::Release);
+        let mut internal = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape("s1").await }
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut internal).await.is_err());
+        engine.purge_test_hook.release.notify_one();
+        durable.await.unwrap().unwrap();
+        internal.await.unwrap().unwrap();
     }
 }

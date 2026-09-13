@@ -35,6 +35,33 @@ struct Retirement {
     /// create's stream has no record to close out.
     shape_id: Option<String>,
     attempt: u32,
+    completion: Option<Arc<RetirementCompletion>>,
+}
+
+pub(crate) struct RetirementCompletion {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl RetirementCompletion {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self { done: std::sync::atomic::AtomicBool::new(false), notify: tokio::sync::Notify::new() })
+    }
+
+    fn complete(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// The engine's background retirement queue (see the module docs). Cheap to clone: a sender plus the
@@ -50,10 +77,23 @@ impl RetirementQueue {
     /// dead queue means the process is going away, and the durable `Dropped` means the next boot
     /// will find this work again.
     pub(crate) fn enqueue(&self, stream_path: &str, shape_id: Option<&str>) {
+        self.enqueue_with_completion(stream_path, shape_id, None);
+    }
+
+    pub(crate) fn enqueue_with_completion(
+        &self,
+        stream_path: &str,
+        shape_id: Option<&str>,
+        completion: Option<Arc<RetirementCompletion>>,
+    ) {
         self.pending.fetch_add(1, Ordering::SeqCst);
         crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
-        let item =
-            Retirement { stream_path: stream_path.to_string(), shape_id: shape_id.map(str::to_string), attempt: 0 };
+        let item = Retirement {
+            stream_path: stream_path.to_string(),
+            shape_id: shape_id.map(str::to_string),
+            attempt: 0,
+            completion,
+        };
         if self.tx.send(item).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             // Republish: the gauge is written from the counter, so an un-mirrored decrement would
@@ -119,6 +159,9 @@ pub(crate) fn spawn_retirement_queue(
                     crate::metrics::metrics()
                         .retirements_pending
                         .store(counter.load(Ordering::SeqCst), Ordering::Relaxed);
+                    if let Some(completion) = item.completion {
+                        completion.complete();
+                    }
                 }
                 Err(e) => {
                     item.attempt += 1;
@@ -162,6 +205,24 @@ impl Engine {
                      is gone from the engine either way, and its stream must not outlive it"
                 );
                 self.retirements.enqueue(stream_path, Some(id));
+            }
+        }
+    }
+
+    pub(crate) async fn retire_shape_stream_with_completion(
+        &self,
+        id: &str,
+        stream_path: &str,
+        completion: Arc<RetirementCompletion>,
+    ) {
+        match self.ds.retire_stream(stream_path).await {
+            Ok(()) => {
+                self.catalog_tx.send(CatalogEvent::Retired { id: id.to_string() });
+                completion.complete();
+            }
+            Err(e) => {
+                tracing::warn!("retiring stream {stream_path} for shape {id} failed ({e:#}); queued and awaited");
+                self.retirements.enqueue_with_completion(stream_path, Some(id), Some(completion));
             }
         }
     }

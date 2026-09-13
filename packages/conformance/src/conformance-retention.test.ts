@@ -174,7 +174,7 @@ describe('shape retention lifecycle (active / dormant / evicted)', () => {
     expect((await shapeInfo(a.shapeId)).state).toBe('active')
   })
 
-  it('DELETE ?purge=true force-drops immediately, bypassing refcounts and the lifecycle', async () => {
+  it('DELETE ?purge=true immediately removes the native shape and eventually retires its stream', async () => {
     await pg('INSERT INTO items (id, n) VALUES (1, 10)')
     await drainEngine(h)
 
@@ -182,10 +182,16 @@ describe('shape retention lifecycle (active / dormant / evicted)', () => {
     const a = await createShape(where)
     await createShape(where) // second subscription on the same shape (refcount 2)
 
-    // A plain release leaves the shape (still one subscriber); purge tears it down NOW.
-    await fetch(`${h.engineUrl}/shapes/${a.shapeId}?purge=true`, { method: 'DELETE' })
+    // A plain release leaves the shape (still one subscriber); successful native purge acknowledges
+    // its durable Dropped intent, so the shape disappears immediately while process-owned stream
+    // retirement completes afterwards.
+    const purged = await fetch(`${h.engineUrl}/shapes/${a.shapeId}?purge=true`, { method: 'DELETE' })
+    expect(purged.ok).toBe(true)
     expect((await shapeInfo(a.shapeId)).status).toBe(404)
-    expect((await fetch(a.streamUrl)).status).toBe(404)
+    await waitFor(async () => {
+      const stream = await fetch(a.streamUrl)
+      return stream.status === 404 || stream.status === 410
+    }, 'purged stream to reach a terminal state')
 
     // Recreation works (fresh shape, fresh stream, fresh backfill).
     const b = await createShape(where)

@@ -212,6 +212,11 @@ pub struct Engine {
     /// the background until it lands. See [`crate::engine::retirement`]: the `Dropped` record is the
     /// durable intent, so nothing here is lost by a restart.
     retirements: RetirementQueue,
+    /// Durable purge completion barriers keyed by shape id. A retry joins the original teardown,
+    /// rather than launching a second completion task or acknowledging before retirement lands.
+    purge_barriers: Arc<std::sync::Mutex<HashMap<String, Arc<PurgeBarrier>>>>,
+    #[cfg(test)]
+    pub(crate) purge_test_hook: Arc<PurgeTestHook>,
     /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
@@ -261,6 +266,66 @@ pub struct Engine {
     /// (ADR-0008). The counter alone would not do: the catalog outlives the process, so a restart
     /// would re-mint ids a restored shape still holds.
     sub_nonce: Arc<str>,
+}
+
+pub(crate) struct PurgeBarrier {
+    dropped_durable: std::sync::atomic::AtomicBool,
+    dropped_notify: tokio::sync::Notify,
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PurgeTestHook {
+    pub(crate) pause_after_remove: std::sync::atomic::AtomicBool,
+    pub(crate) removed: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+impl PurgeBarrier {
+    fn new() -> Self {
+        Self {
+            dropped_durable: std::sync::atomic::AtomicBool::new(false),
+            dropped_notify: tokio::sync::Notify::new(),
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn mark_dropped_durable(&self) {
+        self.dropped_durable.store(true, Ordering::Release);
+        self.dropped_notify.notify_waiters();
+    }
+
+    async fn wait_dropped_durable(&self) {
+        loop {
+            let notified = self.dropped_notify.notified();
+            if self.dropped_durable.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn complete(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// A unit of deferred subquery propagation for the flip propagator (see [`Engine::flip_tx`]).
@@ -841,6 +906,9 @@ impl Engine {
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
             retirements,
+            purge_barriers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            purge_test_hook: Arc::new(PurgeTestHook::default()),
             changes,
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
             seq_highwater: Arc::new(std::sync::Mutex::new(None)),
