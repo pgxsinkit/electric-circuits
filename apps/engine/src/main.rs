@@ -15,7 +15,8 @@
 //! |---|---|
 //! | `0` | clean exit: a graceful shutdown completed inside its grace period |
 //! | `70` | the shutdown was **forced** — a second signal arrived, or the grace period elapsed with work still in flight ([`shutdown::EXIT_SHUTDOWN_FORCED`]). A catalog append being retried through an outage is a named party here |
-//! | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered, and the answer will not change. Memory and storage disagree and only a re-fold at boot can reconcile them, so the process exits instead of serving state its record does not describe |
+//! | `71` | the shutdown was **incomplete**: every task finished, but the durable catalog writer did not drain ([`shutdown::EXIT_SHUTDOWN_INCOMPLETE`]) — the final checkpoint may be missing, so the next boot may replay from an earlier one |
+//! | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered, and the answer will not change — or the catalog writer task itself panicked. Memory and storage disagree and only a re-fold at boot can reconcile them, so the process exits instead of serving state its record does not describe |
 //! | `75` | a counts pipeline must be rebuilt (schema drift or an epoch reset on a circuit-served table); restart to re-seed it |
 //! | `78` | **boot refused** (`EX_CONFIG`): a misconfiguration retrying cannot fix — a setting the config resolver rejected (an unparseable `ELECTRIC_CIRCUITS_PG_URL`, an unusable `ELECTRIC_CIRCUITS_PG_TABLES`, an out-of-range byte budget, a missing `ELECTRIC_CIRCUITS_DS_URL`, an unwritable spill directory), or a fatal Postgres condition — bad credentials, a missing privilege, an unknown database, `wal_level` ≠ `logical`, a publication with a column list, an unreadable durable catalog |
 //!
@@ -183,7 +184,11 @@ async fn main() -> Result<()> {
     // The accept loop is closed and every in-flight request has finished (the `/v1/shape` live poll
     // joined the token, so that took milliseconds, not its 20 s window). Now let the engine's own
     // tasks reach their safe points.
-    finish_shutdown(&engine_at_exit, &shutdown, config.shutdown_grace).await;
+    let outcome = finish_shutdown(&engine_at_exit, &shutdown, config.shutdown_grace).await;
+    if outcome != shutdown::ShutdownOutcome::Complete {
+        std::io::stderr().flush().ok();
+        std::process::exit(outcome.exit_code());
+    }
     Ok(())
 }
 
@@ -307,10 +312,11 @@ async fn await_signal_and_begin(shutdown: ShutdownToken, ready_drain: Duration, 
 /// commit it is appending, the sequencer finishes its batch, flushes it and writes a final
 /// checkpoint, and the catalog writer drains that checkpoint to storage.
 ///
-/// The whole thing is bounded by `grace`. Running out of it is not silent: the parties still
-/// outstanding are named and the process exits [`shutdown::EXIT_SHUTDOWN_FORCED`], because "exited
-/// 0" must mean "everything got to a clean point".
-async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Duration) {
+/// The whole thing is bounded by `grace`. Falling short of it is not silent, and the outcome says
+/// how: parties still outstanding are named and the outcome is [`shutdown::ShutdownOutcome::Forced`];
+/// a catalog that did not drain is [`shutdown::ShutdownOutcome::CatalogIncomplete`]. `main` exits
+/// with the matching code, because "exited 0" must mean "everything got to a clean point".
+async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Duration) -> shutdown::ShutdownOutcome {
     let started = std::time::Instant::now();
     // Measured from the SIGNAL, not from here: the readiness-drain window already spent part of it.
     let left = grace.saturating_sub(shutdown.elapsed().unwrap_or_default());
@@ -321,8 +327,7 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
             shutdown.outstanding(),
             shutdown::EXIT_SHUTDOWN_FORCED
         );
-        std::io::stderr().flush().ok();
-        std::process::exit(shutdown::EXIT_SHUTDOWN_FORCED);
+        return shutdown::ShutdownOutcome::Forced;
     }
     // The sequencer's final `Offset` is queued, not written: draining is what makes the checkpoint
     // durable, and with it the restart point the next boot resumes from.
@@ -330,10 +335,13 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
     if !engine.drain_catalog(catalog_budget).await {
         tracing::error!(
             "the durable catalog writer did not drain within {catalog_budget:?}; the final checkpoint may be \
-             missing and the next boot will replay from the previous one"
+             missing and the next boot will replay from the previous one. Exiting {}.",
+            shutdown::EXIT_SHUTDOWN_INCOMPLETE
         );
+        return shutdown::ShutdownOutcome::CatalogIncomplete;
     }
     tracing::info!("shutdown complete in {:?}", started.elapsed());
+    shutdown::ShutdownOutcome::Complete
 }
 
 /// Refuse the boot: name the class of failure, print the whole error chain, exit [`pg::EXIT_CONFIG`].

@@ -142,6 +142,29 @@ fn is_false(b: &bool) -> bool {
 /// exits, loudly and named, rather than continuing over a record it knows is wrong.
 pub(crate) const EXIT_CATALOG_REFUSED: i32 = 74;
 
+/// Exits the process if the catalog writer task panics.
+///
+/// A dead writer is the same pathological state as a refusal: nothing this process mutates from here
+/// on reaches the durable record, and whatever it was appending when it died may or may not have
+/// landed. Serving on would widen the gap between memory and storage, so it ends exactly like a
+/// refusal — [`EXIT_CATALOG_REFUSED`], and the boot re-folds the catalog. Held as a guard local to
+/// the writer task, it is dropped while the panic unwinds, before tokio reports the task failed.
+struct WriterExit;
+
+impl Drop for WriterExit {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(
+                "the durable catalog writer panicked: no catalog event can land in this process again, and \
+                 the one in flight may or may not have. Exiting {EXIT_CATALOG_REFUSED}: a boot re-folds the \
+                 catalog."
+            );
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+            std::process::exit(EXIT_CATALOG_REFUSED)
+        }
+    }
+}
+
 /// What the writer does about an append it could not complete. Pure and separately decided, so the
 /// "exit the process" branch is unit-testable without exiting anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,8 +257,9 @@ impl CatalogWriter {
     /// log order still matches the state-mutation order; only the WAIT moves to the caller's own
     /// await point (after the lock is released, immediately before it answers its client).
     ///
-    /// It always resolves or the process exits: the writer retries a transient failure forever and
-    /// exits [`EXIT_CATALOG_REFUSED`] on a definite refusal. There is deliberately no timeout — a
+    /// It resolves only once the append landed, or the process exits: the writer retries a transient
+    /// failure forever, exits [`EXIT_CATALOG_REFUSED`] on a definite refusal, and exits the same way if
+    /// its task panics ([`WriterExit`]). There is deliberately no timeout — a
     /// create while storage is down waits, because the alternative is telling a client about a shape
     /// that will not exist after a restart. The client has its own timeout; if it gives up and the
     /// record lands anyway, the shape has no subscriber and retention evicts it.
@@ -243,9 +267,13 @@ impl CatalogWriter {
         let (done, wait) = tokio::sync::oneshot::channel();
         self.enqueue(ev, Some(done));
         async move {
-            // An `Err` means the writer task is gone, i.e. the process is on its way out; there is
-            // nothing better to do than let the caller finish.
-            let _ = wait.await;
+            // An `Err` means the acknowledgement was dropped unsent: the writer task died, and
+            // `WriterExit` is taking the process down with it. Whether the record landed is unknown,
+            // so the caller must never be let through to tell its client it did — it waits for the
+            // exit instead.
+            if wait.await.is_err() {
+                std::future::pending::<()>().await;
+            }
         }
     }
 
@@ -322,6 +350,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     let landed_notify = Arc::new(tokio::sync::Notify::new());
     let writer_landed_notify = landed_notify.clone();
     tokio::spawn(async move {
+        let _exit = WriterExit;
         let mut ensured = false;
         // Latches the "catalog stream create failed" line to once per outage (see
         // `ensure_catalog_logged`); it outlives one event because the retry loop below runs per
@@ -1709,6 +1738,28 @@ mod tests {
             vec!["joined".to_string(), "left".to_string()],
             "both events land, exactly once each, in send order"
         );
+    }
+
+    /// What [`WriterExit`] relies on: a guard held across an await in a spawned task is dropped while
+    /// the task's panic is still unwinding — so it sees `panicking()` and exits before tokio swallows
+    /// the panic into the join handle.
+    #[tokio::test]
+    async fn a_task_guard_is_dropped_during_the_panic_unwind() {
+        struct Probe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(std::thread::panicking(), Ordering::SeqCst);
+            }
+        }
+        let saw_panicking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = saw_panicking.clone();
+        let task = tokio::spawn(async move {
+            let _guard = Probe(probe);
+            tokio::task::yield_now().await;
+            panic!("writer died");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(saw_panicking.load(Ordering::SeqCst), "the guard must observe the unwind");
     }
 
     /// `send_durable` is the durable-before-ack primitive: the future must not resolve while the

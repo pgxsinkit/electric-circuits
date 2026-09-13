@@ -297,7 +297,8 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 |---|---|
 | `0` | a graceful shutdown completed inside its grace period |
 | `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
-| `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
+| `71` | shutdown **incomplete**: every task finished, but the durable catalog writer did not drain in time — the final checkpoint may be missing, so the next boot may replay (de-duplicated) from an earlier one. Not corrupt, but not a clean exit either |
+| `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize), or the catalog writer task panicked. The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
 | `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 

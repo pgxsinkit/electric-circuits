@@ -26,7 +26,8 @@
 //!    highwater. Stopping mid-transaction, before the commit, is the same story with nothing
 //!    appended at all. Either way the slot is never advanced BY the shutdown. The sequencer
 //!    completes the batch it is processing, flushes it, and writes a final checkpoint;
-//! 4. the catalog writer drains, and the process exits 0.
+//! 4. the catalog writer drains, and the process exits 0 — or [`EXIT_SHUTDOWN_INCOMPLETE`] when it
+//!    could not, because the checkpoint the next boot resumes from may then be missing.
 //!
 //! The whole thing is bounded (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`, default 25 s — under a
 //! typical Kubernetes `terminationGracePeriodSeconds: 30`), and a **second** signal during the grace
@@ -41,6 +42,33 @@ use std::time::Duration;
 /// period elapsed with a party still outstanding. Distinct from `0` (clean) and from
 /// [`crate::pg::EXIT_CONFIG`] / the circuit-rebuild `75`.
 pub const EXIT_SHUTDOWN_FORCED: i32 = 70;
+
+/// Exit code when every party finished but the durable catalog writer did **not drain**: the final
+/// checkpoint (and anything queued behind it) may not be in storage, so the next boot may replay from
+/// an earlier one. Nothing is corrupted — a replay is de-duplicated — but it is not a clean exit
+/// either, and `0` must keep meaning "everything got to a clean point".
+pub const EXIT_SHUTDOWN_INCOMPLETE: i32 = 71;
+
+/// How a graceful shutdown ended — what the process exits with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// Every party finished and the catalog drained inside the grace period.
+    Complete,
+    /// The grace period elapsed with a party still outstanding.
+    Forced,
+    /// Every party finished, but the catalog writer did not drain.
+    CatalogIncomplete,
+}
+
+impl ShutdownOutcome {
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            ShutdownOutcome::Complete => 0,
+            ShutdownOutcome::Forced => EXIT_SHUTDOWN_FORCED,
+            ShutdownOutcome::CatalogIncomplete => EXIT_SHUTDOWN_INCOMPLETE,
+        }
+    }
+}
 
 /// How long the whole grace period may take, by default. Below a typical Kubernetes
 /// `terminationGracePeriodSeconds: 30`, so the engine always gets to finish on its own terms rather
@@ -298,6 +326,15 @@ mod tests {
         let m = grace_expiry_message(&[], Duration::from_secs(25));
         assert!(m.contains("no registered party"), "{m}");
         assert!(m.contains("the boot had not finished"), "{m}");
+    }
+
+    /// Only a completed shutdown exits 0; the two ways it can fall short are distinguishable.
+    #[test]
+    fn each_shutdown_outcome_has_its_own_exit_code() {
+        assert_eq!(ShutdownOutcome::Complete.exit_code(), 0);
+        assert_eq!(ShutdownOutcome::Forced.exit_code(), EXIT_SHUTDOWN_FORCED);
+        assert_eq!(ShutdownOutcome::CatalogIncomplete.exit_code(), EXIT_SHUTDOWN_INCOMPLETE);
+        assert_eq!((EXIT_SHUTDOWN_FORCED, EXIT_SHUTDOWN_INCOMPLETE), (70, 71), "operators and lanes match on these");
     }
 
     #[test]
