@@ -763,6 +763,10 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // that binding still holds. `state: "broken"` is the refuse policy's degraded state: ingest
         // is stopped, shape routes answer 503, and `POST /epoch/reset` is the way out.
         "epoch": engine.epoch_json(),
+        // The change-log envelope the sequencer PARKED on, if any (ADR-0010): `epoch.reason` is then
+        // `change_log_unprocessable`, and this says which envelope and what went wrong with it. Null
+        // while changes are being processed normally.
+        "changeLogFailure": engine.change_log_failure_json(),
         // The INGESTOR's position in the segmented change log (ADR-0006): which segment it appends
         // to, and the tail offset of its last append. Additive — the four fields above are
         // untouched — and it is what a convergence barrier reads to know which `changes/<n>` to
@@ -789,8 +793,15 @@ async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Va
     Ok(Json(serde_json::json!({ "ok": true, "epoch": engine.epoch_json() })))
 }
 
-async fn get_metrics() -> Json<serde_json::Value> {
-    Json(crate::metrics::metrics().snapshot())
+/// `GET /metrics` — the engine's counters and gauges, plus `changeLogFailure` when the sequencer has
+/// parked on an envelope it could not process (ADR-0010). That one is engine state rather than a
+/// counter: "degraded" is not actionable without knowing which envelope.
+async fn get_metrics(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    let mut snapshot = crate::metrics::metrics().snapshot();
+    if let Some(failure) = engine.change_log_failure_json() {
+        snapshot["changeLogFailure"] = failure;
+    }
+    Json(snapshot)
 }
 
 async fn reset_metrics() -> Json<serde_json::Value> {

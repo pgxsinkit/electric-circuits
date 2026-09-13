@@ -295,6 +295,11 @@ pub struct Engine {
     /// Which replication slot, in which cluster, this engine is bound to — and what to do when that
     /// stops being true (see [`engine::epoch`], ADR-0004).
     epoch: Arc<EpochState>,
+    /// The change-log envelope the sequencer could not process, if it has parked on one (ADR-0010).
+    /// Written by the sequencer task through [`sequencer::FailClosed`], cleared by an epoch reset, and
+    /// served on `GET /metrics` and `GET /replication/lsn` — "degraded" alone does not tell an
+    /// operator which envelope to look at, and nothing else in the process knows.
+    change_log_failure: Arc<std::sync::Mutex<Option<ChangeLogFailure>>>,
     /// The process's graceful-shutdown state (see [`crate::shutdown`]). Held here — not in a global
     /// — because every part that must join it (the sequencer's select, the ingestor, the `/v1/shape`
     /// live poll, `GET /ready`) already has an `Engine`.
@@ -960,6 +965,7 @@ impl Engine {
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
+            change_log_failure: Arc::new(std::sync::Mutex::new(None)),
             shutdown,
             sub_nonce: crate::engine::catalog::process_nonce().into(),
         };
@@ -1223,8 +1229,28 @@ impl Engine {
             self.arr_gates.read().unwrap().clone(),
             self.pg_url.is_none(),
             hold_reads,
+            // Two std-locked handles, not an `Engine`: see `FailClosed`.
+            FailClosed { failure: self.change_log_failure.clone(), epoch: self.epoch.clone() },
             self.shutdown.clone(),
         )
+    }
+
+    /// The change-log envelope the sequencer parked on, as JSON (ADR-0010), or `None` while the engine
+    /// is processing changes normally. Served on `GET /metrics` and `GET /replication/lsn`.
+    pub fn change_log_failure_json(&self) -> Option<serde_json::Value> {
+        let f = self.change_log_failure.lock().unwrap().clone()?;
+        Some(serde_json::json!({
+            "position": { "segment": f.position.segment, "path": f.position.path(), "offset": f.position.offset },
+            "table": f.table,
+            "key": f.key,
+            "txid": f.txid,
+            "lsn": f.lsn,
+            "envelopeOffset": f.envelope_offset,
+            "error": f.error,
+            // Spelled out rather than left implicit: this is the one state whose recovery is a
+            // deliberate operator act (the break is never auto-reset).
+            "recovery": "POST /epoch/reset",
+        }))
     }
 
     /// Number of tables with a known schema (tables being tailed) — for the boot `consumers_ready` metric.
@@ -1656,7 +1682,12 @@ impl Engine {
             })
             .collect();
         let primary_key = ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect();
-        Ok(TableSchemaInfo { table: ts.table.clone(), columns, primary_key })
+        Ok(TableSchemaInfo {
+            table: ts.table.clone(),
+            columns,
+            primary_key,
+            schema_digest: ts.schema_digest.map(crate::schema::digest_hex),
+        })
     }
 
     /// Insert one row into a replicated table's Postgres relation, so the change is captured by logical

@@ -501,6 +501,14 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
 | `catalog_restore_retired_<reason>_total` | counter | shape records the boot's catalog restore retired instead of resuming (ADR-0009), one per reason: `schema`, `subquery`, `table_gone`, `stream_missing`, `stream_closed`. Prometheus exports one `engine_catalog_restore_retired_total` with a `reason` attribute. `schema`/`subquery` after a boot are expected; the other three mean something outside the engine moved |
+| `sequencer_stale_schema_skipped_total` | counter | change-log envelopes consumed **without** being decoded, because a drift replaced the schema they were decoded under while the sequencer was still behind the ingestor (ADR-0010). Non-zero after a migration is expected and is bounded by the DML that migration outran; non-zero with no migrations means something is writing envelopes under a schema the engine does not have |
+| `sequencer_unknown_table_skipped_total` | counter | change-log envelopes consumed without being decoded because the engine does not compile their table at all — dropped, or parked unresolved (ADR-0005), so its dependents are retired. The other half of the same rule; a `type` that is not a canonical `schema.name` is **not** counted here, because no producer can write one — it parks the sequencer |
+
+While the sequencer is **parked** on a change it cannot process (ADR-0010), both metrics surfaces
+report the envelope: `GET /metrics` adds a `changeLogFailure` object and `GET /replication/lsn` carries
+the same one. It names the envelope (`table`, `key`, `txid`, `lsn`, the change-log `position`, the
+`error` chain) and its `recovery`: `POST /epoch/reset`. While the engine is processing changes normally
+the key is **absent** from `GET /metrics` and **`null`** on `GET /replication/lsn`.
 
 The three replication-slot gauges are sampled every ~10 s by an **engine-owned** sampler on a
 **pooled** connection (never a dedicated one), and the same sample feeds StatsD — so the numbers are
@@ -533,6 +541,39 @@ on closed-**and**-drained, so the abandoned one is inert.)
 Every position in the log is therefore a `(segment, offset)` pair — the sequencer's checkpoint, a
 dormant shape's resume state, `GET /tables/{name}/offset`. Comparing offsets alone is wrong: an
 offset from a later segment can be lexicographically smaller than one from an earlier segment.
+
+Every **data** envelope on the log also carries `headers.schema`: the digest of the table schema it was
+decoded under, as 16 hex characters (`docs/adr/0010-change-log-envelopes-carry-their-schema-and-processing-fails-closed.md`).
+It is the fence that lets the sequencer — which runs behind the ingestor — tell an envelope its
+compiled schema *describes* from one encoded before a migration. A shape stream's envelopes never carry
+it (it is the engine's own bookkeeping, not part of what a subscriber reads), and neither does anything
+in library mode, which has no fingerprint to digest. `GET /table/{name}/schema` reports the digest a
+table is compiled under as `schemaDigest`.
+
+**A change the engine cannot process stops ingest into shapes.** If an envelope whose stamp matches the
+schema about to decode it will not decode, that is an engine bug or corrupt storage, so the sequencer
+**parks** at it: the transaction is unwound (no partial flush, no count fold, the de-duplication
+highwater restored), the read cursor is rewound to the replay boundary, nothing is published or
+checkpointed past it — on shutdown either — and the engine latches
+`epoch.reason = change_log_unprocessable`, which makes `GET /ready` and `/v1/health` report `degraded`
+and every shape route answer 503. It keeps serving commands, so a purge or a reset still works. The
+break is **never** reset automatically, whatever `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` says: recovery is
+`POST /epoch/reset`, which retires every shape, rotates the change log and restarts the replay on the
+fresh segment, so nothing before it is ever read again. A restart before that re-derives the same park,
+by design.
+
+**Exactly two things are consumed without being decoded**, and both say the same thing — everything that
+could have wanted the change is already retired: an envelope whose schema a drift has replaced
+(`sequencer_stale_schema_skipped_total`), and one for a table the engine does not compile at all —
+dropped, or parked unresolved (`sequencer_unknown_table_skipped_total`). Everything else parks,
+including a `type` that is not a canonical `schema.name` (no producer can write one).
+
+The same rule governs the two replay paths, each narrowed to the one schema it holds: a pending shape's
+buffered deltas at activation, and a dormant shape's reactivation replay. That second one matters most
+— it reads from the shape's resume position to the head of the open segment, so it can reach an
+envelope the live loop has not, and will park on. A failure there fails the reactivation (the shape
+stays dormant and the read that touched it is refused) rather than reporting a shape live that is short
+a change.
 
 A rotated-out segment is **deleted** by the retention sweeper once the **durable** checkpoint (the
 last position that actually reached the catalog, not the sequencer's in-memory one) is past it and
@@ -624,6 +665,15 @@ the new schema. A create that was already in flight when a drift retired its tab
 (`schema of <t> changed during creation; retry`) and rolled back rather than installed against a
 schema that is gone.
 
+**The sequencer's side of a drift.** It reads the log behind the ingestor, so by the time it reaches the
+changes a migrating transaction was interleaved with, the compiled schema has already been swapped and
+those envelopes describe a table that no longer exists. They are **consumed without being decoded** —
+recognised by the schema digest each envelope carries, not by position (the swap happens
+mid-transaction, so no position separates old from new) — and counted as
+`sequencer_stale_schema_skipped_total`. That is correct precisely because every shape that could have
+wanted them was retired by the same drift. Any other envelope that will not decode parks the sequencer
+instead (see *The change log*, ADR-0010).
+
 Granularity is per table: a migration on one table never resyncs another. The one exception is a
 table with a counts pipeline (`ELECTRIC_CIRCUITS_DBSP_COUNTS`) — the circuit is built and seeded once
 at boot with no runtime rebuild, so once the retirements and catalog records have landed the process
@@ -690,6 +740,18 @@ recorded but not acted on — one primary, no promotion, per the ADR.)
   (`epoch.state = "broken"`, `epoch.reason` one of `slot_lost` / `slot_wal_lost` /
   `system_identifier_mismatch`). Nothing is destroyed while refusing. Recovery is a deliberate act:
   `POST /epoch/reset` runs exactly the reset above and resumes ingest.
+
+A fourth reason ends an epoch without the slot being at fault: `change_log_unprocessable` (ADR-0010,
+above). It is **never** auto-reset — under either policy, and not on the ingestor's reconnect — because
+a reset destroys every shape and doing that in reply to an engine bug would do it on a loop. The reset
+that recovers it keeps the slot (it is healthy, and our own walsender is streaming from it) and rebinds
+it, which is what ends the old epoch.
+
+**Every reset moves the sequencer's replay start.** After retiring the shapes and force-rotating the
+change log, the reset restarts the replay at the beginning of the fresh segment and records that
+position durably alongside the drops — so nothing written under the epoch that ended is ever read
+again, including the envelope a parked sequencer stopped on. The old segments hold changes for shapes
+that no longer exist, whichever reason ended the epoch.
 
 Reconnects (and refusals) back off exponentially with jitter, 1 s → 30 s. The schedule resets only
 when a connection actually **delivered** — a `START_REPLICATION` the server rejected (the slot is held

@@ -587,6 +587,7 @@ fn taken() -> Envelope {
             lsn: None,
             seq: None,
             last: None,
+            schema: None,
         },
     }
 }
@@ -697,6 +698,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                schema: None,
             },
         }
     }

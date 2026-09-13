@@ -438,7 +438,15 @@ fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_
         key: key.into(),
         value,
         old,
-        headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None, lsn: None, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: op.into(),
+            txid: None,
+            offset: None,
+            lsn: None,
+            seq: None,
+            last: None,
+            schema: None,
+        },
     }
 }
 
@@ -1372,6 +1380,7 @@ async fn emission_lanes_order_and_barrier() {
             lsn: None,
             seq: None,
             last: None,
+            schema: None,
         },
     };
     // Interleave two streams; per-stream order must survive whatever lane assignment they get.

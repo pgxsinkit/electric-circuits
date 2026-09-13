@@ -395,6 +395,18 @@ pub fn init_otel() -> SdkMeterProvider {
         sequencer_orphan_fragments,
         ""
     );
+    engine_counter!(
+        "engine_sequencer_stale_schema_skipped",
+        "Change-log envelopes consumed without decoding: their schema was replaced by a drift (ADR-0010)",
+        sequencer_stale_schema_skipped,
+        ""
+    );
+    engine_counter!(
+        "engine_sequencer_unknown_table_skipped",
+        "Change-log envelopes consumed without decoding: the engine does not compile their table (ADR-0010)",
+        sequencer_unknown_table_skipped,
+        ""
+    );
     engine_gauge!(
         "engine_changes_segments_retained",
         "Change-log segments that exist right now",

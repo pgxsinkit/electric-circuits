@@ -142,6 +142,19 @@ pub struct Metrics {
     /// first, or an epoch reset abandoning the fragment). Never zero-cost silence: the fragment is
     /// re-delivered in full or was abandoned, and either way an operator should be able to see it.
     pub sequencer_orphan_fragments: AtomicU64,
+    /// ADR-0010: change-log envelopes the sequencer CONSUMED without decoding, because the schema
+    /// they were decoded under is not the one the engine holds any more — a drift (ADR-0005) swapped
+    /// it and retired every shape that could have wanted them, while the sequencer was still behind
+    /// the ingestor. The one legitimate reason an envelope is not processed; everything else parks the
+    /// sequencer (`change_log_failure`). Non-zero after a migration is expected, and the count is
+    /// bounded by the DML the migrating transaction outran.
+    pub sequencer_stale_schema_skipped: AtomicU64,
+    /// ADR-0010: change-log envelopes CONSUMED without decoding because the engine does not compile
+    /// their table at all — it was dropped, or is parked unresolved (ADR-0005). The second (and last)
+    /// legitimate reason an envelope is not processed: the table's dependents went with it, so the
+    /// change has no consumer. A `type` that is not a canonical `schema.name` is NOT counted here — no
+    /// producer can write one, so it parks the sequencer instead.
+    pub sequencer_unknown_table_skipped: AtomicU64,
     /// GAUGE, not a counter: how many change-log segments exist right now (republished by every
     /// retention sweep). `reset()` leaves it alone — a gauge describes the world, not the window.
     pub changes_segments_retained: AtomicU64,
@@ -201,6 +214,8 @@ pub fn metrics() -> &'static Metrics {
         retirements_pending: AtomicU64::new(0),
         backfill_chunked_appends: AtomicU64::new(0),
         sequencer_orphan_fragments: AtomicU64::new(0),
+        sequencer_stale_schema_skipped: AtomicU64::new(0),
+        sequencer_unknown_table_skipped: AtomicU64::new(0),
         sequencer_held_run: AtomicU64::new(0),
         shutdown_in_progress: AtomicU64::new(0),
         replication_slot_retained_wal_bytes: AtomicU64::new(0),
@@ -285,6 +300,8 @@ impl Metrics {
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
                 "backfill_chunked_appends_total": self.backfill_chunked_appends.load(Ordering::Relaxed),
                 "sequencer_orphan_fragments_total": self.sequencer_orphan_fragments.load(Ordering::Relaxed),
+                "sequencer_stale_schema_skipped_total": self.sequencer_stale_schema_skipped.load(Ordering::Relaxed),
+                "sequencer_unknown_table_skipped_total": self.sequencer_unknown_table_skipped.load(Ordering::Relaxed),
             },
             "gauges": {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
@@ -335,6 +352,8 @@ impl Metrics {
         self.txn_chunked_appends.store(0, Ordering::Relaxed);
         self.backfill_chunked_appends.store(0, Ordering::Relaxed);
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
+        self.sequencer_stale_schema_skipped.store(0, Ordering::Relaxed);
+        self.sequencer_unknown_table_skipped.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
         // (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`,
         // `retirements_pending`, and the three replication-slot gauges the sampler republishes).

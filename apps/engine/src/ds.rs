@@ -61,11 +61,31 @@ pub struct EnvelopeHeaders {
     /// incomplete transaction, by definition — never a transaction that opted out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<bool>,
+    /// **The schema this change was decoded under** — `SchemaFingerprint::digest` as 16 lowercase hex
+    /// characters (ADR-0010).
+    ///
+    /// Set by the replication ingestor on every data envelope it appends to the change log in
+    /// Postgres mode, and on nothing else: never on a shape-stream (output) envelope — subscribers
+    /// read those, and the engine's own fence is no part of their contract — and never in library
+    /// mode, where there is no fingerprint and no drift to fence.
+    ///
+    /// The sequencer is behind the ingestor, so it can reach an envelope whose schema a drift has
+    /// already replaced (ADR-0005 swaps the compiled schema and retires that table's shapes). This is
+    /// what tells the two apart: a stamp that matches the schema about to decode it means a decode
+    /// failure is an ENGINE BUG and stops ingest; one that names a schema the drift replaced means the
+    /// envelope's shapes are already gone and consuming it without decoding is correct. A string, not
+    /// a `u64`, because the log is JSON and a number above 2^53 does not survive `JSON.parse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 }
 
 impl crate::heap_size::HeapSize for EnvelopeHeaders {
     fn heap_bytes(&self) -> usize {
-        self.operation.heap_bytes() + self.txid.heap_bytes() + self.offset.heap_bytes() + self.lsn.heap_bytes()
+        self.operation.heap_bytes()
+            + self.txid.heap_bytes()
+            + self.offset.heap_bytes()
+            + self.lsn.heap_bytes()
+            + self.schema.heap_bytes()
     }
 }
 
@@ -958,6 +978,7 @@ mod tests {
                 lsn: None,
                 seq: Some(7),
                 last: Some(true),
+                schema: None,
             },
         };
         let expected = serde_json::to_vec(&[envelope.clone()]).unwrap();

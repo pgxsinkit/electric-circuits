@@ -105,6 +105,10 @@ pub enum EpochBreakReason {
     SlotWalLost,
     /// A different Postgres cluster answers at this URL than the one the epoch was bound in.
     SystemIdentifierMismatch,
+    /// The sequencer reached a change-log envelope it could not process and the schema it was
+    /// encoded under IS the one the engine holds — so it is an engine bug or storage corruption, not
+    /// drift (ADR-0010). Ingest into shapes stops at that envelope rather than stepping over it.
+    ChangeLogUnprocessable,
 }
 
 impl EpochBreakReason {
@@ -113,8 +117,38 @@ impl EpochBreakReason {
             EpochBreakReason::SlotLost => "slot_lost",
             EpochBreakReason::SlotWalLost => "slot_wal_lost",
             EpochBreakReason::SystemIdentifierMismatch => "system_identifier_mismatch",
+            EpochBreakReason::ChangeLogUnprocessable => "change_log_unprocessable",
         }
     }
+
+    /// Must an OPERATOR clear this break? The auto-reset policy (ADR-0004) does not apply to it, at
+    /// boot or on a reconnect.
+    ///
+    /// True only for [`Self::ChangeLogUnprocessable`]. The slot reasons describe something that
+    /// happened to Postgres and that a fresh slot + a resync genuinely repairs, so an unattended
+    /// deployment may heal itself. This one describes the engine failing to process a change it
+    /// wrote itself: auto-resetting would destroy every shape in reply to a bug, on a loop, and throw
+    /// away the evidence. Pathological states are refused, not healed.
+    pub fn needs_operator(self) -> bool {
+        matches!(self, EpochBreakReason::ChangeLogUnprocessable)
+    }
+
+    /// Is the SLOT what this break is about — i.e. must a reset replace it?
+    ///
+    /// False only for [`Self::ChangeLogUnprocessable`] (ADR-0010): there the slot is healthy, the
+    /// engine is bound to exactly the slot Postgres has, and the ingestor is streaming from it. A new
+    /// slot would buy nothing (the epoch's shapes are all retired and a new one backfills from
+    /// Postgres), and Postgres would refuse to drop one its own walsender holds. The new epoch rebinds
+    /// the same slot instead.
+    pub fn slot_is_suspect(self) -> bool {
+        !matches!(self, EpochBreakReason::ChangeLogUnprocessable)
+    }
+}
+
+/// Does the configured auto-reset policy apply to this break? Pure, so both halves of the rule are
+/// unit-testable: the policy switch, and the reasons no policy may auto-reset.
+fn auto_reset_applies(reason: EpochBreakReason, auto_reset: bool) -> bool {
+    auto_reset && !reason.needs_operator()
 }
 
 impl std::fmt::Display for EpochBreakReason {
@@ -137,12 +171,19 @@ pub struct EpochBroken {
 
 impl std::fmt::Display for EpochBroken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "epoch broken ({}): the replication slot is no longer the one the engine bound to, so every \
-             shape is missing an unknown span of changes; POST /epoch/reset starts a new epoch",
-            self.reason
-        )
+        // The recovery is the same either way; what is broken is not, and a message naming the slot
+        // for a change-log failure would send an operator to look at a slot that is perfectly healthy.
+        let what = match self.reason {
+            EpochBreakReason::ChangeLogUnprocessable => {
+                "the engine cannot process a change on its own change log, so no shape is maintained \
+                 past it"
+            }
+            _ => {
+                "the replication slot is no longer the one the engine bound to, so every shape is \
+                 missing an unknown span of changes"
+            }
+        };
+        write!(f, "epoch broken ({}): {what}; POST /epoch/reset starts a new epoch", self.reason)
     }
 }
 
@@ -232,6 +273,27 @@ pub(crate) struct EpochState {
 }
 
 impl EpochState {
+    /// Latch the break and **count** it, once; the caller announces it, because what is worth saying
+    /// differs by reason. Returns whether this call is the one that latched it.
+    ///
+    /// On [`EpochState`] rather than only on [`Engine`] so the sequencer can latch from its own task
+    /// (ADR-0010) through a narrow handle instead of holding an `Engine` — which would make the
+    /// engine, and with it the sequencer's own command channel, un-droppable.
+    ///
+    /// The latch is what makes the count right: a reset that fails is retried on every reconnect, and
+    /// each retry re-derives the same verdict — `epoch_breaks_total` must stay "epochs that ended",
+    /// not "times we noticed".
+    pub(crate) fn latch(&self, reason: EpochBreakReason) -> bool {
+        let mut broken = self.broken.lock().unwrap();
+        if broken.is_some() {
+            return false;
+        }
+        *broken = Some(reason);
+        drop(broken);
+        crate::metrics::metrics().epoch_breaks.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(EpochState {
             slot: std::sync::Mutex::new(None),
@@ -302,19 +364,17 @@ impl Engine {
         })
     }
 
-    /// Latch the break, and count + announce it **once**.
+    /// Latch the break, and count + announce it **once** — the SLOT half of [`EpochState::latch`]
+    /// (which counts but does not log; see it for why the latch is what makes the count right).
+    /// Returns whether this call is the one that latched it.
     ///
-    /// The latch is what makes the count right: a reset that fails is retried on every reconnect,
-    /// and each retry re-derives the same verdict — `epoch_breaks_total` must stay "epochs that
-    /// ended", not "times we noticed". Returns whether this call is the one that latched it.
+    /// The sequencer's fail-closed park latches through [`EpochState::latch`] directly instead, so it
+    /// can announce the envelope it stopped on rather than a slot that is perfectly healthy
+    /// (ADR-0010).
     pub(crate) fn latch_epoch_break(&self, reason: EpochBreakReason, slot: &str) -> bool {
-        let mut broken = self.epoch.broken.lock().unwrap();
-        if broken.is_some() {
+        if !self.epoch.latch(reason) {
             return false;
         }
-        *broken = Some(reason);
-        drop(broken);
-        crate::metrics::metrics().epoch_breaks.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             "EPOCH BREAK on slot '{slot}' ({reason}): the slot the engine bound to is not the slot \
              postgres has, so every shape is missing an unknown span of changes and no amount of \
@@ -324,6 +384,11 @@ impl Engine {
     }
 
     /// Say, once, that the refuse policy is in force and what clears it.
+    ///
+    /// Only the SLOT reasons come through here. A break that
+    /// [`EpochBreakReason::needs_operator`] is announced by whoever detected it — the sequencer names
+    /// the envelope it stopped on and the same recovery (ADR-0010) — and the ingestor then reports its
+    /// refusal on every reconnect attempt, so nothing is silent.
     pub(crate) fn log_refuse_policy(&self, reason: EpochBreakReason) {
         tracing::error!(
             "ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false: ingest is stopped and every shape route \
@@ -475,7 +540,37 @@ impl Engine {
         //     instead of waiting for the size/age budget to expire on its own.
         self.changes.force_rotate().await;
 
-        // 2. The barrier. Nothing may create the new slot until every `Dropped` is durable.
+        // 1c. Move the replay start onto the fresh segment (ADR-0010). Every segment written under the
+        //     epoch that just ended belongs to shapes that no longer exist, so nothing may read them
+        //     again — and when the reset is recovering a PARKED sequencer, the envelope it could not
+        //     process is in there: leaving the position where it was would replay it and park again,
+        //     so the reset would not be a recovery at all.
+        //
+        //     **A running sequencer records the position itself**, from its own task, before it
+        //     acknowledges the jump (see `SequencerCmd::Jump`). That ordering has to be by
+        //     construction rather than by timing: the catalog fold is last-wins, and a checkpoint the
+        //     resumed sequencer writes a moment later would otherwise be free to overtake an `Offset`
+        //     sent from here and lower the durable start again. Sends from one task are FIFO, so its
+        //     own is necessarily first. Only a reset with NO sequencer — at boot, before the restore
+        //     spawns one — records it here.
+        //
+        //     A rotation that could not complete (storage refused the close) leaves `current` where it
+        //     was, so the start is that segment's own beginning. That re-reads the old epoch's tail,
+        //     which costs a replay and nothing else — every shape it could fan out to has been
+        //     retired, and one created afterwards fences the replay with its own backfill snapshot —
+        //     and it never skips past a change.
+        let start = LogPosition::start_of(self.changes.state().current());
+        if !self.jump_sequencer(start.clone()).await {
+            self.catalog_tx.send(CatalogEvent::Offset { pos: start.clone(), highwater: None });
+        }
+        *self.seq_start.lock().unwrap() = start;
+        *self.seq_highwater.lock().unwrap() = None;
+        // The park is over: whatever the sequencer could not process is in a segment nothing will read
+        // again, so the record of it goes too (the break itself is cleared by `bind_epoch`).
+        *self.change_log_failure.lock().unwrap() = None;
+
+        // 2. The barrier. Nothing may create the new slot until every `Dropped` is durable — nor
+        //    until the replay start above is, for the same reason.
         if !self.catalog_tx.drain(CATALOG_DRAIN_TIMEOUT).await {
             bail!(
                 "epoch reset: the catalog writer did not drain the shape drops within {:?}, so the \
@@ -489,8 +584,21 @@ impl Engine {
         //    of the same name someone else made, a slot whose WAL is gone) is not ours, so it is
         //    dropped rather than adopted. A dedicated connection, never the shared pool: the pool is
         //    where the post-reset backfill storm queues, and the reset must not wait behind it.
+        //
+        //    Unless the break was never about the slot (ADR-0010): then the slot is healthy, our own
+        //    walsender is streaming from it — Postgres refuses to drop one an active walsender holds —
+        //    and replacing it would buy nothing, because every shape of the old epoch is retired and a
+        //    new one backfills from Postgres. The new binding below rebinds the same slot, which is what
+        //    ends the old epoch and clears the break.
         let client = crate::pg::connect(&url).await.context("epoch reset: connect to postgres")?;
-        crate::pg::recreate_slot(&client, &slot).await?;
+        if reason.slot_is_suspect() {
+            crate::pg::recreate_slot(&client, &slot).await?;
+        } else {
+            tracing::warn!(
+                "epoch reset ({reason}): keeping the replication slot '{slot}' — this break is not about \
+                 the slot, and ingest continues on it; the new epoch rebinds the same slot"
+            );
+        }
         // From here until `bind_epoch` succeeds the slot exists but nothing records it. The break is
         // still latched, so a failure here leaves the engine refusing (and, under the auto policy,
         // retrying) rather than streaming a fresh slot under the old binding.
@@ -537,13 +645,17 @@ impl Engine {
 
     /// Apply the configured policy to a break. Shared by the boot check and the ingestor's
     /// pre-connect check, so both count, announce and act identically.
+    ///
+    /// A reason that [`EpochBreakReason::needs_operator`] is refused here under EVERY policy — the
+    /// auto-reset default included — so a re-entry (the ingestor's `before_connect` re-derives the
+    /// latch on every reconnect attempt) can never turn one into a reset (ADR-0010).
     pub(crate) async fn on_epoch_break(
         &self,
         reason: EpochBreakReason,
         slot: &str,
     ) -> std::result::Result<(), Refused> {
         let first = self.latch_epoch_break(reason, slot);
-        if !self.epoch_auto_reset() {
+        if !auto_reset_applies(reason, self.epoch_auto_reset()) {
             if first {
                 self.log_refuse_policy(reason);
             }
@@ -563,6 +675,33 @@ impl Engine {
 }
 
 impl Engine {
+    /// Tell a running sequencer to restart its replay at `pos`, and wait for it to say it has
+    /// (`SequencerCmd::Jump`).
+    ///
+    /// Returns whether a sequencer took it — and therefore whether the new position is already on its
+    /// way to the durable catalog, recorded by that task ahead of anything it writes next. `false`
+    /// means there is no sequencer (at boot the reset runs before the restore spawns one) or it died
+    /// mid-jump, and the caller must record the position itself.
+    async fn jump_sequencer(&self, pos: LogPosition) -> bool {
+        let cmd_tx = { self.state.lock().await.sequencer.as_ref().map(|seq| seq.cmd_tx.clone()) };
+        let Some(cmd_tx) = cmd_tx else { return false };
+        let (done, ack) = tokio::sync::oneshot::channel();
+        if cmd_tx.send(SequencerCmd::Jump { pos, done }).is_err() {
+            return false;
+        }
+        // Served between transactions, so this also waits out the batch in flight — the same wait the
+        // reset's retirements take on the same storage.
+        ack.await.is_ok()
+    }
+
+    /// Restart the sequencer's replay at `pos`, as [`Self::reset_epoch`] does, with no Postgres round
+    /// trip. Test-only: the real reset needs a slot and a cluster to rebind, which the library-mode
+    /// engine the sequencer tests drive has neither of.
+    #[doc(hidden)]
+    pub async fn force_sequencer_jump(&self, pos: LogPosition) -> bool {
+        self.jump_sequencer(pos).await
+    }
+
     /// Run the reset's engine-state critical section — enumerate, bump the epoch generation, raise
     /// the `resetting` flag — with no Postgres round trip, and hold the flag until the returned
     /// handle is dropped. Test-only: it is what a create racing a real reset actually sees.
@@ -636,6 +775,7 @@ impl crate::replication::EpochEvents for Engine {
 mod tests {
     use super::*;
     use crate::pg::SlotRow;
+    use crate::replication::EpochEvents;
 
     fn binding() -> SlotBinding {
         SlotBinding {
@@ -763,5 +903,55 @@ mod tests {
         assert_eq!(EpochBreakReason::SlotLost.as_str(), "slot_lost");
         assert_eq!(EpochBreakReason::SlotWalLost.as_str(), "slot_wal_lost");
         assert_eq!(EpochBreakReason::SystemIdentifierMismatch.as_str(), "system_identifier_mismatch");
+        assert_eq!(EpochBreakReason::ChangeLogUnprocessable.as_str(), "change_log_unprocessable");
+    }
+
+    /// A change the engine cannot process is never auto-reset — under EITHER policy (ADR-0010).
+    /// Resetting destroys every shape, and doing that in reply to an engine bug would do it on a loop
+    /// and throw the evidence away. The slot reasons are the opposite case: a new slot and a resync
+    /// genuinely repair them, so the default policy may.
+    #[test]
+    fn only_an_unprocessable_change_log_refuses_under_both_policies() {
+        assert!(EpochBreakReason::ChangeLogUnprocessable.needs_operator());
+        for reason in
+            [EpochBreakReason::SlotLost, EpochBreakReason::SlotWalLost, EpochBreakReason::SystemIdentifierMismatch]
+        {
+            assert!(!reason.needs_operator(), "{reason} is repaired by a reset");
+            assert!(auto_reset_applies(reason, true), "{reason} auto-resets under the default policy");
+            assert!(!auto_reset_applies(reason, false), "{reason} refuses under RESET_ON_SLOT_LOSS=false");
+        }
+        for auto_reset in [true, false] {
+            assert!(
+                !auto_reset_applies(EpochBreakReason::ChangeLogUnprocessable, auto_reset),
+                "auto_reset={auto_reset} must not reset an unprocessable change log"
+            );
+        }
+    }
+
+    /// The ingestor's pre-connect gate re-derives the latch on every reconnect attempt. For a break
+    /// that needs an operator it must refuse — not resume a reset — however the policy is set: that
+    /// re-entry is the loop the rule exists to prevent. Exercised through the real
+    /// [`Engine::before_connect`], under the DEFAULT (auto-reset) policy, which is the dangerous one.
+    #[tokio::test]
+    async fn a_latched_unprocessable_change_log_refuses_the_ingestors_reconnect() {
+        let engine = Engine::new_pg(
+            crate::ds::DsClient::new("http://127.0.0.1:1"),
+            "postgres://127.0.0.1:1/nothing".to_string(),
+        );
+        engine.set_epoch_slot("slot");
+        assert!(engine.epoch_auto_reset(), "the default policy is what this test is about");
+        assert!(engine.latch_epoch_break(EpochBreakReason::ChangeLogUnprocessable, "slot"));
+
+        let refused = engine.before_connect().await.expect_err("a broken epoch must refuse the connection");
+        match refused {
+            Refused::EpochBroken(reason) => assert_eq!(reason, "change_log_unprocessable"),
+            other => panic!("expected the epoch-broken refusal, got {other}"),
+        }
+        // Still broken: nothing reset it, so the refusal is stable rather than a one-off.
+        assert_eq!(engine.epoch_broken(), Some(EpochBreakReason::ChangeLogUnprocessable));
+        assert_eq!(engine.health_status(), "degraded");
+        // ...and every shape route refuses with the typed 503.
+        let err = engine.ensure_not_degraded().expect_err("shape routes must refuse");
+        assert!(err.downcast_ref::<EpochBroken>().is_some(), "unexpected refusal: {err:#}");
     }
 }

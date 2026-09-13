@@ -288,6 +288,10 @@ pub struct TableSchemaInfo {
     pub table: TableRef,
     pub columns: Vec<TableColumnInfo>,
     pub primary_key: Vec<String>,
+    /// The digest of the schema fingerprint this table is compiled under (ADR-0010), as the 16 hex
+    /// characters the change log carries — the value an envelope's `headers.schema` is compared
+    /// against. `null` in library mode (no fingerprint, so nothing to fence).
+    pub schema_digest: Option<String>,
 }
 
 /// One entry of a subquery node's live inner-set index.

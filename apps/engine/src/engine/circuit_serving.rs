@@ -5,24 +5,39 @@
 use super::*;
 
 /// Convert one change-log envelope into a gate-fenced, stamped counts delta.
-/// `None` = not applicable (table without a counts pipeline, empty delta, or fenced out by
-/// the seed gate).
+///
+/// `Ok(None)` = not applicable (table without a counts pipeline, empty delta, fenced out by the seed
+/// gate, or an envelope decoded under a schema a drift has since replaced — ADR-0010). `Err` = the
+/// schema the engine holds IS the one the envelope was decoded under and it still would not decode,
+/// which parks the sequencer: the counts tier has no runtime rebuild, so feeding it a transaction
+/// with a hole in it is unrecoverable.
 pub(crate) fn stamped_delta_for_arrangements(
     tables: &SharedTables,
     arr: &crate::arrangements::Arrangements,
     arr_gates: &HashMap<TableRef, crate::pg::SnapshotGate>,
     env: &Envelope,
-) -> Option<crate::arrangements::StampedDelta> {
+) -> Result<Option<crate::arrangements::StampedDelta>> {
     // The envelope `type` IS the canonical `schema.name` — strictly, exactly as `exec_for` requires
     // (see its doc comment): a non-canonical spelling is refused here too, so the counts feed and
     // the fan-out can never disagree about which envelopes belong to a table.
-    let table = TableRef::parse(&env.type_).ok().filter(|t| t.as_str() == env.type_)?;
+    let Some(table) = TableRef::parse(&env.type_).ok().filter(|t| t.as_str() == env.type_) else {
+        return Ok(None);
+    };
     // Only counted tables enter the circuit — everything else has no input handle.
-    arr.counts_group_cols(&table)?;
-    let ts = tables.read().unwrap().get(&table).cloned()?;
-    let (delta, txid, lsn) = apply_envelope(&ts, env).ok()?;
+    if arr.counts_group_cols(&table).is_none() {
+        return Ok(None);
+    }
+    let Some(ts) = tables.read().unwrap().get(&table).cloned() else { return Ok(None) };
+    // The schema fence (ADR-0010). This tier reads the CURRENT shared schema rather than an
+    // executor's, so "the envelope's schema is not this one" always means pre-drift — and a drift on a
+    // counted table exits the process once its retirements have landed (ADR-0005), so there is
+    // nothing here to keep consistent with.
+    if !super::sequencer::schema_describes(&ts, env) {
+        return Ok(None);
+    }
+    let (delta, txid, lsn) = apply_envelope(&ts, env)?;
     if delta.is_empty() {
-        return None;
+        return Ok(None);
     }
     let lsn_u = lsn.as_deref().map(crate::pg::lsn_to_u64);
     let xid_u = txid.as_deref().and_then(|t| t.parse::<u64>().ok());
@@ -30,10 +45,10 @@ pub(crate) fn stamped_delta_for_arrangements(
     // idempotent, so a double-apply would corrupt counts).
     if let Some(gate) = arr_gates.get(&table) {
         if gate.should_skip(lsn_u.unwrap_or(0), xid_u) {
-            return None;
+            return Ok(None);
         }
     }
-    Some(crate::arrangements::StampedDelta { table, delta, lsn: lsn_u, seq: env.headers.seq })
+    Ok(Some(crate::arrangements::StampedDelta { table, delta, lsn: lsn_u, seq: env.headers.seq }))
 }
 
 /// Sequencer-side creation of a circuit-served COUNT aggregate: seed = Σ matching count groups

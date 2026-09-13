@@ -776,6 +776,11 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
             lsn: None,
             seq: None,
             last: None,
+            // The schema this row was decoded under (ADR-0010). `ts` is read from the SHARED view on
+            // every message, so an envelope always carries the digest of the schema that produced
+            // it — including the first one after a drift swapped it. `None` in library mode, where
+            // there is no fingerprint.
+            schema: ts.schema_digest.map(crate::schema::digest_hex),
         },
     };
     match msg {
@@ -1236,6 +1241,53 @@ mod tests {
             d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }),
             Decoded::Env(_)
         ));
+    }
+
+    /// Every envelope carries the digest of the schema it was decoded under (ADR-0010) — and follows
+    /// the shared view when a drift swaps it, because that view is what the decoder reads per message.
+    /// Without that the sequencer could not tell an envelope its schema describes from one encoded
+    /// before a migration.
+    #[tokio::test]
+    async fn every_envelope_carries_the_digest_of_the_schema_it_was_decoded_under() {
+        let tables = shared(fingerprinted_users());
+        let ev = Arc::new(RecordingEvents::default());
+        let t_ref = TableRef::parse("users").unwrap();
+        let before = users_fingerprint().digest();
+
+        let mut d = Decoder::new(tables.clone());
+        d.on_relation(users_rel(1, "public"), ev.as_ref(), None).await;
+        let e = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }));
+        assert_eq!(e.headers.schema.as_deref(), Some(crate::schema::digest_hex(before).as_str()));
+
+        // A migration: the "engine" retires the dependents and swaps the compiled schema, exactly as
+        // the real drift handler does. The next envelope must name the NEW schema — an envelope
+        // carrying the old digest after the swap would be skipped as pre-drift and lost.
+        let altered = SchemaFingerprint {
+            columns: vec![fp_col("id", 23), fp_col("tenant", 23), fp_col("name", 25), fp_col("extra", 25)],
+            replident: crate::schema::REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        };
+        let mut def = users_def(Some(altered.clone()));
+        def.columns.insert("extra".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
+        *ev.resolves_to.lock().unwrap() = Some(TableSchema::from_def(&t_ref, &def).unwrap());
+        *ev.tables.lock().unwrap() = Some(tables.clone());
+        let altered_msg = rel_msg(1, "public", "users", &[("id", 23), ("tenant", 23), ("name", 25), ("extra", 25)]);
+        d.on_relation(altered_msg, ev.as_ref(), None).await;
+
+        let e = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("2"), t("7"), t("b"), t("x")] }));
+        let after = altered.digest();
+        assert_ne!(after, before, "the fingerprint moved, so the digest must too");
+        assert_eq!(e.headers.schema.as_deref(), Some(crate::schema::digest_hex(after).as_str()));
+    }
+
+    /// Library mode has no fingerprint, so nothing to stamp: the fence is a Postgres-mode construct
+    /// (there is no drift without a catalog to drift from).
+    #[tokio::test]
+    async fn a_library_mode_envelope_carries_no_digest() {
+        let tables = shared(users());
+        let (d, _ev) = decoder(&tables).await;
+        let e = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }));
+        assert!(e.headers.schema.is_none());
     }
 
     /// A changed relation reports EXACTLY ONCE per change: the drift, then silence while the new

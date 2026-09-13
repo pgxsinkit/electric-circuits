@@ -346,6 +346,19 @@ pooled connection concurrently; `ActivateShape` replays the buffer through the s
 gate and goes live. The buffer is registered before the snapshot is taken, so no change can fall
 between them.
 
+**Nothing it reads is ever skipped quietly** (ADR-0010). Each envelope carries the digest of the schema
+it was decoded under, so the sequencer — which is behind the ingestor — can recognise the two envelopes
+it is right not to process: one a drift has orphaned (schema replaced, dependents retired), and one for
+a table the engine no longer compiles (dropped or parked unresolved — same reasoning). Both are counted.
+Anything else that will not decode — a `type` no producer could have written included — **parks** the
+sequencer at that envelope: the transaction is unwound, the cursor rewound to the replay boundary,
+nothing is published or checkpointed past it, and the engine latches `degraded` until an operator's
+`POST /epoch/reset` — which retires every shape and restarts the replay on a fresh segment. It keeps
+serving commands while parked, which is how that reset reaches it. The two replay paths — a pending
+shape's buffered deltas and a dormant shape's reactivation, which reads ahead of the live loop to the
+head of the open segment — apply the same rule against the one schema they hold, so neither reports a
+shape live that is short a change.
+
 ### 5.2 Three execution strategies
 
 The shape of the predicate picks the strategy (full detail + cost model: internals doc §3):
@@ -769,6 +782,9 @@ absolute membership emission makes them unnecessary for convergence).
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
 | graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, writes a final `Offset` → catalog drains → exit 0 (71 if it does not drain); bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
+| change-log envelope ↔ the schema that decodes it | every data envelope carries `headers.schema` — the digest of the compiled `SchemaFingerprint` the ingestor decoded it under (never on an output envelope); the sequencer compares it with the schema about to decode it, and with the CURRENT one when they differ (ADR-0010). The live loop, a pending shape's buffered replay and a dormant shape's reactivation replay all apply it | exactly two envelopes may go unprocessed, and both are already orphaned: one whose schema a drift replaced (`sequencer_stale_schema_skipped_total`) and one whose table the engine does not compile (`sequencer_unknown_table_skipped_total`) — in both cases the dependents were retired (ADR-0005). A stale executor is refreshed rather than skipped past, an unstamped envelope is decoded as current, and a stamp that is not exactly 16 lowercase hex characters counts as unstamped rather than as some other schema — a position-based fence could do none of this, because the schema swap happens mid-transaction |
+| sequencer ↔ a change it cannot process | the transaction is unwound (highwater restored, counts deltas never applied, nothing flushed), the cursor rewound to the replay boundary (the page, or the page a held run began in), nothing published or checkpointed past it — on shutdown either — and the engine latches `EpochBreakReason::ChangeLogUnprocessable`, which is never auto-reset (ADR-0010) | a change the schema says the engine should be able to process is never skipped: no shape is maintained past it, `/ready` and `/v1/health` say `degraded`, every shape route answers 503, and `GET /metrics` + `/replication/lsn` name the exact envelope. A restart re-derives the same park rather than stepping over it; the sequencer keeps serving commands so the recovery can reach it |
+| epoch reset ↔ the change log | after retiring every shape the reset force-rotates the log, restarts the sequencer at the start of the fresh segment (`SequencerCmd::Jump` — executors and pending creations dropped, no highwater) and records that position durably with the drops (ADR-0004, ADR-0010) | nothing written under the epoch that ended is ever read again — including the envelope a parked sequencer stopped on, which is what makes `POST /epoch/reset` a recovery rather than a loop. A reset whose cause was not the slot keeps the slot (healthy, and held by our own walsender) and rebinds it |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,

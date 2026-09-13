@@ -89,7 +89,15 @@ pub(crate) fn absolute_envelope(
         key: key.to_string(),
         value,
         old: None,
-        headers: EnvelopeHeaders { operation: operation.into(), txid, offset: None, lsn, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: operation.into(),
+            txid,
+            offset: None,
+            lsn,
+            seq: None,
+            last: None,
+            schema: None,
+        },
     })
 }
 
@@ -138,6 +146,7 @@ pub(crate) fn translate_output(
                 lsn: lsn.clone(),
                 seq: None,
                 last: None,
+                schema: None,
             },
         });
     }
@@ -160,6 +169,7 @@ pub(crate) fn translate_output(
                 lsn: lsn.clone(),
                 seq: None,
                 last: None,
+                schema: None,
             },
         });
     }
@@ -187,6 +197,7 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
                 lsn: None,
                 seq: None,
                 last: None,
+                schema: None,
             },
         })
         .collect()
@@ -208,6 +219,81 @@ pub(crate) fn agg_envelope(
         key: "agg".into(),
         value: Some(serde_json::json!({ "value": value, "n": n })),
         old: None,
-        headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: "upsert".into(),
+            txid,
+            offset: None,
+            lsn,
+            seq: None,
+            last: None,
+            schema: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{FingerprintColumn, REPLICA_IDENTITY_FULL, SchemaFingerprint, TableDef};
+
+    /// An introspected table: it has a fingerprint, so its envelopes are stamped (ADR-0010).
+    fn items() -> TableSchema {
+        let mut def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": { "type": "int" }, "n": { "type": "int" } },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        def.fingerprint = Some(SchemaFingerprint {
+            columns: vec![
+                FingerprintColumn { name: "id".into(), type_oid: 23, typmod: -1 },
+                FingerprintColumn { name: "n".into(), type_oid: 23, typmod: -1 },
+            ],
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        });
+        TableSchema::from_def(&crate::table_ref::TableRef::parse("items").unwrap(), &def).unwrap()
+    }
+
+    /// The schema digest is the ENGINE's fence, not part of what a subscriber reads: it belongs on
+    /// change-log envelopes and nowhere else (ADR-0010). Asserted on the serialized form, because that
+    /// is what reaches a client — pgxsinkit's client reads shape streams, and a header it never asked
+    /// for is a contract it would then have to carry.
+    #[test]
+    fn no_output_envelope_carries_the_schema_digest() {
+        let ts = items();
+        assert!(ts.schema_digest.is_some(), "an introspected schema has a digest to leak in the first place");
+        // The input envelope IS stamped — so the outputs below are derived from a stamped change.
+        let input = Envelope {
+            type_: ts.table.to_string(),
+            key: "1".into(),
+            value: Some(serde_json::json!({ "id": 1, "n": 10 })),
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "insert".into(),
+                txid: Some("7".into()),
+                offset: None,
+                lsn: Some("0/10".into()),
+                seq: Some(0),
+                last: Some(true),
+                schema: ts.schema_digest.map(crate::schema::digest_hex),
+            },
+        };
+        let (delta, txid, lsn) = apply_envelope(&ts, &input).unwrap();
+        let row = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r.clone()).unwrap();
+        // A second key, retracted: `translate_output`'s delete branch only runs for a pk with no
+        // positive weight.
+        let left = ts.row_from_json(serde_json::json!({ "id": 2, "n": 20 }).as_object().unwrap()).unwrap();
+
+        let mut outs = translate_output(&ts, vec![(row.clone(), 1), (left, -1)], txid.clone(), lsn.clone(), None);
+        outs.extend(absolute_envelope(&ts, "1", Some(&row), txid.clone(), lsn.clone(), None));
+        outs.extend(absolute_envelope(&ts, "2", None, txid.clone(), lsn.clone(), None));
+        outs.extend(delete_envelopes(&ts, vec!["3".into()], txid.clone()));
+        outs.push(agg_envelope(&ts.table, serde_json::json!(1), 1, txid, lsn));
+        assert!(outs.len() >= 5, "every output constructor is covered: {outs:?}");
+        for env in &outs {
+            assert!(env.headers.schema.is_none(), "output envelope carries a schema digest: {env:?}");
+            let json = serde_json::to_value(env).unwrap();
+            assert!(json["headers"].get("schema").is_none(), "serialized output carries a schema key: {json}");
+        }
     }
 }

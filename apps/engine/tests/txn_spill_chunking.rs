@@ -106,6 +106,7 @@ fn env_of(key: &str, payload: usize) -> Envelope {
             lsn: None,
             seq: None,
             last: None,
+            schema: None,
         },
     }
 }

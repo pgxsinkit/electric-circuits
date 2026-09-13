@@ -109,6 +109,7 @@ fn envelope() -> Envelope {
             lsn: None,
             seq: None,
             last: Some(true),
+            schema: None,
         },
     }
 }

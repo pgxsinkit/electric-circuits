@@ -106,6 +106,21 @@ pub(crate) enum SequencerCmd {
     Discard {
         done: tokio::sync::oneshot::Sender<()>,
     },
+    /// **Start over at `pos`**, forgetting everything held: the epoch reset's half of the recovery
+    /// (ADR-0004, ADR-0010). The reset retires every shape and rotates the change log, so nothing in
+    /// the old segments may ever be read again — including, after a fail-closed park, the envelope
+    /// the sequencer could not process. A sequencer left where it was would replay it and park again.
+    ///
+    /// Every executor and every pending creation is dropped, so a create still in flight fails at its
+    /// `ActivateShape` (no executor, no pending shape) and rolls itself back — which a create racing a
+    /// reset would be refused for anyway, by the epoch generation. Reads resume at `pos` with no
+    /// de-duplication highwater (the new epoch's log starts empty), and the sequencer records the new
+    /// position durably itself before acknowledging, so no checkpoint of its own can be ordered ahead
+    /// of it.
+    Jump {
+        pos: LogPosition,
+        done: tokio::sync::oneshot::Sender<()>,
+    },
     /// Dump the full internal state of one node (`family:<t>:<cols>` → the routing index
     /// contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX multiset).
     /// `None` if the node id is unknown. Serves `GET /state/node`.
@@ -122,6 +137,42 @@ pub(crate) enum SequencerCmd {
     MemBytes {
         resp: tokio::sync::oneshot::Sender<usize>,
     },
+}
+
+/// The change-log envelope the sequencer could not process (ADR-0010).
+///
+/// Recorded on the engine and served on `GET /metrics` and `GET /replication/lsn`, because "the
+/// engine is degraded" is not actionable on its own: an operator needs the exact envelope, and the
+/// engine is the only thing that knows which one it was.
+#[derive(Clone, Debug)]
+pub(crate) struct ChangeLogFailure {
+    /// Where the sequencer stopped — the position it would re-read from, which is the page the
+    /// envelope arrived in (or, if a transaction was held across pages, the page that run began in).
+    pub(crate) position: LogPosition,
+    /// The envelope's `type`: the table it says it belongs to.
+    pub(crate) table: String,
+    /// Its `key` — the row, within the page.
+    pub(crate) key: String,
+    pub(crate) txid: Option<String>,
+    pub(crate) lsn: Option<String>,
+    /// Which envelope of the (control-filtered, run-merged) page it was, 0-based: a transaction can
+    /// carry many envelopes for the same table and key.
+    pub(crate) envelope_offset: usize,
+    /// The formatted error chain.
+    pub(crate) error: String,
+}
+
+/// How the sequencer fails closed (ADR-0010): where the failing envelope is recorded, and the latch
+/// that makes the engine refuse instead of serving shapes it can no longer maintain.
+///
+/// A narrow handle rather than an `Engine`: the sequencer's command channel lives inside the engine,
+/// so a task holding an `Engine` clone could never be ended by dropping the engine. Both fields are
+/// std locks touched without awaiting, so the sequencer can never block the engine state lock —
+/// which a create holds while waiting for a sequencer acknowledgement.
+#[derive(Clone)]
+pub(crate) struct FailClosed {
+    pub(crate) failure: Arc<std::sync::Mutex<Option<ChangeLogFailure>>>,
+    pub(crate) epoch: Arc<EpochState>,
 }
 
 /// What kind of shape a pending creation becomes at activation.
@@ -150,6 +201,9 @@ pub(crate) fn spawn_sequencer(
     // shapes one at a time, and a sequencer reading while it does would consume — and checkpoint
     // past — changes that a shape registered a moment later never sees.
     hold_reads: bool,
+    // Where an envelope the sequencer cannot process is recorded, and how the engine is latched
+    // broken for it (ADR-0010).
+    fail_closed: FailClosed,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -175,6 +229,7 @@ pub(crate) fn spawn_sequencer(
         arr_gates,
         library_mode,
         hold_reads,
+        fail_closed,
         shutdown,
         party,
     ));
@@ -330,8 +385,10 @@ pub(crate) struct PendingShape {
 /// catch-up — compares `env.type_ != table.as_str()` and would skip the very same envelopes, so a
 /// shape's live stream and its replayed stream would disagree. No legitimate writer produces a
 /// non-canonical `type`: the replication ingestor stamps `TableRef::to_string()`, and library-mode
-/// writes go through the protocol's `toTableEnvelope`/`canonicalTable`. One that somehow appears
-/// falls into the caller's "unknown table" branch — logged, highwater-advanced, dropped.
+/// writes go through the protocol's `toTableEnvelope`/`canonicalTable`. One that somehow appears is
+/// therefore not a routing question but corrupt storage, and [`resolve_exec`] parks the sequencer on
+/// it (ADR-0010) — it is the caller, not this function, that tells that apart from a table the engine
+/// simply does not compile.
 pub(crate) fn exec_for<'a>(
     execs: &'a mut HashMap<String, TableExec>,
     tables: &SharedTables,
@@ -370,6 +427,7 @@ pub(crate) async fn sequencer_loop(
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
     library_mode: bool,
     hold_reads: bool,
+    fail_closed: FailClosed,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -422,6 +480,18 @@ pub(crate) async fn sequencer_loop(
     // has to be visible rather than looking like an idle engine.
     let mut held_since: Option<std::time::Instant> = None;
     let mut held_warnings: u32 = 0;
+    // PARKED (ADR-0010): an envelope the schema says this engine should be able to process would not
+    // decode, so the sequencer stopped reading rather than step over a change a shape needed. It keeps
+    // serving commands — the epoch reset's purges and its `Jump` are what recovers — and publishes and
+    // checkpoints nothing past the envelope. Distinct from `!reading`, which a HELD restore sequencer
+    // also is (and which has read nothing at all).
+    let mut parked = false;
+    // Tables whose pre-drift envelopes have already been reported, per schema digest: a migrating
+    // transaction can outrun the sequencer by thousands of changes, and each of them is the same
+    // fact. One line per (table, schema) per sequencer.
+    let mut stale_schema_reported: HashSet<(String, u64)> = HashSet::new();
+    // The same, for tables the engine does not compile at all (dropped, or parked unresolved).
+    let mut unknown_table_reported: HashSet<String> = HashSet::new();
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -550,6 +620,50 @@ pub(crate) async fn sequencer_loop(
                     let _ = done.send(());
                     break;
                 }
+                Some(SequencerCmd::Jump { pos: to, done }) => {
+                    tracing::warn!(
+                        "sequencer: restarting the change-log replay at {to} (epoch reset); dropping {} table \
+                         executor(s) and everything they routed",
+                        execs.len()
+                    );
+                    // Everything held describes the epoch that just ended: its shapes are retired and
+                    // its segments are never read again. Dropping the executors drops every pending
+                    // creation with them, so a create still in flight fails its activation ("no
+                    // executor for table") and rolls itself back.
+                    execs.clear();
+                    emitted.clear();
+                    pos = to;
+                    held.clear();
+                    held_from = None;
+                    held_since = None;
+                    held_warnings = 0;
+                    metrics().sequencer_held_run.store(0, Ordering::Relaxed);
+                    // The pointer belonged to the segment just left; following it from the new one
+                    // would cross to a segment nothing has read.
+                    rotate_to = None;
+                    highwater = None;
+                    // Record the new replay start HERE, and from this task: the catalog writer is a
+                    // FIFO, so a checkpoint this sequencer writes after resuming is necessarily
+                    // ordered behind it. The engine cannot make that promise — its `Offset` and the
+                    // first post-jump periodic checkpoint would race, and the fold is last-wins, so a
+                    // stale one would lower the durable start again.
+                    catalog_tx.send(CatalogEvent::Offset { pos: pos.clone(), highwater: None });
+                    ckpt_pos = pos.clone();
+                    ckpt_hw = None;
+                    last_ckpt = std::time::Instant::now();
+                    *processed.lock().unwrap() = pos.clone();
+                    // A PARKED sequencer reads again — that is what the reset is for. One still HELD
+                    // by a catalog restore (ADR-0009) stays held: its `ReleaseReads` is the restore's
+                    // to send, and it will start from the new position when it arrives.
+                    if parked {
+                        reading = true;
+                    }
+                    parked = false;
+                    // Acked only once the position is on its way to the catalog and reads are set to
+                    // resume, so the reset knows both are true when it returns.
+                    let _ = done.send(());
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
                     let val =
                         execs.get(table.as_str()).and_then(|exec| dump_node_json(exec, &pos.to_string(), &emitted, &node_id));
@@ -594,6 +708,16 @@ pub(crate) async fn sequencer_loop(
                         rotate_to = Some(n);
                     }
                     envs.retain(|e| !crate::changelog::is_control(e));
+                    // Where a failure in THIS page must rewind to, kept separately from `held_from`:
+                    // that pin is cleared the moment a held run completes on this page, and a later
+                    // transaction failing must still re-read the completed run, whose appends went out
+                    // from here (ADR-0010).
+                    //
+                    // Captured before the orphan-fragment branch below, so a failure on a page that
+                    // DISCARDED a held fragment rewinds to that fragment's page rather than to this
+                    // one. Deliberately conservative: the fragment was never emitted, so re-reading it
+                    // costs a page and cannot double-apply (the highwater fences what was applied).
+                    let held_replay_from = held_from.clone();
                     // Re-attach the run held from an earlier page (ADR-0003).
                     //
                     // A re-delivery complicates this: when the ingestor fails part-way through a
@@ -700,27 +824,46 @@ pub(crate) async fn sequencer_loop(
                     // envelope carrying `headers.last`, so a commit appended in several chunks
                     // (ADR-0003) is processed once, whole, not chunk by chunk.
                     let mut touched = false;
+                    // The envelope this page could not process, if any (ADR-0010): set once, and
+                    // everything after it — the count fold, the flush, the publication, the
+                    // checkpoint — is skipped rather than done with a hole in it.
+                    let mut failure: Option<ChangeLogFailure> = None;
                     let mut i = 0;
                     while i < envs.len() {
+                        // The de-duplication highwater moves only once the WHOLE transaction is
+                        // through: a failure part-way restores it, so the replay re-applies the
+                        // transaction from its first envelope rather than from after the prefix that
+                        // did work.
+                        let txn_highwater = highwater;
                         let txid = envs[i].headers.txid.clone();
                         let lsn = envs[i].headers.lsn.clone();
                         let mut j = i + 1;
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
                         }
-                        // Feed this transaction into the dbsp counts pipelines and step the
-                        // circuit BEFORE fanning it out, so circuit-served aggregates emit
-                        // within the transaction that changed them. The counts layer re-checks
-                        // its own (lsn, seq) highwater, so feeding pre-dedup envelopes is safe.
-                        let txn_count_deltas = if let Some(arr) = &arr {
-                            let deltas: Vec<_> = envs[i..j]
-                                .iter()
-                                .filter_map(|env| stamped_delta_for_arrangements(&tables, arr, &arr_gates, env))
-                                .collect();
-                            arr.apply_batch(deltas).await
-                        } else {
-                            Vec::new()
-                        };
+                        // Stage this transaction's counts deltas for the dbsp pipelines, to be applied
+                        // once every envelope has fanned out — the circuit must never absorb a prefix
+                        // of a transaction whose fan-out then failed (it has no runtime rebuild, so
+                        // there is no way back). The counts layer re-checks its own (lsn, seq)
+                        // highwater, so staging pre-dedup envelopes is safe.
+                        let mut txn_arr_deltas = Vec::new();
+                        if let Some(arr) = &arr {
+                            for k in i..j {
+                                match stamped_delta_for_arrangements(&tables, arr, &arr_gates, &envs[k]) {
+                                    Ok(Some(d)) => txn_arr_deltas.push(d),
+                                    // Not a counted table, an empty delta, fenced out by the seed
+                                    // gate, or an envelope from before a drift (ADR-0010).
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        failure = Some(ChangeLogFailure::of(&envs[k], k, &e));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if failure.is_some() {
+                            break;
+                        }
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                         for k in i..j {
                             // Skip redelivered changes (see `highwater` above).
@@ -734,11 +877,54 @@ pub(crate) async fn sequencer_loop(
                                     continue;
                                 }
                             }
-                            let Some(exec) = exec_for(&mut execs, &tables, &envs[k].type_) else {
-                                tracing::error!("sequencer: change for unknown table '{}'", envs[k].type_);
-                                if let Some(p) = pos { highwater = Some(p); }
-                                continue;
-                            };
+                            // Route the envelope to an executor, under THE SCHEMA FENCE (ADR-0010):
+                            // ready to decode, consumed without decoding (the only two reasons there
+                            // are), or fatal.
+                            match resolve_exec(&mut execs, &tables, &envs[k]) {
+                                Resolve::Ready => {}
+                                Resolve::Consume(why) => {
+                                    // CONSUMED, deliberately: no shape can want this change, so the
+                                    // position and the highwater advance and a restart does not come
+                                    // back to it. Counted, and reported once per cause — a migration
+                                    // (or a dropped table) can orphan thousands of changes, and each
+                                    // of them is the same fact.
+                                    match why {
+                                        Consume::PreDrift(digest) => {
+                                            metrics().sequencer_stale_schema_skipped.fetch_add(1, Ordering::Relaxed);
+                                            if stale_schema_reported.insert((envs[k].type_.clone(), digest)) {
+                                                tracing::warn!(
+                                                    "sequencer: skipping changes to '{}' that were decoded under \
+                                                     schema {} — a drift has replaced it (ADR-0005) and every \
+                                                     dependent shape is retired, so these changes have no consumer \
+                                                     left. Counted as sequencer_stale_schema_skipped_total.",
+                                                    envs[k].type_,
+                                                    crate::schema::digest_hex(digest)
+                                                );
+                                            }
+                                        }
+                                        Consume::TableGone => {
+                                            metrics().sequencer_unknown_table_skipped.fetch_add(1, Ordering::Relaxed);
+                                            if unknown_table_reported.insert(envs[k].type_.clone()) {
+                                                tracing::warn!(
+                                                    "sequencer: skipping changes to '{}' — the engine does not \
+                                                     compile that table (dropped, or parked unresolved — ADR-0005), \
+                                                     so its dependents are retired and these changes have no \
+                                                     consumer left. Counted as \
+                                                     sequencer_unknown_table_skipped_total.",
+                                                    envs[k].type_
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(p) = pos { highwater = Some(p); }
+                                    continue;
+                                }
+                                Resolve::Fatal(e) => {
+                                    failure = Some(ChangeLogFailure::of(&envs[k], k, &e));
+                                    break;
+                                }
+                            }
+                            let exec = execs.get_mut(envs[k].type_.as_str()).expect("resolved above");
                             // LIBRARY MODE: no Postgres wrote this change, so nothing stamped a
                             // before-image on it. Fill it in from the sequencer's own per-key view
                             // (`TableExec::library_rows`) HERE — after the de-duplication highwater
@@ -767,7 +953,11 @@ pub(crate) async fn sequencer_loop(
                             )
                             .await
                             {
-                                tracing::error!("process_envelope failed: {e:#}");
+                                // The schema fence says this envelope IS ours, so failing to process
+                                // it is an engine bug or corrupt storage — never something to step
+                                // over, which would leave a shape silently short of a change. Stop.
+                                failure = Some(ChangeLogFailure::of(&envs[k], k, &e));
+                                break;
                             }
                             exec.envelopes_total += 1;
                             touched = true;
@@ -775,7 +965,17 @@ pub(crate) async fn sequencer_loop(
                                 highwater = Some(p);
                             }
                         }
-                        // Counts pipeline → circuit-served aggregates.
+                        if failure.is_some() {
+                            // Nothing of this transaction is applied further: no count fold (the
+                            // deltas were only staged), no flush of the partial `txn_pending` (a
+                            // subscriber must never see a fraction of a commit), no highwater.
+                            highwater = txn_highwater;
+                            break;
+                        }
+                        // Counts pipeline → circuit-served aggregates. Applied only now, once the
+                        // whole transaction has fanned out.
+                        let txn_count_deltas =
+                            if let Some(arr) = &arr { arr.apply_batch(txn_arr_deltas).await } else { Vec::new() };
                         if !txn_count_deltas.is_empty() {
                             apply_count_deltas(
                                 &mut execs, txn_count_deltas, txid.clone(), lsn.clone(), &mut txn_pending,
@@ -790,6 +990,49 @@ pub(crate) async fn sequencer_loop(
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
                         i = j;
+                    }
+                    if let Some(mut failure) = failure {
+                        // PARK (ADR-0010). Rewind the read cursor to where a replay must start: the
+                        // page the held run began in when one was re-attached here (its completed
+                        // appends went out from this page, so they have to be re-read), else this
+                        // page's own start. `processed` was never advanced, so the published position
+                        // — the restart point, `GET /tables/{n}/offset`, the deletion floor — already
+                        // agrees with it.
+                        match held_replay_from {
+                            Some(from) => {
+                                pos = from.clone();
+                                held_from = Some(from);
+                            }
+                            None => pos.offset = read_off,
+                        }
+                        failure.position = published(&pos, &held_from);
+                        // Stop reading, keep serving commands: the epoch reset's purges and its
+                        // `Jump` are the recovery, and both arrive as commands.
+                        reading = false;
+                        parked = true;
+                        *fail_closed.failure.lock().unwrap() = Some(failure.clone());
+                        // Latch the engine broken so `/ready` and `/v1/health` say `degraded` and
+                        // every shape route refuses, rather than serving shapes nothing maintains any
+                        // more. NEVER auto-reset: `EpochBreakReason::needs_operator`.
+                        fail_closed.epoch.latch(EpochBreakReason::ChangeLogUnprocessable);
+                        tracing::error!(
+                            "CHANGE LOG UNPROCESSABLE at {} (table '{}', key '{}', txid {:?}, lsn {:?}, envelope {} of \
+                             the page): {}. The schema this change was decoded under is the one the engine holds, so \
+                             this is an engine bug or corrupt storage, not schema drift — and stepping over it would \
+                             leave every shape on that table silently short of a change. The sequencer is PARKED: it \
+                             is not retried, no shape is maintained past this point, nothing further is published or \
+                             checkpointed, and the engine reports `degraded`. Recovery is an operator's: \
+                             POST /epoch/reset retires every shape and restarts the replay on a fresh change-log \
+                             segment.",
+                            failure.position,
+                            failure.table,
+                            failure.key,
+                            failure.txid,
+                            failure.lsn,
+                            failure.envelope_offset,
+                            failure.error,
+                        );
+                        continue;
                     }
                     // Publish the processed position only after the whole batch is fanned out +
                     // flushed — and never past a run still being HELD (ADR-0003): a restart must
@@ -893,13 +1136,163 @@ pub(crate) async fn sequencer_loop(
     // A sequencer that never read has nothing to record: its position is still the one it was
     // started from, which the catalog already holds, and a restore being rolled back must not
     // append anything on its way out.
-    if !reading {
+    if !reading && !parked {
         tracing::info!("sequencer: stopped before reading the change log; no checkpoint to write");
         return;
     }
     let ckpt = published(&pos, &held_from);
     catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
+    if parked {
+        // The rewound position, which is AT the envelope that could not be processed and never past
+        // it (ADR-0010) — so the next process re-derives the same park instead of stepping over it,
+        // and the progress made before it (the highwater) is not replayed.
+        tracing::info!("sequencer: stopped while parked at {ckpt} (highwater {highwater:?})");
+        return;
+    }
     tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
+}
+
+/// Why an envelope is CONSUMED without being decoded. There are exactly two reasons, and both say
+/// the same thing: whatever could have wanted this change has been retired (ADR-0010).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Consume {
+    /// It was decoded under a schema a drift has since replaced (ADR-0005).
+    PreDrift(u64),
+    /// Its table is not one the engine compiles: dropped, or parked unresolved. Same reasoning — the
+    /// dependents went with it, and a table that comes back is a fresh backfill behind its own gate.
+    TableGone,
+}
+
+/// What routing one envelope to an executor produced (ADR-0010).
+pub(crate) enum Resolve {
+    /// The executor exists and its schema is the one the envelope was decoded under: decode, and treat
+    /// a failure as fatal.
+    Ready,
+    /// Consume it without decoding, for one of the two legitimate reasons.
+    Consume(Consume),
+    /// Not routable at all, and not for any reason the engine can explain: park.
+    Fatal(anyhow::Error),
+}
+
+/// Get the executor for an envelope's table, applying the schema fence — the ONE place the live loop
+/// decides whether an envelope is its to decode.
+///
+/// Refreshing a stale executor happens here too (it is the `ResetTable` a drift already sent, taken
+/// early), so the caller sees a single answer per envelope and no table is resolved twice.
+pub(crate) fn resolve_exec(execs: &mut HashMap<String, TableExec>, tables: &SharedTables, env: &Envelope) -> Resolve {
+    if exec_for(execs, tables, &env.type_).is_none() {
+        // Two very different things (see `exec_for`): a `type` that is not a canonical `schema.name`
+        // at all — which NO producer the engine has can write, so the log itself is corrupt — and a
+        // perfectly well-formed table the engine does not compile.
+        return match TableRef::parse(&env.type_).ok().filter(|t| t.as_str() == env.type_) {
+            Some(_) => Resolve::Consume(Consume::TableGone),
+            None => Resolve::Fatal(anyhow::anyhow!(
+                "change-log envelope names '{}', which is not a canonical schema.name. Every producer \
+                 stamps one (the ingestor from `TableRef`, library-mode writes through `canonicalTable`), \
+                 so this envelope was not written by this engine",
+                env.type_
+            )),
+        };
+    }
+    match schema_fence_of(env, execs, tables) {
+        SchemaFence::Decode => Resolve::Ready,
+        SchemaFence::PreDrift(digest) => Resolve::Consume(Consume::PreDrift(digest)),
+        SchemaFence::StaleExec => {
+            // Exactly what `ResetTable` does: the executor is keyed by the OLD schema, so it is
+            // dropped rather than patched and rebuilt from the (already swapped) shared view. Every
+            // shape it routed to was retired by the same drift handler.
+            tracing::warn!(
+                "sequencer: dropped the executor for '{}' (schema drift; its ResetTable is still queued \
+                 behind this page)",
+                env.type_
+            );
+            execs.remove(env.type_.as_str());
+            // Gone from the shared view in the moment since the fence read it ⇒ the table was dropped
+            // or parked; consumed like any change on a table the engine no longer compiles.
+            if exec_for(execs, tables, &env.type_).is_none() {
+                return Resolve::Consume(Consume::TableGone);
+            }
+            Resolve::Ready
+        }
+    }
+}
+
+/// What the [`schema_fence`] says about one envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaFence {
+    /// The schema about to decode it is the one it was decoded under: process it, and treat a failure
+    /// as fatal.
+    Decode,
+    /// The executor is stale — the SHARED schema is the envelope's, so a drift has swapped it and the
+    /// `ResetTable` that drops this executor is still queued. Replace the executor, then decode.
+    StaleExec,
+    /// The envelope predates a drift the engine has already resolved (the digest it names is neither
+    /// the executor's nor the current one): its dependent shapes are retired, so it is consumed
+    /// without being decoded.
+    PreDrift(u64),
+}
+
+/// The ADR-0010 fence as a pure decision: `env` is the digest the envelope carries, `exec` the one
+/// the executor about to process it was compiled from, `shared` the one the table's CURRENT compiled
+/// schema has.
+///
+/// Two things are deliberately NOT mismatches. Equal digests — including both absent, which is
+/// library mode — are the ordinary case. And an envelope with NO digest against a table that has one
+/// is decoded as current: it was written by an engine from before the stamp existed, and the safe
+/// direction for an envelope whose provenance is unknown is the loud one (a strict decode that fails
+/// visibly), never a silent skip.
+pub(crate) fn schema_fence(env: Option<u64>, exec: Option<u64>, shared: Option<u64>) -> SchemaFence {
+    match env {
+        _ if env == exec => SchemaFence::Decode,
+        None => SchemaFence::Decode,
+        Some(digest) if Some(digest) == shared => SchemaFence::StaleExec,
+        Some(digest) => SchemaFence::PreDrift(digest),
+    }
+}
+
+/// [`schema_fence`] for one envelope of the read page, reading the shared schema view only when the
+/// stamps actually disagree (the steady state is one integer compare on the hot path).
+fn schema_fence_of(env: &Envelope, execs: &HashMap<String, TableExec>, tables: &SharedTables) -> SchemaFence {
+    let Some(exec) = execs.get(env.type_.as_str()) else { return SchemaFence::Decode };
+    let stamped = stamped_digest(env);
+    if stamped == exec.ts.schema_digest {
+        return SchemaFence::Decode;
+    }
+    let shared = tables.read().unwrap().get(&exec.ts.table).and_then(|ts| ts.schema_digest);
+    schema_fence(stamped, exec.ts.schema_digest, shared)
+}
+
+/// The schema digest an envelope carries (ADR-0010), or `None` when it carries none.
+fn stamped_digest(env: &Envelope) -> Option<u64> {
+    env.headers.schema.as_deref().and_then(crate::schema::digest_from_hex)
+}
+
+/// Does `ts` describe this envelope — i.e. would the main loop decode it rather than skip it?
+///
+/// The replay paths that are NOT the main loop (a pending shape's buffered deltas at activation) use
+/// this instead of the full fence: they hold one executor's schema and no ability to refresh it, and
+/// an envelope from before a drift belongs to shapes that are already retired either way.
+pub(crate) fn schema_describes(ts: &TableSchema, env: &Envelope) -> bool {
+    match stamped_digest(env) {
+        None => true,
+        Some(digest) => Some(digest) == ts.schema_digest,
+    }
+}
+
+impl ChangeLogFailure {
+    /// Record one envelope's failure. `position` is filled in by the loop, which alone knows where a
+    /// replay has to start.
+    fn of(env: &Envelope, envelope_offset: usize, error: &anyhow::Error) -> ChangeLogFailure {
+        ChangeLogFailure {
+            position: LogPosition::start(),
+            table: env.type_.clone(),
+            key: env.key.clone(),
+            txid: env.headers.txid.clone(),
+            lsn: env.headers.lsn.clone(),
+            envelope_offset,
+            error: format!("{error:#}"),
+        }
+    }
 }
 
 /// Wait out a read-error backoff, cut short by a shutdown. The backoff exists to stop a failing
@@ -966,6 +1359,17 @@ fn unterminated_tail(envs: &[Envelope]) -> Option<usize> {
     Some(i)
 }
 
+/// Decode one envelope buffered for a pending shape (ADR-0010): `Ok(None)` when it predates a drift
+/// and belongs to nothing this executor serves, `Err` when the schema describes it and it still would
+/// not decode — which fails the activation, and with it the create.
+type BufferedDelta = (Vec<Tup2<Row, ZWeight>>, Option<String>, Option<String>);
+fn decode_buffered(ts: &TableSchema, env: &Envelope) -> Result<Option<BufferedDelta>> {
+    if !schema_describes(ts, env) {
+        return Ok(None);
+    }
+    Ok(Some(apply_envelope(ts, env)?))
+}
+
 /// Make a pending shape live: register its routing, then replay its buffered deltas through the
 /// snapshot gate — emitting exactly the changes the backfill snapshot did not see. The buffered
 /// replay is appended before the sequencer processes any further change, so the shape stream stays
@@ -1024,7 +1428,12 @@ pub(crate) async fn activate_shape(
             // and standalone predicates alike, so one replay path covers both placements.
             let mut outs: Vec<Envelope> = Vec::new();
             for env in &p.buffered {
-                let Ok((delta, txid, lsn)) = apply_envelope(&exec.ts, env) else { continue };
+                // The same fence the live loop applies (ADR-0010): an envelope from before a drift is
+                // skipped (its shapes are retired), and one this schema DOES describe that still will
+                // not decode fails the activation — the create is refused rather than quietly serving
+                // a shape that is missing a change. The same envelope reaches the main loop, which is
+                // what parks the engine.
+                let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, env)? else { continue };
                 if delta.is_empty() {
                     continue;
                 }
@@ -1064,7 +1473,8 @@ pub(crate) async fn activate_shape(
             let mut outs = vec![agg.envelope(&exec.ts, None, None)];
             agg.last = Some(agg.value());
             for env in &p.buffered {
-                let Ok((delta, txid, lsn)) = apply_envelope(&exec.ts, env) else { continue };
+                // The fence, as in the plain branch above (ADR-0010).
+                let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, env)? else { continue };
                 if delta.is_empty() {
                     continue;
                 }
@@ -1112,6 +1522,15 @@ pub(crate) async fn activate_shape(
 /// the rest — no delta is counted twice and no intermediate state is wrong, only briefly
 /// incomplete, on a stream the shape is not live on yet. The live loop's rule is what governs from
 /// the moment the shape is registered.
+///
+/// It does apply the schema fence (ADR-0010), and a failure here is LOUD for a reason particular to
+/// this path: the replay runs from the shape's resume position to the **head of the open segment**, so
+/// it can reach an envelope the live loop has not processed yet and will park on. Skipping one would
+/// report the shape live and serve it short of that change until the live loop caught up — the exact
+/// silent gap the fence exists to prevent. An envelope from before a drift is still skipped (its
+/// dependents are retired either way); one this schema DESCRIBES and that will not decode fails the
+/// reactivation, which leaves the shape dormant and refuses the read that touched it, exactly as a
+/// storage failure on the append below does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn replay_changes_for_shape(
     ds: &DsClient,
@@ -1128,6 +1547,9 @@ pub(crate) async fn replay_changes_for_shape(
     let mut pos = from.clone();
     let mut rotate_to: Option<u32> = None;
     let mut emitted = 0u64;
+    // Pre-drift schemas already reported by this replay (see the fence below): one line per schema,
+    // not one per envelope, because a migration the shape slept through orphaned every change in it.
+    let mut stale_schema_reported: HashSet<u64> = HashSet::new();
     loop {
         let rr = ds
             .read(&pos.path(), &pos.offset, false)
@@ -1144,7 +1566,31 @@ pub(crate) async fn replay_changes_for_shape(
             if env.type_ != table.as_str() {
                 continue;
             }
-            let Ok((delta, txid, lsn)) = apply_envelope(ts, env) else { continue };
+            // THE SCHEMA FENCE (ADR-0010), in the same narrowed form `decode_buffered` uses: this path
+            // holds one compiled schema and cannot refresh it from the shared view.
+            if !schema_describes(ts, env) {
+                metrics().sequencer_stale_schema_skipped.fetch_add(1, Ordering::Relaxed);
+                if let Some(digest) = stamped_digest(env)
+                    && stale_schema_reported.insert(digest)
+                {
+                    tracing::warn!(
+                        "shape replay on '{table}': skipping changes decoded under schema {} — a drift has \
+                         replaced it (ADR-0005), so they belong to shapes that are already retired",
+                        crate::schema::digest_hex(digest)
+                    );
+                }
+                continue;
+            }
+            // ...and a failure on an envelope this schema DOES describe fails the reactivation rather
+            // than leaving the shape live one change short of the log (see the fn docs).
+            let (delta, txid, lsn) = apply_envelope(ts, env).with_context(|| {
+                format!(
+                    "replaying the change log at {pos} for a shape on '{table}': the change with key '{}' was \
+                     decoded under this table's current schema and still cannot be applied, so the shape cannot \
+                     be brought up to date (ADR-0010)",
+                    env.key
+                )
+            })?;
             // Library mode replays RAW change-log envelopes: nothing stamped a before-image on
             // them (the sequencer's per-key view is the state at the log's HEAD, not at this
             // replay position), so membership is decided ABSOLUTELY per pk — matches now ⇒
@@ -1736,6 +2182,7 @@ mod txn_boundary_tests {
                 lsn: Some(lsn.into()),
                 seq: Some(seq),
                 last: last.then_some(true),
+                schema: None,
             },
         }
     }
@@ -1754,6 +2201,7 @@ mod txn_boundary_tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                schema: None,
             },
         }
     }
@@ -1797,5 +2245,283 @@ mod txn_boundary_tests {
 
         let held_from = LogPosition { segment: 2, offset: "40".into() };
         assert_eq!(published(&cursor, &Some(held_from.clone())), held_from);
+    }
+}
+
+/// The schema fence (ADR-0010): which of the three things the sequencer does with an envelope.
+#[cfg(test)]
+mod schema_fence_tests {
+    use super::*;
+    use crate::ds::EnvelopeHeaders;
+    use crate::schema::{FingerprintColumn, REPLICA_IDENTITY_FULL, SchemaFingerprint, TableDef};
+
+    const CURRENT: u64 = 0x1111_1111_1111_1111;
+    const OLD: u64 = 0x2222_2222_2222_2222;
+    const ELSEWHERE: u64 = 0x3333_3333_3333_3333;
+
+    /// The ordinary case: the executor was compiled from the schema the envelope names, so it is
+    /// processed — and a failure is the caller's to treat as fatal.
+    #[test]
+    fn a_matching_stamp_is_decoded() {
+        assert_eq!(schema_fence(Some(CURRENT), Some(CURRENT), Some(CURRENT)), SchemaFence::Decode);
+        // Library mode: no digests anywhere, and every envelope is still processed.
+        assert_eq!(schema_fence(None, None, None), SchemaFence::Decode);
+    }
+
+    /// The SHARED schema is the envelope's, so the drift has already landed and only this executor is
+    /// behind: its `ResetTable` is still queued behind the page being processed. Refresh and decode —
+    /// skipping here would drop changes that belong to the CURRENT schema.
+    #[test]
+    fn an_executor_the_shared_view_has_moved_past_is_refreshed() {
+        assert_eq!(schema_fence(Some(CURRENT), Some(OLD), Some(CURRENT)), SchemaFence::StaleExec);
+    }
+
+    /// Neither the executor's schema nor the current one: the envelope was encoded before a drift
+    /// whose dependents are all retired. Consumed without decoding.
+    #[test]
+    fn an_envelope_from_before_a_drift_is_skipped() {
+        assert_eq!(schema_fence(Some(OLD), Some(CURRENT), Some(CURRENT)), SchemaFence::PreDrift(OLD));
+        // Two migrations while the sequencer was behind: still pre-drift, whatever the executor holds.
+        assert_eq!(schema_fence(Some(OLD), Some(ELSEWHERE), Some(CURRENT)), SchemaFence::PreDrift(OLD));
+    }
+
+    /// An envelope with NO stamp against a table that HAS a digest — written by an engine from before
+    /// the stamp existed. It is decoded as current: the failure mode of a strict decode is loud, and
+    /// the one outcome the fence exists to prevent is a silent skip. No compatibility branch beyond
+    /// this one line.
+    #[test]
+    fn an_unstamped_envelope_is_decoded_as_current() {
+        assert_eq!(schema_fence(None, Some(CURRENT), Some(CURRENT)), SchemaFence::Decode);
+    }
+
+    fn fingerprint(cols: &[(&str, u32)]) -> SchemaFingerprint {
+        SchemaFingerprint {
+            columns: cols
+                .iter()
+                .map(|(n, oid)| FingerprintColumn { name: (*n).into(), type_oid: *oid, typmod: -1 })
+                .collect(),
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        }
+    }
+
+    fn items(fp: Option<SchemaFingerprint>) -> TableSchema {
+        let mut def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": { "type": "int" }, "n": { "type": "int" } },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        def.fingerprint = fp;
+        TableSchema::from_def(&TableRef::parse("items").unwrap(), &def).unwrap()
+    }
+
+    fn env(digest: Option<u64>) -> Envelope {
+        Envelope {
+            type_: "public.items".into(),
+            key: "1".into(),
+            value: Some(serde_json::json!({ "id": 1, "n": 1 })),
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "insert".into(),
+                txid: Some("7".into()),
+                offset: None,
+                lsn: Some("0/10".into()),
+                seq: Some(0),
+                last: Some(true),
+                schema: digest.map(crate::schema::digest_hex),
+            },
+        }
+    }
+
+    /// The live loop's wrapper resolves the same three answers off real state: the executor map for
+    /// what a table is compiled under, and the shared view for what it is compiled under NOW.
+    #[test]
+    fn the_live_wrapper_reads_the_shared_view_only_when_the_stamps_disagree() {
+        let old = items(Some(fingerprint(&[("id", 23), ("n", 23)])));
+        let new = items(Some(fingerprint(&[("id", 23), ("n", 25)])));
+        let old_digest = old.schema_digest.unwrap();
+        let new_digest = new.schema_digest.unwrap();
+        assert_ne!(old_digest, new_digest);
+
+        let tables: SharedTables = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        tables.write().unwrap().insert(new.table.clone(), new.clone());
+        let mut execs = HashMap::new();
+        execs.insert("public.items".to_string(), TableExec::new(old.clone()));
+
+        // The executor is the OLD schema; the shared view has already been swapped.
+        assert_eq!(schema_fence_of(&env(Some(new_digest)), &execs, &tables), SchemaFence::StaleExec);
+        assert_eq!(schema_fence_of(&env(Some(old_digest)), &execs, &tables), SchemaFence::Decode);
+        assert_eq!(schema_fence_of(&env(None), &execs, &tables), SchemaFence::Decode);
+        // A digest from two schemas ago is neither.
+        assert_eq!(schema_fence_of(&env(Some(0xdead_beef)), &execs, &tables), SchemaFence::PreDrift(0xdead_beef));
+        // An unknown table has no executor to fence against; the caller's unknown-table branch owns it.
+        let mut other = env(Some(old_digest));
+        other.type_ = "public.elsewhere".into();
+        assert_eq!(schema_fence_of(&other, &execs, &tables), SchemaFence::Decode);
+    }
+
+    /// The activation replay's narrower form of the same rule (one executor, no view to refresh from):
+    /// an envelope this schema describes is decoded, and a failure is the activation's to propagate;
+    /// one from before a drift is skipped.
+    #[test]
+    fn a_buffered_envelope_is_decoded_only_when_its_schema_describes_it() {
+        let ts = items(Some(fingerprint(&[("id", 23), ("n", 23)])));
+        let digest = ts.schema_digest.unwrap();
+        assert!(decode_buffered(&ts, &env(Some(digest))).unwrap().is_some(), "matching: decoded");
+        assert!(decode_buffered(&ts, &env(None)).unwrap().is_some(), "unstamped: decoded as current");
+        assert!(decode_buffered(&ts, &env(Some(0xdead_beef))).unwrap().is_none(), "pre-drift: skipped");
+
+        // Matching, and undecodable: the create fails rather than going live a change short.
+        let mut bad = env(Some(digest));
+        bad.value = Some(serde_json::json!({ "id": 1, "n": "not-an-int" }));
+        assert!(decode_buffered(&ts, &bad).is_err());
+        // ...but the same undecodable body from before a drift is simply skipped.
+        let mut stale = bad.clone();
+        stale.headers.schema = Some(crate::schema::digest_hex(0xdead_beef));
+        assert!(decode_buffered(&ts, &stale).unwrap().is_none());
+    }
+
+    /// Library mode: nothing is stamped, so nothing is ever fenced out — the digest machinery is
+    /// invisible there.
+    #[test]
+    fn library_mode_never_fences_anything() {
+        let ts = items(None);
+        assert!(ts.schema_digest.is_none());
+        assert!(schema_describes(&ts, &env(None)));
+        assert!(decode_buffered(&ts, &env(None)).unwrap().is_some());
+    }
+
+    /// The table resolution half of the fence (ADR-0010). A well-formed table the engine does not
+    /// compile is CONSUMED — its dependents went with it — while a `type` that is not a canonical
+    /// `schema.name` at all is corrupt storage and parks the sequencer. The old code logged an
+    /// `ERROR` per envelope and stepped over both.
+    #[test]
+    fn an_uncompiled_table_is_consumed_and_an_unspellable_one_is_fatal() {
+        let ts = items(Some(fingerprint(&[("id", 23), ("n", 23)])));
+        let digest = ts.schema_digest.unwrap();
+        let tables: SharedTables = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let mut execs = HashMap::new();
+
+        // Nothing compiled at all: the table was dropped, or is parked unresolved (ADR-0005).
+        let gone = resolve_exec(&mut execs, &tables, &env(Some(digest)));
+        assert!(matches!(gone, Resolve::Consume(Consume::TableGone)), "an uncompiled table is consumed");
+        assert!(execs.is_empty(), "and no executor is created for it");
+
+        // A `type` no producer can write: the bare-name sugar (canonical is always qualified), an
+        // empty one, a second dot. A case-different spelling is NOT one of them — Postgres identifiers
+        // are byte-exact, so `PUBLIC.items` is a perfectly well-formed reference to a table the engine
+        // does not compile, and the case above governs it.
+        for spelling in ["items", "", "public.items.extra"] {
+            let mut bad = env(Some(digest));
+            bad.type_ = spelling.to_string();
+            match resolve_exec(&mut execs, &tables, &bad) {
+                Resolve::Fatal(e) => assert!(
+                    format!("{e:#}").contains("canonical schema.name"),
+                    "the refusal must say what is wrong with '{spelling}': {e:#}"
+                ),
+                other => panic!(
+                    "'{spelling}' is not a canonical schema.name and must be fatal, got {}",
+                    match other {
+                        Resolve::Ready => "Ready",
+                        Resolve::Consume(_) => "Consume",
+                        Resolve::Fatal(_) => unreachable!(),
+                    }
+                ),
+            }
+        }
+
+        let mut cased = env(Some(digest));
+        cased.type_ = "PUBLIC.items".to_string();
+        assert!(matches!(resolve_exec(&mut execs, &tables, &cased), Resolve::Consume(Consume::TableGone)));
+
+        // Compiled: the ordinary answer.
+        tables.write().unwrap().insert(ts.table.clone(), ts);
+        assert!(matches!(resolve_exec(&mut execs, &tables, &env(Some(digest))), Resolve::Ready));
+        assert!(execs.contains_key("public.items"));
+    }
+
+    /// A durable-streams stand-in serving ONE page of `changes/0` (swappable between calls) and 200
+    /// for everything else — enough to drive the real [`replay_changes_for_shape`].
+    async fn serve_one_page(body: Arc<std::sync::Mutex<String>>) -> String {
+        use axum::extract::{Request, State};
+        use axum::http::{Method, StatusCode};
+        use axum::response::{IntoResponse, Response};
+
+        async fn handler(State(body): State<Arc<std::sync::Mutex<String>>>, req: Request) -> Response {
+            let path = req.uri().path().trim_start_matches('/').to_string();
+            let at =
+                req.uri().query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("offset=")).unwrap_or("-1");
+            match *req.method() {
+                // The page, once: `up-to-date` ends the replay after it.
+                Method::GET if path.starts_with("changes") && at == "-1" => {
+                    let body = body.lock().unwrap().clone();
+                    ([("stream-next-offset", "01"), ("stream-up-to-date", "1")], body).into_response()
+                }
+                Method::GET => ([("stream-next-offset", at), ("stream-up-to-date", "1")], "[]").into_response(),
+                _ => StatusCode::OK.into_response(),
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(axum::routing::any(handler)).with_state(body);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        url
+    }
+
+    /// The dormant-reactivation replay applies the fence too, and **must** (ADR-0010): it reads from
+    /// the shape's resume position to the head of the open segment, ahead of the live loop, so an
+    /// envelope skipped here is served as a live shape until the live loop reaches the same envelope
+    /// and parks. A pre-drift envelope is consumed; one this schema describes and that will not decode
+    /// fails the reactivation.
+    #[tokio::test]
+    async fn the_reactivation_replay_skips_pre_drift_and_fails_on_its_own_schema() {
+        let ts = items(Some(fingerprint(&[("id", 23), ("n", 23)])));
+        let digest = ts.schema_digest.unwrap();
+        // Undecodable against `ts` (a text value in an int column), as a page of one envelope.
+        let page = |stamp: u64| {
+            let mut e = env(Some(stamp));
+            e.value = Some(serde_json::json!({ "id": 1, "n": "not-an-int" }));
+            Arc::new(std::sync::Mutex::new(serde_json::to_string(&vec![e]).unwrap()))
+        };
+
+        let body = page(0xdead_beef);
+        let ds = DsClient::new(serve_one_page(body.clone()).await);
+        let pred = CompiledPredicate::compile_opt(None, &ts).unwrap();
+        let gate = crate::pg::SnapshotGate::passthrough();
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let replay = |ds: DsClient, ts: TableSchema, pred: CompiledPredicate, gate, shutdown| async move {
+            replay_changes_for_shape(
+                &ds,
+                &ts,
+                &ts.table.clone(),
+                &pred,
+                None,
+                &gate,
+                "shape/s1",
+                &LogPosition::start(),
+                false,
+                &shutdown,
+            )
+            .await
+        };
+
+        // Pre-drift: consumed, nothing emitted, counted.
+        let before = metrics().sequencer_stale_schema_skipped.load(Ordering::Relaxed);
+        let emitted = replay(ds.clone(), ts.clone(), pred.clone(), gate.clone(), shutdown.clone())
+            .await
+            .expect("skipped, not failed");
+        assert_eq!(emitted, 0, "a pre-drift envelope emits nothing");
+        assert_eq!(metrics().sequencer_stale_schema_skipped.load(Ordering::Relaxed), before + 1);
+
+        // The same body, stamped with the schema the replay holds: the reactivation fails instead of
+        // reporting the shape live one change short.
+        *body.lock().unwrap() = page(digest).lock().unwrap().clone();
+        let err =
+            replay(ds, ts, pred, gate, shutdown).await.expect_err("a decodable-by-claim envelope must fail loudly");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("cannot be applied"), "unexpected error: {chain}");
+        assert!(chain.contains("expected an integer"), "the cause must survive: {chain}");
     }
 }

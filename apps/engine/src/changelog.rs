@@ -125,6 +125,7 @@ pub fn rotation_envelope(next: u32) -> Envelope {
             lsn: None,
             seq: None,
             last: None,
+            schema: None,
         },
     }
 }
@@ -700,6 +701,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                schema: None,
             },
         };
         assert!(!is_control(&data));
@@ -720,6 +722,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                schema: None,
             },
         }];
         assert_eq!(rotation_target_in(&envs), None);

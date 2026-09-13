@@ -1053,6 +1053,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                schema: None,
             },
         }
     }

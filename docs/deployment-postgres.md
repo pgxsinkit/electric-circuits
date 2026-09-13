@@ -321,6 +321,18 @@ Two caveats worth knowing rather than discovering:
   performs exactly the reset above. Pick `false` when an unscheduled resync is worse than an outage
   (and alert on `epoch_breaks_total`); pick the default when an unattended deployment must heal
   itself. Either way, budget `max_slot_wal_keep_size` for your worst expected engine downtime.
+- **A change the engine cannot process parks it — and only an operator clears that.** If the
+  sequencer reaches a change-log envelope it cannot decode under the very schema it was written with
+  (an engine bug or corrupt storage; schema drift is recognised and never looks like this — ADR-0010),
+  it stops AT that envelope: `/ready` and `/v1/health` report `degraded`, every shape route answers
+  503, and `GET /replication/lsn` names it (`epoch.reason = change_log_unprocessable`, plus a
+  `changeLogFailure` object with the table, key, txid, lsn, position and error; the same object is on
+  `GET /metrics`). This break is **never** reset automatically, whatever
+  `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` says, and a restart parks again at the same envelope rather
+  than stepping over it. Recovery is `POST /epoch/reset`: it retires every shape, restarts the replay
+  on a fresh change-log segment and keeps the slot (it is healthy). Until then the retained WAL and the
+  change-log segments grow, because the durable checkpoint cannot move past that envelope —
+  `replication_slot_retained_wal_bytes` is where it shows.
 - **A durable-streams outage at boot stops the engine, deliberately.** The epoch is decided from the
   durable catalog, so a catalog the engine cannot read is refused rather than guessed at — booting on
   would look like "no epoch has ever been claimed", create a slot at the current WAL head, and leave

@@ -33,12 +33,21 @@ _Avoid_: invalidation, drop (for streams)
 
 **Epoch**:
 One binding of the engine to a replication slot, and the whole world of shapes and streams built on
-it. An epoch break is a slot the engine can no longer trust; recovery is a new epoch.
+it. An epoch break is a slot the engine can no longer trust — or a change on the log the engine cannot
+process, which ends the epoch without the slot being at fault. Recovery is a new epoch: every shape
+retired, the change log rotated, and the replay restarted on the fresh segment.
 
 **Change log**:
 The single ordered stream of committed changes the ingestor appends to and the sequencer reads from,
-rotated into **segments**.
+rotated into **segments**. In Postgres mode every change on it carries the **schema digest** it was
+decoded under (there is none to carry in library mode), which is what tells an envelope a drift has
+orphaned from one the engine should be able to process.
 _Avoid_: table stream
+
+**Parked**:
+The sequencer stopped at a change it cannot process, maintaining no shape past it and checkpointing
+nothing past it, with the engine reporting `degraded`. Not a retry and not a skip: it stays there,
+across restarts, until an operator resets the epoch.
 
 **Schema drift**:
 A difference between a table's compiled schema and what Postgres now reports for it.

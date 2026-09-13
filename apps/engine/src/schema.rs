@@ -98,6 +98,65 @@ impl SchemaFingerprint {
     pub fn column_names(&self) -> Vec<String> {
         self.columns.iter().map(|c| c.name.clone()).collect()
     }
+
+    /// A 64-bit digest of this fingerprint: FNV-1a over its JSON encoding (ADR-0010).
+    ///
+    /// This is what the ingestor stamps onto every change-log envelope, so the sequencer can tell an
+    /// envelope its compiled schema DESCRIBES from one encoded under a schema a drift has since
+    /// replaced. Determinism is the whole property: the struct's field order and the `Vec`'s column
+    /// order fix the bytes, so two processes that introspected the same table compute the same digest.
+    ///
+    /// It is a fence, not a security boundary — a collision would let a pre-drift envelope be decoded
+    /// as current, which fails loudly rather than silently (the decode is strict), so 64 bits with no
+    /// cryptographic strength is the right trade.
+    ///
+    /// **Changing the encoding — this function, the JSON form, or [`SchemaFingerprint`]'s fields —
+    /// changes every stored digest**, so every envelope already on the change log would read as
+    /// pre-drift and be skipped. An upgrade that does that needs an epoch reset (ADR-0010).
+    pub fn digest(&self) -> u64 {
+        // Never fails: every field is a plain scalar/`Vec`/`Option` (`replident` serialises as a
+        // one-character string). An encoder error would mean the type changed, and a digest of
+        // nothing would compare equal across DIFFERENT schemas — so fall back to a value no
+        // fingerprint can produce rather than to 0.
+        let Ok(bytes) = serde_json::to_vec(self) else { return u64::MAX };
+        fnv1a64(&bytes)
+    }
+}
+
+/// FNV-1a, 64-bit. Inline (ten lines) rather than a dependency: the digest is a fence over a few
+/// dozen bytes of JSON, and the constants are part of the durable format either way.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// A schema digest as it travels on the wire: 16 lowercase hex characters.
+///
+/// A STRING, not a number, because the change log is JSON and the conformance harness reads it with
+/// `JSON.parse`: an integer above 2^53 does not survive that.
+pub fn digest_hex(digest: u64) -> String {
+    format!("{digest:016x}")
+}
+
+/// The digest a wire stamp names, or `None` when the stamp is not one.
+///
+/// Anything that is not EXACTLY what [`digest_hex`] writes — 16 lowercase hex characters — is read as
+/// ABSENT rather than as a different schema: "absent" decodes the envelope strictly (a failure is
+/// loud), while "different" would skip it, and silently skipping a change is the one outcome the stamp
+/// exists to prevent. So the format is checked rather than left to `from_str_radix`, which happily
+/// accepts a truncated stamp, a sign, or uppercase — each of which would parse as some OTHER digest
+/// and be skipped as pre-drift.
+pub fn digest_from_hex(hex: &str) -> Option<u64> {
+    if hex.len() != 16 || !hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
 /// Name what changed between the compiled fingerprint and the observed one, for the drift log.
@@ -231,6 +290,11 @@ pub struct TableSchema {
     /// every pgoutput `Relation` message and with the reconciler's catalog read; a difference
     /// retires the table's dependents. `None` in library mode ⇒ no drift checking.
     pub fingerprint: Option<SchemaFingerprint>,
+    /// [`SchemaFingerprint::digest`] of [`Self::fingerprint`], computed once here (ADR-0010): the
+    /// ingestor stamps it on every envelope it decodes under this schema, and the sequencer compares
+    /// it against the schema it is about to decode with. `None` in library mode — there is no
+    /// fingerprint and no drift, so there is nothing to fence.
+    pub schema_digest: Option<u64>,
 }
 
 /// Separator joining composite-key column values into the durable-stream `key` string. Chosen to not
@@ -302,6 +366,7 @@ impl TableSchema {
             pk_cols,
             pg_types,
             has_defaults,
+            schema_digest: def.fingerprint.as_ref().map(SchemaFingerprint::digest),
             fingerprint: def.fingerprint.clone(),
         })
     }
@@ -445,10 +510,12 @@ mod tests {
         assert_eq!(back, obj);
     }
 
-    /// A library-mode schema (JSON, no Postgres) carries no fingerprint, so nothing drift-checks it.
+    /// A library-mode schema (JSON, no Postgres) carries no fingerprint, so nothing drift-checks it —
+    /// and therefore no digest to stamp or fence with (ADR-0010).
     #[test]
     fn library_mode_schema_has_no_fingerprint() {
         assert!(users().fingerprint.is_none());
+        assert!(users().schema_digest.is_none());
     }
 
     fn col(name: &str, type_oid: u32, typmod: i32) -> FingerprintColumn {
@@ -594,6 +661,56 @@ mod tests {
     fn the_replication_decoder_agrees_with_key_string() {
         assert_eq!(join_key_components(["x", "y\u{1f}z"]), "x\u{1f}y\\x1fz");
         assert_eq!(join_key_components(["x\u{1f}y", "z"]), "x\\x1fy\u{1f}z");
+    }
+
+    /// **The digest is a durable format.** It is stamped onto every change-log envelope, and an
+    /// envelope whose stamp does not match the schema the sequencer holds is treated as pre-drift and
+    /// SKIPPED (ADR-0010) — so changing the encoding (this value, the JSON form, or the struct's
+    /// fields) makes every envelope already on the log unreadable-and-skipped. An upgrade that does
+    /// that needs an epoch reset. Hence the pin.
+    #[test]
+    fn the_fingerprint_digest_is_pinned_to_an_exact_value() {
+        assert_eq!(base().digest(), 0x204b_32de_951b_413d);
+        assert_eq!(digest_hex(base().digest()), "204b32de951b413d");
+        assert_eq!(digest_from_hex("204b32de951b413d"), Some(base().digest()));
+
+        // Deterministic across constructions, and different for a fingerprint that differs in any
+        // field the drift compare looks at.
+        assert_eq!(base().digest(), base().digest());
+        let added = fp(vec![col("id", 23, -1), col("name", 25, -1), col("extra", 25, -1)]);
+        let retyped = fp(vec![col("id", 23, -1), col("name", 1043, 14)]);
+        let reordered = fp(vec![col("name", 25, -1), col("id", 23, -1)]);
+        let repk = SchemaFingerprint { pk: Some(vec!["name".into()]), ..base() };
+        let reident = SchemaFingerprint { replident: b'd', ..base() };
+        let mut digests = vec![base(), added, retyped, reordered, repk, reident]
+            .iter()
+            .map(SchemaFingerprint::digest)
+            .collect::<Vec<_>>();
+        digests.sort_unstable();
+        let distinct = digests.len();
+        digests.dedup();
+        assert_eq!(digests.len(), distinct, "every fingerprint difference must move the digest");
+    }
+
+    /// A stamp that is not a digest at all reads as ABSENT, which decodes the envelope strictly.
+    /// Reading it as "some other schema" would skip a change without a word (ADR-0010) — so a stamp
+    /// that is merely MANGLED (truncated on the wire, signed, uppercased) must not parse either: each
+    /// of those is a valid `from_str_radix` input naming a digest nothing has.
+    #[test]
+    fn an_unparseable_stamp_is_no_stamp() {
+        assert_eq!(digest_from_hex(""), None);
+        assert_eq!(digest_from_hex("not-a-digest"), None);
+        assert_eq!(digest_from_hex("0x5b4fbe71a1f49a9f"), None);
+        assert_eq!(digest_from_hex("204b32de951b41"), None, "truncated");
+        assert_eq!(digest_from_hex("+204b32de951b413d"), None, "signed");
+        assert_eq!(digest_from_hex("204B32DE951B413D"), None, "uppercase is not what digest_hex writes");
+        assert_eq!(digest_from_hex(" 204b32de951b413d"), None, "padded");
+        assert_eq!(digest_from_hex("0204b32de951b413d"), None, "17 characters");
+        // …and the full u64 range round-trips, including the top bit (a 16-hex-char stamp).
+        for d in [0u64, 1, u64::MAX, 0x8000_0000_0000_0000] {
+            assert_eq!(digest_from_hex(&digest_hex(d)), Some(d));
+            assert_eq!(digest_hex(d).len(), 16);
+        }
     }
 
     /// The durable audit record spells the identity as Postgres does.
