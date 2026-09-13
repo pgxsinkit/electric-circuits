@@ -1742,39 +1742,45 @@ impl Engine {
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
         let finished =
             self.subqueries.lock().await.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
-        let crate::subquery::FinishedCreate { work, deferred, node_work } = finished;
-        if !node_work.is_empty() {
-            // Re-derivations a child node's flip aimed at one of THIS create's fresh nodes while it
-            // was still seeding: reconciling then would have run against an empty set, and the seed
-            // (from an older snapshot) would have been installed over the change. Handed off first
-            // so the node's set is right before anything reads it — though the order against the
-            // shape-deferred hand-off below is not load-bearing: emission is absolute per pk, and
-            // this walk re-derives every dependent of the node anyway, so whichever of the two runs
-            // last evaluates against the reconciled set.
-            self.pending_flips.fetch_add(1, Ordering::SeqCst);
-            if self.flip_tx.send(FlipWork::DeferredNode { work: node_work }).is_err() {
-                self.pending_flips.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        if !work.is_empty() {
-            // Replay flips propagate exactly like live ones (barrier-covered).
-            self.pending_flips.fetch_add(1, Ordering::SeqCst);
-            if self.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: None }).is_err() {
-                self.pending_flips.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        if !deferred.is_empty() {
-            // Flips that reached this shape's edges while it was still pending — a shared inner
-            // node's, since a fresh node's deltas buffer on the node itself. They carry membership
-            // the phase-B snapshot could not contain, so they are barrier-covered like any other
-            // effect: counted before the hand-off, released only once they land.
-            self.pending_flips.fetch_add(1, Ordering::SeqCst);
-            if self.flip_tx.send(FlipWork::Deferred { shape_id: id.to_string(), work: deferred }).is_err() {
-                self.pending_flips.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
+        enqueue_finished_create_work(&self.flip_tx, &self.pending_flips, id, finished)?;
         Ok(())
     }
+}
+
+/// Hand off the effects computed by a subquery create after its registry lock is released.
+///
+/// Each non-empty batch is counted before sending so the convergence barrier cannot observe a
+/// partially delivered create. The sender is unbounded, but it still closes during shutdown; a
+/// failed send releases its count and refuses the create so its guard can roll back the install.
+fn enqueue_finished_create_work(
+    flip_tx: &mpsc::UnboundedSender<FlipWork>,
+    pending_flips: &std::sync::atomic::AtomicI64,
+    id: &str,
+    finished: crate::subquery::FinishedCreate,
+) -> Result<()> {
+    let crate::subquery::FinishedCreate { work, deferred, node_work } = finished;
+    if !node_work.is_empty() {
+        pending_flips.fetch_add(1, Ordering::SeqCst);
+        if flip_tx.send(FlipWork::DeferredNode { work: node_work }).is_err() {
+            pending_flips.fetch_sub(1, Ordering::SeqCst);
+            return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
+        }
+    }
+    if !work.is_empty() {
+        pending_flips.fetch_add(1, Ordering::SeqCst);
+        if flip_tx.send(FlipWork::Walk { work, txid: None, lsn: None }).is_err() {
+            pending_flips.fetch_sub(1, Ordering::SeqCst);
+            return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
+        }
+    }
+    if !deferred.is_empty() {
+        pending_flips.fetch_add(1, Ordering::SeqCst);
+        if flip_tx.send(FlipWork::Deferred { shape_id: id.to_string(), work: deferred }).is_err() {
+            pending_flips.fetch_sub(1, Ordering::SeqCst);
+            return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
+        }
+    }
+    Ok(())
 }
 
 /// Is this subscription id free to be claimed on `shape`? (ADR-0008.)
@@ -2249,6 +2255,26 @@ impl Engine {
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    /// A create must not acknowledge after shutdown closes the flip propagator channel: the
+    /// deferred effects returned by `finish_create` have nowhere to run, so the caller needs the
+    /// normal shutdown error and rollback path.
+    #[test]
+    fn closed_flip_channel_rejects_finished_create_handoff() {
+        let (flip_tx, flip_rx) = mpsc::unbounded_channel();
+        drop(flip_rx);
+        let pending_flips = std::sync::atomic::AtomicI64::new(0);
+        let finished = crate::subquery::FinishedCreate {
+            work: std::collections::VecDeque::new(),
+            deferred: std::collections::VecDeque::from([crate::subquery::DeferredShapeWork::Full { txid: None }]),
+            node_work: std::collections::VecDeque::new(),
+        };
+
+        let err = enqueue_finished_create_work(&flip_tx, &pending_flips, "s1", finished)
+            .expect_err("a closed propagator cannot acknowledge deferred create work");
+        assert_eq!(err.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
+        assert_eq!(pending_flips.load(Ordering::SeqCst), 0, "failed handoff must not hold the barrier");
+    }
 
     /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream
     /// DELETE fails and is ignored, which leaves exactly the in-memory state these tests assert on.
