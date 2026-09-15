@@ -1,7 +1,7 @@
 # Build + test on every push/PR: Rust engine unit tests, then the full TS suite (unit + the
-# conformance harness, which boots its own ephemeral logical-replication Postgres). The harness
-# runs against PostgreSQL 18 — the version the engine targets and the one developers run locally —
-# installed from PGDG, not the older server the runner image happens to ship.
+# conformance harness, which boots its own ephemeral logical-replication Postgres). The runner is
+# pinned to an explicit Ubuntu LTS — an update every two years, decided here rather than by
+# `ubuntu-latest` moving underneath us — and that image ships the PostgreSQL the engine targets.
 name: ci
 
 on:
@@ -12,7 +12,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 ships PostgreSQL 18 (service disabled; the harness runs its own initdb).
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -38,13 +39,8 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: Install PostgreSQL 18 and put its binaries on PATH
+      - name: Put the PostgreSQL 18 server binaries on PATH
         run: |
-          # No default cluster: the harness runs initdb itself on a free port, and a package-created
-          # `18/main` would only burn runner memory.
-          echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y --no-install-recommends postgresql-18
           echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
           /usr/lib/postgresql/18/bin/initdb --version
 
