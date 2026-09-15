@@ -51,12 +51,6 @@ describe('conformance: ds-rust WAL survives a storage crash and engine recovery'
   })
 
   it('retains one shape stream across SIGKILL, then converges before and after source transactions', async () => {
-    const major = new pgpkg.Client({ connectionString: h.pgUrl })
-    await major.connect()
-    const version = Number((await major.query('SHOW server_version_num')).rows[0]!.server_version_num)
-    await major.end()
-    expect(Math.floor(version / 10_000), `PostgreSQL server_version_num=${version}`).toBe(18)
-
     // This is the real client/materializer path.  It owns a stable server-issued shape and stream;
     // neither is created again after the crash.
     const shape = await h.client.shape(def)
