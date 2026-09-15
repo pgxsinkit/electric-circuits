@@ -16,3 +16,4 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 ## Items
 
 - [0001 — A refused shape create is not logged](0001-refused-shape-create-not-logged.md) — candidate
+- [0002 — The harness client retries a dead subscription's renewal at its floor cadence, logging a non-JSON body](0002-harness-client-renewal-retry-storm.md) — candidate
