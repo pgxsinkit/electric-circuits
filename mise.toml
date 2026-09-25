@@ -1,0 +1,10 @@
+# The toolchain for `mise install`. Rust's version is rust-toolchain.toml's (pinned there,
+# with the reason): the setting below makes mise read that file rather than export a
+# RUSTUP_TOOLCHAIN of its own.
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+node = "26"
+# Only the pnpm that starts: it switches itself to package.json's packageManager version.
+pnpm = "12"

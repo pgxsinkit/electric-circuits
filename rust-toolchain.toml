@@ -10,8 +10,8 @@
 # upstream ICE is fixed. See PR #24.
 #
 # NOTE for mise users: mise exports RUSTUP_TOOLCHAIN, which rustup ranks ABOVE this
-# file, so a global `rust = "latest"` silently overrides the pin. Either run
-# `mise settings add idiomatic_version_file_enable_tools rust` (mise then honours this
-# file) or unset RUSTUP_TOOLCHAIN in this repo.
+# file, so a global `rust = "latest"` would silently override the pin. The repo's
+# mise.toml turns on `idiomatic_version_file_enable_tools` for rust, so mise takes the
+# version from this file instead.
 [toolchain]
 channel = "1.96.0"
