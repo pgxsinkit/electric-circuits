@@ -1,3 +1,5 @@
+Archived: future development in https://github.com/pgxsinkit/circuits/tree/main/apps/engine
+
 # Electric Circuits
 
 **Electric Circuits make your app's queries live.** Write the queries your app already runs — joins,
